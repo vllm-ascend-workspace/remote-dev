@@ -61,6 +61,14 @@ Managed VAWS `session_id`, `session_file`, and `machine` resolution remain
 available as compatibility modes. Host plus port is the default remote-dev
 surface.
 
+Remote read-before-edit ledgers are scoped by `client_context_id` when supplied,
+then by `CLAUDE_SESSION_ID`, `CODEX_SESSION_ID`, `CODEX_RUN_ID`,
+`REMOTE_DEV_SESSION_ID`, and finally `default`. A read in one client context
+does not authorize edits from another context.
+
+Model-visible output is capped. Full command logs and job output are exposed
+through result refs and MCP resources instead of being copied into tool text.
+
 Claude Code skill mirrors are generated from `.agents/skills`:
 
 ```bash

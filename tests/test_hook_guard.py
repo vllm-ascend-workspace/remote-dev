@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 HOOKS = Path(__file__).resolve().parents[1] / "hooks"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(HOOKS) not in sys.path:
     sys.path.insert(0, str(HOOKS))
 
@@ -96,6 +97,26 @@ class HookGuardTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 2)
         self.assertIn("raw ssh", proc.stderr)
+
+    def test_claude_hook_blocks_mcp_remote_bash_secret_like_command(self) -> None:
+        payload = {
+            "tool_name": "mcp__remote-dev__remote_bash",
+            "tool_input": {"command": "echo token=abc", "host": "1.2.3.4", "port": 46000},
+        }
+        proc = subprocess.run(
+            [sys.executable, str(HOOKS / "claude_remote_guard.py")],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("secret", proc.stderr)
+
+    def test_claude_settings_hooks_mcp_remote_tools(self) -> None:
+        settings = json.loads((REPO_ROOT / ".claude" / "settings.example.json").read_text(encoding="utf-8"))
+        matchers = {item["matcher"] for item in settings["hooks"]["PreToolUse"]}
+        self.assertIn("mcp__remote-dev__.*", matchers)
 
     def test_codex_hook_returns_deny_json_shape(self) -> None:
         payload = {"tool_name": "remote.bash", "arguments": {"command": "curl --password secret"}}

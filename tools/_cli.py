@@ -92,6 +92,7 @@ def build_parser(tool: str) -> argparse.ArgumentParser:
     add_endpoint_args(parser)
     parser.add_argument("--input-json", help="Read complete tool arguments from a JSON file, or '-' for stdin.")
     parser.add_argument("--timeout-ms", type=int, default=120000)
+    parser.add_argument("--client-context-id")
     if tool == "bash":
         parser.add_argument("--command", required=False)
         parser.add_argument("--description")
@@ -185,7 +186,7 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
         return remote_bash(endpoint, command=data.get("command") or args.command or "", cwd=data.get("cwd"), description=data.get("description") or args.description, timeout_ms=timeout_ms, run_in_background=True, runtime_env=data.get("runtime_env"), env=data.get("env") if isinstance(data.get("env"), dict) else parse_env(args.env))
     if tool == "read":
         assert endpoint is not None
-        return remote_read(endpoint, file_path=data.get("file_path") or args.file_path, offset=int(data.get("offset", args.offset)), limit=int(data.get("limit", args.limit)), allow_symlink=bool(data.get("allow_symlink", args.allow_symlink)), timeout_ms=timeout_ms)
+        return remote_read(endpoint, file_path=data.get("file_path") or args.file_path, offset=int(data.get("offset", args.offset)), limit=int(data.get("limit", args.limit)), allow_symlink=bool(data.get("allow_symlink", args.allow_symlink)), client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
     if tool == "ls":
         assert endpoint is not None
         return remote_ls(endpoint, path=data.get("path") or args.path, limit=int(data.get("limit", args.limit)), all=bool(data.get("all", args.all)), timeout_ms=timeout_ms)
@@ -194,16 +195,16 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
         content = data.get("content")
         if content is None and args.content_file:
             content = Path(args.content_file).read_text(encoding="utf-8")
-        return remote_write(endpoint, file_path=data.get("file_path") or args.file_path, content=str(content or ""), overwrite=bool(data.get("overwrite", args.overwrite)), create_dirs=bool(data.get("create_dirs", args.create_dirs)), timeout_ms=timeout_ms)
+        return remote_write(endpoint, file_path=data.get("file_path") or args.file_path, content=str(content or ""), overwrite=bool(data.get("overwrite", args.overwrite)), create_dirs=bool(data.get("create_dirs", args.create_dirs)), client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
     if tool == "edit":
         assert endpoint is not None
-        return remote_edit(endpoint, file_path=data.get("file_path") or args.file_path, old_string=data.get("old_string") if data.get("old_string") is not None else args.old_string, new_string=data.get("new_string") if data.get("new_string") is not None else args.new_string, replace_all=bool(data.get("replace_all", args.replace_all)), timeout_ms=timeout_ms)
+        return remote_edit(endpoint, file_path=data.get("file_path") or args.file_path, old_string=data.get("old_string") if data.get("old_string") is not None else args.old_string, new_string=data.get("new_string") if data.get("new_string") is not None else args.new_string, replace_all=bool(data.get("replace_all", args.replace_all)), client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
     if tool == "multi_edit":
         assert endpoint is not None
         edits = data.get("edits")
         if edits is None and args.edits_json:
             edits = json.loads(args.edits_json)
-        return remote_multi_edit(endpoint, file_path=data.get("file_path") or args.file_path, edits=edits or [], timeout_ms=timeout_ms)
+        return remote_multi_edit(endpoint, file_path=data.get("file_path") or args.file_path, edits=edits or [], client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
     if tool == "glob":
         assert endpoint is not None
         return remote_glob(endpoint, pattern=data.get("pattern") or args.pattern or "*", path=data.get("path") or args.path, limit=int(data.get("limit", args.limit)), respect_gitignore=bool(data.get("respect_gitignore", args.respect_gitignore)), timeout_ms=timeout_ms)

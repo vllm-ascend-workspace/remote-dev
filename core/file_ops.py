@@ -6,9 +6,10 @@ from typing import Any
 from .endpoint import Endpoint
 from .errors import PathPolicyError
 from .path_policy import assert_under_root, join_under_root
+from .preview import MAX_LINE_CHARS, MAX_READ_LINES, compact_text
 from .result import make_result, new_invocation_id, utc_now_iso
 from .ssh_transport import run_remote_python
-from .state_store import load_read_ledger, write_read_ledger
+from .state_store import load_read_ledger, resolve_ledger_scope, write_read_ledger
 
 REMOTE_FILE_PY = r'''
 import difflib
@@ -107,7 +108,15 @@ if op == "read":
         fail("invalid_pagination", "offset and limit must be positive integers")
     start = min(offset - 1, len(lines))
     end = min(start + limit, len(lines))
-    numbered = "\n".join(f"{idx} | {line}" for idx, line in enumerate(lines[start:end], start=start + 1))
+    max_line_chars = int(payload.get("max_line_chars") or 2000)
+    truncated_lines = 0
+    formatted_lines = []
+    for idx, line in enumerate(lines[start:end], start=start + 1):
+        if len(line) > max_line_chars:
+            line = line[:max_line_chars] + "<remote-dev line truncated>"
+            truncated_lines += 1
+        formatted_lines.append(f"{idx} | {line}")
+    numbered = "\n".join(formatted_lines)
     info = file_info(path, content=raw)
     info.update({
         "total_lines": len(lines),
@@ -117,10 +126,14 @@ if op == "read":
         "line_end": end,
         "partial": start > 0 or end < len(lines),
         "content": numbered,
+        "truncated_line_count": truncated_lines,
         "symlink": path.is_symlink(),
         "resolved_path": str(resolved),
     })
-    print(json.dumps({"status": "partial" if info["partial"] else "ok", "file": info}, sort_keys=True))
+    warnings = []
+    if truncated_lines:
+        warnings.append(f"{truncated_lines} line(s) truncated to {max_line_chars} chars")
+    print(json.dumps({"status": "partial" if info["partial"] else "ok", "file": info, "warnings": warnings}, sort_keys=True))
     raise SystemExit(0)
 
 if op == "ls":
@@ -267,10 +280,17 @@ def remote_read(
     offset: int = 1,
     limit: int = 200,
     allow_symlink: bool = False,
+    client_context_id: str | None = None,
     timeout_ms: int = 120000,
 ) -> dict[str, Any]:
     started = utc_now_iso()
     start = time.monotonic()
+    warnings = []
+    if limit > MAX_READ_LINES:
+        warnings.append(f"limit clamped from {limit} to {MAX_READ_LINES}")
+        limit = MAX_READ_LINES
+    if limit < 1:
+        limit = 1
     try:
         path = join_under_root(endpoint.root, endpoint.effective_cwd, file_path)
     except PathPolicyError as exc:
@@ -286,15 +306,18 @@ def remote_read(
             "offset": offset,
             "limit": limit,
             "allow_symlink": allow_symlink,
+            "max_line_chars": MAX_LINE_CHARS,
         },
         timeout_ms=timeout_ms,
     )
     status = str(data.get("status", "failed"))
     refs: dict[str, Any] = {}
+    ledger_scope = resolve_ledger_scope(client_context_id)
     if status in {"ok", "partial"} and isinstance(data.get("file"), dict):
-        ledger = write_read_ledger(endpoint, data["file"])
+        ledger = write_read_ledger(endpoint, data["file"], client_context_id)
         refs["read_ledger"] = str(ledger)
     file_info = data.get("file", {}) if isinstance(data.get("file"), dict) else {}
+    warnings.extend(data.get("warnings", []) if isinstance(data.get("warnings"), list) else [])
     result = make_result(
         tool="remote.read",
         target=endpoint.to_result_target(),
@@ -303,9 +326,10 @@ def remote_read(
         summary=f"RemoteRead {status} for {path}",
         started_at=started,
         duration_ms=_duration_ms(start),
-        preview={"content": file_info.get("content", ""), "partial": file_info.get("partial", False)},
+        preview={"content": compact_text(str(file_info.get("content", ""))), "partial": file_info.get("partial", False)},
         refs=refs,
-        extra={"file": {k: v for k, v in file_info.items() if k != "content"}, "error": data.get("error")},
+        warnings=warnings,
+        extra={"file": {k: v for k, v in file_info.items() if k != "content"}, "error": data.get("error"), "ledger_scope": ledger_scope},
     )
     text = _format_read_text(endpoint, result, file_info)
     return {"text": text, "result": result}
@@ -355,6 +379,7 @@ def remote_write(
     content: str,
     overwrite: bool = False,
     create_dirs: bool = False,
+    client_context_id: str | None = None,
     timeout_ms: int = 120000,
 ) -> dict[str, Any]:
     started = utc_now_iso()
@@ -363,7 +388,7 @@ def remote_write(
         path = join_under_root(endpoint.root, endpoint.effective_cwd, file_path)
     except PathPolicyError as exc:
         return _path_blocked_result(endpoint, "remote.write", file_path, str(exc), started, start)
-    ledger = load_read_ledger(endpoint, path)
+    ledger = load_read_ledger(endpoint, path, client_context_id)
     data = run_remote_python(
         endpoint,
         REMOTE_FILE_PY,
@@ -379,7 +404,7 @@ def remote_write(
         },
         timeout_ms=timeout_ms,
     )
-    return _write_like_result(endpoint, "remote.write", path, data, started, start)
+    return _write_like_result(endpoint, "remote.write", path, data, started, start, client_context_id=client_context_id)
 
 
 def remote_edit(
@@ -389,6 +414,7 @@ def remote_edit(
     old_string: str,
     new_string: str,
     replace_all: bool = False,
+    client_context_id: str | None = None,
     timeout_ms: int = 120000,
 ) -> dict[str, Any]:
     started = utc_now_iso()
@@ -397,10 +423,10 @@ def remote_edit(
         path = join_under_root(endpoint.root, endpoint.effective_cwd, file_path)
     except PathPolicyError as exc:
         return _path_blocked_result(endpoint, "remote.edit", file_path, str(exc), started, start)
-    ledger = load_read_ledger(endpoint, path)
+    ledger = load_read_ledger(endpoint, path, client_context_id)
     if not ledger:
         data = {"status": "read_required", "error": "RemoteEdit requires RemoteRead first"}
-        return _write_like_result(endpoint, "remote.edit", path, data, started, start)
+        return _write_like_result(endpoint, "remote.edit", path, data, started, start, client_context_id=client_context_id)
     data = run_remote_python(
         endpoint,
         REMOTE_FILE_PY,
@@ -416,7 +442,7 @@ def remote_edit(
         },
         timeout_ms=timeout_ms,
     )
-    return _write_like_result(endpoint, "remote.edit", path, data, started, start)
+    return _write_like_result(endpoint, "remote.edit", path, data, started, start, client_context_id=client_context_id)
 
 
 def remote_multi_edit(
@@ -424,6 +450,7 @@ def remote_multi_edit(
     *,
     file_path: str,
     edits: list[dict[str, Any]],
+    client_context_id: str | None = None,
     timeout_ms: int = 120000,
 ) -> dict[str, Any]:
     started = utc_now_iso()
@@ -432,10 +459,10 @@ def remote_multi_edit(
         path = join_under_root(endpoint.root, endpoint.effective_cwd, file_path)
     except PathPolicyError as exc:
         return _path_blocked_result(endpoint, "remote.multi_edit", file_path, str(exc), started, start)
-    ledger = load_read_ledger(endpoint, path)
+    ledger = load_read_ledger(endpoint, path, client_context_id)
     if not ledger:
         data = {"status": "read_required", "error": "RemoteMultiEdit requires RemoteRead first"}
-        return _write_like_result(endpoint, "remote.multi_edit", path, data, started, start)
+        return _write_like_result(endpoint, "remote.multi_edit", path, data, started, start, client_context_id=client_context_id)
     data = run_remote_python(
         endpoint,
         REMOTE_FILE_PY,
@@ -449,7 +476,7 @@ def remote_multi_edit(
         },
         timeout_ms=timeout_ms,
     )
-    return _write_like_result(endpoint, "remote.multi_edit", path, data, started, start)
+    return _write_like_result(endpoint, "remote.multi_edit", path, data, started, start, client_context_id=client_context_id)
 
 
 def _write_like_result(
@@ -459,12 +486,15 @@ def _write_like_result(
     data: dict[str, Any],
     started: str,
     start: float,
+    *,
+    client_context_id: str | None = None,
 ) -> dict[str, Any]:
     status = str(data.get("status", "failed"))
     file_info = data.get("file", {}) if isinstance(data.get("file"), dict) else {}
     refs: dict[str, Any] = {}
+    ledger_scope = resolve_ledger_scope(client_context_id)
     if status in {"written", "edited"} and file_info:
-        refs["read_ledger"] = str(write_read_ledger(endpoint, file_info))
+        refs["read_ledger"] = str(write_read_ledger(endpoint, file_info, client_context_id))
     changed = []
     if file_info:
         changed.append({
@@ -484,7 +514,7 @@ def _write_like_result(
         preview={"diff": data.get("diff_preview", "")},
         refs=refs,
         changed_files=changed,
-        extra={"file": file_info, "error": data.get("error")},
+        extra={"file": file_info, "error": data.get("error"), "ledger_scope": ledger_scope},
     )
     return {"text": _format_write_text(endpoint, result, data), "result": result}
 
@@ -526,7 +556,7 @@ def _format_read_text(endpoint: Endpoint, result: dict[str, Any], file_info: dic
     ]
     if result.get("error"):
         lines.append(f"error: {result['error']}")
-    return "\n".join(lines).rstrip() + "\n"
+    return compact_text("\n".join(lines).rstrip() + "\n")
 
 
 def _format_ls_text(endpoint: Endpoint, result: dict[str, Any]) -> str:
@@ -538,7 +568,7 @@ def _format_ls_text(endpoint: Endpoint, result: dict[str, Any]) -> str:
         lines.append("<truncated>")
     if result.get("error"):
         lines.append(f"error: {result['error']}")
-    return "\n".join(lines).rstrip() + "\n"
+    return compact_text("\n".join(lines).rstrip() + "\n")
 
 
 def _format_write_text(endpoint: Endpoint, result: dict[str, Any], data: dict[str, Any]) -> str:
@@ -557,4 +587,4 @@ def _format_write_text(endpoint: Endpoint, result: dict[str, Any], data: dict[st
         lines.append(str(data["diff_preview"]))
     if result.get("error"):
         lines.append(f"error: {result['error']}")
-    return "\n".join(lines).rstrip() + "\n"
+    return compact_text("\n".join(lines).rstrip() + "\n")

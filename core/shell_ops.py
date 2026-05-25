@@ -9,7 +9,8 @@ from .endpoint import Endpoint
 from .errors import PathPolicyError
 from .job_ops import start_remote_job
 from .path_policy import assert_under_root
-from .preview import stdout_stderr_preview
+from .permissions import contains_secret_in_argv
+from .preview import compact_text, stdout_stderr_preview
 from .result import make_result, new_invocation_id, utc_now_iso
 from .ssh_transport import run_script
 from .state_store import atomic_write_json, atomic_write_text, new_log_dir
@@ -43,6 +44,17 @@ def remote_bash(
 ) -> dict[str, Any]:
     env = env or {}
     runtime_enabled = endpoint.runtime_env if runtime_env is None else runtime_env
+    if contains_secret_in_argv(command):
+        result = make_result(
+            tool="remote.bash",
+            target=endpoint.to_result_target(),
+            outcome="blocked",
+            status="secret_like_argv",
+            summary="RemoteBash blocked because the command contains secret-like argv.",
+            preview={"stderr": "secret-like command argv is blocked"},
+            extra={"command_preview": command[:500]},
+        )
+        return {"text": result["summary"] + "\n", "result": result}
     try:
         cwd = assert_under_root(cwd or endpoint.effective_cwd, endpoint.root)
     except PathPolicyError as exc:
@@ -176,4 +188,4 @@ def _format_bash_text(endpoint: Endpoint, cwd: str, result: dict[str, Any]) -> s
         str(result.get("refs", {}).get("stdout")),
         str(result.get("refs", {}).get("stderr")),
     ]
-    return "\n".join(lines).rstrip() + "\n"
+    return compact_text("\n".join(lines).rstrip() + "\n")

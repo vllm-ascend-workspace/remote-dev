@@ -38,6 +38,30 @@ class ReadLedgerTests(unittest.TestCase):
             finally:
                 state_store.substrate_root = original  # type: ignore[assignment]
 
+    def test_read_ledger_scope_isolated_by_client_context(self) -> None:
+        endpoint = Endpoint(host="1.2.3.4", port=46000)
+        with tempfile.TemporaryDirectory() as tmp:
+            original = state_store.substrate_root
+            try:
+                state_store.substrate_root = lambda: Path(tmp)  # type: ignore[assignment]
+                path = state_store.write_read_ledger(
+                    endpoint,
+                    {
+                        "path": "/vllm-workspace/foo.py",
+                        "sha256": "abc",
+                        "size": 3,
+                        "mtime_ns": 1,
+                    },
+                    client_context_id="context-a",
+                )
+                self.assertIn("/reads/context-a/", path.as_posix())
+                self.assertIsNone(state_store.load_read_ledger(endpoint, "/vllm-workspace/foo.py", client_context_id="context-b"))
+                loaded = state_store.load_read_ledger(endpoint, "/vllm-workspace/foo.py", client_context_id="context-a")
+                self.assertIsNotNone(loaded)
+                self.assertEqual(loaded["ledger_scope"], "context-a")
+            finally:
+                state_store.substrate_root = original  # type: ignore[assignment]
+
 
 if __name__ == "__main__":
     unittest.main()

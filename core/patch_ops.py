@@ -26,6 +26,7 @@ payload = json.loads(sys.stdin.read())
 root = pathlib.Path(payload["root"]).resolve()
 cwd = pathlib.Path(payload["cwd"]).resolve()
 ops = payload["ops"]
+DELETED = object()
 
 def fail(status, error=None, **extra):
     data = {"status": status}
@@ -55,18 +56,37 @@ def resolve_path(raw, *, parent_ok=False):
 def sha(data):
     return hashlib.sha256(data).hexdigest()
 
-def file_sha(path):
-    return sha(path.read_bytes()) if path.exists() and path.is_file() else None
+def file_bytes(path):
+    if path in virtual:
+        data = virtual[path]
+        return None if data is DELETED else data
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        fail("symlink_not_allowed" if path.is_symlink() else "not_file", f"refusing to patch non-regular file: {path}")
+    return path.read_bytes()
 
-def atomic_write(path, data):
+def file_sha_bytes(data):
+    return sha(data) if data is not None else None
+
+def exists_in_virtual(path):
+    data = file_bytes(path)
+    return data is not None
+
+def atomic_write(path, data, mode=None):
     if path.is_symlink():
         fail("symlink_not_allowed", f"refusing to patch symlink: {path}")
+    if path.exists() and not path.is_file():
+        fail("not_file", f"refusing to patch non-regular file: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
+        if mode is not None:
+            os.chmod(temp_name, mode)
         os.replace(temp_name, path)
     finally:
         try:
@@ -74,38 +94,57 @@ def atomic_write(path, data):
         except FileNotFoundError:
             pass
 
+def snapshot_real(path):
+    if not path.exists() and not path.is_symlink():
+        return {"exists": False, "bytes": None, "mode": None}
+    if path.is_symlink() or not path.is_file():
+        fail("symlink_not_allowed" if path.is_symlink() else "not_file", f"refusing to patch non-regular file: {path}")
+    st = path.stat()
+    return {"exists": True, "bytes": path.read_bytes(), "mode": st.st_mode & 0o777}
+
+def restore(before_state):
+    restored = []
+    failed = []
+    for path, state in reversed(list(before_state.items())):
+        try:
+            if state["exists"]:
+                atomic_write(path, state["bytes"], state["mode"])
+            else:
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+            restored.append(str(path))
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
+    return {"restored": restored, "failed": failed}
+
 changed = []
 diffs = []
+virtual = {}
+touched_paths = []
 for op in ops:
     kind = op["kind"]
     path = resolve_path(op["path"], parent_ok=kind == "add")
-    before_bytes = path.read_bytes() if path.exists() and path.is_file() else None
-    before_sha = sha(before_bytes) if before_bytes is not None else None
+    before_bytes = file_bytes(path)
+    before_sha = file_sha_bytes(before_bytes)
     before_text = before_bytes.decode("utf-8", errors="replace") if before_bytes is not None else ""
     path_for_diff = path
     if kind == "add":
-        if path.exists():
+        if exists_in_virtual(path) or path.is_symlink():
             fail("file_exists", f"add file target already exists: {path}")
-        path.parent.mkdir(parents=True, exist_ok=True)
         after_text = op.get("content", "")
-        atomic_write(path, after_text.encode("utf-8"))
+        virtual[path] = after_text.encode("utf-8")
     elif kind == "delete":
-        if not path.exists():
+        if before_bytes is None:
             fail("not_found", f"delete target does not exist: {path}")
-        if path.is_symlink() or not path.is_file():
-            fail("symlink_not_allowed" if path.is_symlink() else "not_file", f"refusing to delete non-regular file: {path}")
-        path.unlink()
+        virtual[path] = DELETED
         after_text = ""
     elif kind == "update":
-        if not path.exists():
+        if before_bytes is None:
             fail("not_found", f"update target does not exist: {path}")
-        if path.is_symlink() or not path.is_file():
-            fail("symlink_not_allowed" if path.is_symlink() else "not_file", f"refusing to patch non-regular file: {path}")
         target_path = resolve_path(op["move_to"], parent_ok=True) if op.get("move_to") else path
         if op.get("move_to"):
-            if target_path.exists() or target_path.is_symlink():
+            if exists_in_virtual(target_path) or target_path.exists() or target_path.is_symlink():
                 fail("file_exists", f"move target already exists: {target_path}")
-            target_path.parent.mkdir(parents=True, exist_ok=True)
         after_text = before_text
         for hunk_index, hunk in enumerate(op.get("hunks", [])):
             old = hunk["old"]
@@ -113,13 +152,17 @@ for op in ops:
             if old not in after_text:
                 fail("context_mismatch", f"patch context not found in {path}; re-run remote.read before retrying", hunk_index=hunk_index)
             after_text = after_text.replace(old, new, 1)
-        atomic_write(target_path, after_text.encode("utf-8"))
+        virtual[target_path] = after_text.encode("utf-8")
         if target_path != path:
-            path.unlink()
+            virtual[path] = DELETED
         path_for_diff = target_path
     else:
         fail("invalid_patch", f"unsupported patch op: {kind}")
-    after_sha = file_sha(path_for_diff)
+    if path not in touched_paths:
+        touched_paths.append(path)
+    if path_for_diff not in touched_paths:
+        touched_paths.append(path_for_diff)
+    after_sha = file_sha_bytes(file_bytes(path_for_diff))
     diff = "".join(difflib.unified_diff(
         before_text.splitlines(keepends=True),
         after_text.splitlines(keepends=True),
@@ -136,6 +179,25 @@ for op in ops:
         "size": path_for_diff.stat().st_size if path_for_diff.exists() else 0,
         "op": "move" if kind == "update" and op.get("move_to") and not op.get("hunks") else kind,
     })
+
+before_state = {path: snapshot_real(path) for path in touched_paths}
+try:
+    for path, data in virtual.items():
+        if data is DELETED:
+            continue
+        mode = before_state.get(path, {}).get("mode")
+        atomic_write(path, data, mode)
+    for path, data in virtual.items():
+        if data is DELETED and (path.exists() or path.is_symlink()):
+            path.unlink()
+except Exception as exc:  # noqa: BLE001
+    rollback_status = restore(before_state)
+    fail("commit_failed", f"{type(exc).__name__}: {exc}", rollback_status=rollback_status)
+
+for item in changed:
+    path = pathlib.Path(item["path"])
+    item["after_sha256"] = sha(path.read_bytes()) if path.exists() and path.is_file() else None
+    item["size"] = path.stat().st_size if path.exists() else 0
 print(json.dumps({"status": "applied", "changed_files": changed, "diff_preview": "".join(diffs)[:16000]}, sort_keys=True))
 '''
 
@@ -342,14 +404,31 @@ def _apply_unified_patch(
             f"cat > \"$tmp\" <<'{delimiter}'",
             patch,
             delimiter,
-            "python3 - \"$tmp_before\" " + path_args + " <<'REMOTE_DEV_BEFORE'",
+            "python3 - \"$tmp_before\" " + shlex.quote(endpoint.root) + " " + shlex.quote(cwd) + " " + path_args + " <<'REMOTE_DEV_BEFORE'",
             "import hashlib, json, pathlib, sys",
+            "def fail(status, error):",
+            "    print(f'REMOTE_DEV_PATCH_PREFLIGHT {status}: {error}', file=sys.stderr)",
+            "    raise SystemExit(72)",
+            "root=pathlib.Path(sys.argv[2]).resolve()",
+            "cwd=pathlib.Path(sys.argv[3]).resolve()",
             "before={}",
-            "for raw in sys.argv[2:]:",
+            "for raw in sys.argv[4:]:",
             "    p=pathlib.Path(raw)",
-            "    if p.exists() and p.is_file():",
+            "    if not p.is_absolute():",
+            "        p=cwd / p",
+            "    if p.exists() or p.is_symlink():",
+            "        resolved=p.resolve()",
+            "        if resolved != root and root not in resolved.parents:",
+            "            fail('path_outside_root', f'{resolved} not under {root}')",
+            "        if p.is_symlink():",
+            "            fail('symlink_not_allowed', f'refusing to patch symlink: {p}')",
+            "        if not p.is_file():",
+            "            fail('not_file', f'refusing to patch non-regular file: {p}')",
             "        before[raw]=hashlib.sha256(p.read_bytes()).hexdigest()",
             "    else:",
+            "        parent=p.parent.resolve()",
+            "        if parent != root and root not in parent.parents:",
+            "            fail('path_outside_root', f'{parent} not under {root}')",
             "        before[raw]=None",
             "pathlib.Path(sys.argv[1]).write_text(json.dumps(before), encoding='utf-8')",
             "REMOTE_DEV_BEFORE",
@@ -380,6 +459,15 @@ def _apply_unified_patch(
     completed = run_script(endpoint, script, timeout_ms=timeout_ms)
     if completed.timed_out:
         return _patch_failed(endpoint, started, start, "timeout", "RemoteApplyPatch timed out", outcome="timeout")
+    if completed.returncode == 72:
+        error = completed.stderr[-4000:]
+        status = "failed"
+        for line in completed.stderr.splitlines():
+            if line.startswith("REMOTE_DEV_PATCH_PREFLIGHT "):
+                status = line.split(" ", 1)[1].split(":", 1)[0]
+                break
+        outcome = "blocked" if status in {"path_outside_root", "symlink_not_allowed", "not_file"} else "failed"
+        return _patch_failed(endpoint, started, start, status, error, outcome=outcome)
     if completed.returncode == 73:
         return _patch_failed(endpoint, started, start, "context_mismatch", completed.stderr[-4000:])
     if completed.returncode != 0:
@@ -427,7 +515,7 @@ def _patch_result(
 ) -> dict[str, Any]:
     status = str(data.get("status", "failed"))
     changed = data.get("changed_files", []) if isinstance(data.get("changed_files"), list) else []
-    outcome = "success" if status == "applied" else ("blocked" if status in {"path_outside_root", "symlink_not_allowed", "file_exists"} else "failed")
+    outcome = "success" if status == "applied" else ("blocked" if status in {"path_outside_root", "symlink_not_allowed", "not_file", "file_exists"} else "failed")
     patch_dir = ensure_endpoint_state(endpoint) / "patches"
     result = make_result(
         tool="remote.apply_patch",

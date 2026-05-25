@@ -17,7 +17,7 @@ REPO_ROOT = REMOTE_DEV_ROOT.parent
 if str(REMOTE_DEV_ROOT) not in sys.path:
     sys.path.insert(0, str(REMOTE_DEV_ROOT))
 
-from mcp.schemas import ENDPOINT_PROPS, TOOL_SCHEMAS  # noqa: E402
+from mcp.schemas import ENDPOINT_PROPS, ENDPOINT_SELECTOR_ANY_OF, TOOL_SCHEMAS  # noqa: E402
 from mcp.tools import call_tool, list_resources, list_tools, read_resource  # noqa: E402
 
 
@@ -90,6 +90,12 @@ def mcp_and_burden_checks() -> dict[str, Any]:
         for name, required in required_by_tool.items()
         if required & endpoint_fields
     }
+    endpoint_selector_tools = {
+        name
+        for name, schema in TOOL_SCHEMAS.items()
+        if {"anyOf": ENDPOINT_SELECTOR_ANY_OF} in schema.get("allOf", [])
+    }
+    endpoint_selector_missing = sorted(set(TOOL_SCHEMAS) - {"remote.job_status", "remote.job_tail", "remote.job_stop"} - endpoint_selector_tools)
     own_required_counts = {
         name: len(required - endpoint_fields)
         for name, required in required_by_tool.items()
@@ -104,7 +110,9 @@ def mcp_and_burden_checks() -> dict[str, Any]:
     if set(scripts) != expected_scripts:
         failures.append("CLI remote_*.py wrappers do not match TOOL_SCHEMAS")
     if endpoint_required:
-        failures.append("endpoint fields should not be required by tool schemas")
+        failures.append("endpoint fields should not be top-level required by tool schemas")
+    if endpoint_selector_missing:
+        failures.append("remote tools should express endpoint selector anyOf in tool schemas")
     if not has_native_shape_names:
         failures.append("tool names should retain remote.<native-tool> shape")
     if not all_have_schema:
@@ -118,6 +126,7 @@ def mcp_and_burden_checks() -> dict[str, Any]:
         "resource_count": len(resources),
         "cli_wrapper_count": len(scripts),
         "endpoint_required": endpoint_required,
+        "endpoint_selector_missing": endpoint_selector_missing,
         "own_required_counts": own_required_counts,
         "max_own_required_fields": max(own_required_counts.values()) if own_required_counts else 0,
         "failures": failures,

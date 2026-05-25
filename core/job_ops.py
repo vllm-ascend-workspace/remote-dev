@@ -9,6 +9,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from .endpoint import Endpoint
+from .preview import MAX_JOB_TAIL_LINES, MAX_TEXT_CHARS, compact_text
 from .result import make_result, utc_now_iso
 from .ssh_transport import run_script
 from .state_store import atomic_write_json, find_job_record, job_record_path
@@ -60,6 +61,74 @@ def start_remote_job(
     runtime_enabled = endpoint.runtime_env if runtime_env is None else runtime_env
     job_id = require_job_id(job_id or new_job_id())
     cwd = cwd or endpoint.effective_cwd
+    local_record = job_record_path(endpoint, job_id)
+    found_record = find_job_record(job_id)
+    if local_record.exists() or found_record:
+        result = make_result(
+            tool="remote.bash",
+            target={**endpoint.to_result_target(), "cwd": cwd},
+            outcome="blocked",
+            status="job_id_exists",
+            summary=f"Remote background task blocked because job_id already exists: {job_id}.",
+            started_at=started,
+            duration_ms=_duration_ms(start),
+            refs={"job_record": str(found_record[0]) if found_record else str(local_record)},
+            extra={"job_id": job_id},
+        )
+        return {"text": result["summary"] + "\n", "result": result}
+    validation_script = "\n".join(
+        [
+            "python3 - <<'REMOTE_DEV_VALIDATE'",
+            "import pathlib, sys",
+            f"root = pathlib.Path({endpoint.root!r}).resolve()",
+            f"cwd = pathlib.Path({cwd!r})",
+            "if not cwd.exists():",
+            "    print('REMOTE_DEV_CWD_NOT_FOUND', file=sys.stderr)",
+            "    raise SystemExit(70)",
+            "resolved = cwd.resolve()",
+            "if resolved != root and root not in resolved.parents:",
+            "    print('REMOTE_DEV_CWD_OUTSIDE_ROOT', file=sys.stderr)",
+            "    raise SystemExit(71)",
+            "if not cwd.is_dir():",
+            "    print('REMOTE_DEV_CWD_NOT_DIRECTORY', file=sys.stderr)",
+            "    raise SystemExit(72)",
+            "REMOTE_DEV_VALIDATE",
+        ]
+    )
+    validation = run_script(endpoint, validation_script, timeout_ms=20000)
+    if validation.timed_out or validation.returncode in {70, 71, 72} or validation.returncode != 0:
+        if validation.timed_out:
+            outcome = "timeout"
+            status = "timeout"
+            summary = "Remote background task cwd validation timed out."
+        elif validation.returncode == 70:
+            outcome = "failed"
+            status = "cwd_not_found"
+            summary = "Remote background task failed because cwd does not exist."
+        elif validation.returncode == 71:
+            outcome = "blocked"
+            status = "cwd_outside_root"
+            summary = "Remote background task blocked because cwd is outside root."
+        elif validation.returncode == 72:
+            outcome = "failed"
+            status = "cwd_not_directory"
+            summary = "Remote background task failed because cwd is not a directory."
+        else:
+            outcome = "failed"
+            status = "job_start_failed"
+            summary = "Remote background task failed cwd validation."
+        result = make_result(
+            tool="remote.bash",
+            target={**endpoint.to_result_target(), "cwd": cwd},
+            outcome=outcome,  # type: ignore[arg-type]
+            status=status,
+            summary=summary,
+            started_at=started,
+            duration_ms=_duration_ms(start),
+            preview={"stdout": validation.stdout, "stderr": validation.stderr},
+            extra={"error": validation.stderr[-4000:], "job_id": job_id},
+        )
+        return {"text": summary + "\n", "result": result}
     remote_dir = remote_job_dir(endpoint, job_id)
     timeout_prefix = f"timeout {int(timeout_ms / 1000)} " if timeout_ms else ""
     env_lines = [f"export {require_env_name(key)}={shlex.quote(str(value))}" for key, value in sorted(env.items())]
@@ -72,15 +141,38 @@ def start_remote_job(
             "#!/usr/bin/env bash",
             "set +e",
             f"JOB_DIR={shlex.quote(remote_dir)}",
-            *runtime_lines,
-            f"cd {shlex.quote(cwd)}",
-            *env_lines,
-            f"printf '%s\\n' {status_running} > \"$JOB_DIR/status.json\"",
-            f"{timeout_prefix}bash -c {shlex.quote(command)} > \"$JOB_DIR/stdout.log\" 2> \"$JOB_DIR/stderr.log\"",
+            "python3 - <<'REMOTE_DEV_VALIDATE' > \"$JOB_DIR/stdout.log\" 2> \"$JOB_DIR/stderr.log\"",
+            "import pathlib, sys",
+            f"root = pathlib.Path({endpoint.root!r}).resolve()",
+            f"cwd = pathlib.Path({cwd!r})",
+            "if not cwd.exists():",
+            "    print('REMOTE_DEV_CWD_NOT_FOUND', file=sys.stderr)",
+            "    raise SystemExit(70)",
+            "resolved = cwd.resolve()",
+            "if resolved != root and root not in resolved.parents:",
+            "    print('REMOTE_DEV_CWD_OUTSIDE_ROOT', file=sys.stderr)",
+            "    raise SystemExit(71)",
+            "if not cwd.is_dir():",
+            "    print('REMOTE_DEV_CWD_NOT_DIRECTORY', file=sys.stderr)",
+            "    raise SystemExit(72)",
+            "REMOTE_DEV_VALIDATE",
             "rc=$?",
+            "if [ \"$rc\" -eq 0 ]; then",
+            *["  " + line for line in runtime_lines],
+            f"  cd {shlex.quote(cwd)} || rc=70",
+            "fi",
+            "if [ \"$rc\" -eq 0 ]; then",
+            *["  " + line for line in env_lines],
+            f"  printf '%s\\n' {status_running} > \"$JOB_DIR/status.json\"",
+            f"  {timeout_prefix}bash -c {shlex.quote(command)} > \"$JOB_DIR/stdout.log\" 2> \"$JOB_DIR/stderr.log\"",
+            "  rc=$?",
+            "fi",
             "finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "status=failed",
             "[ \"$rc\" -eq 0 ] && status=succeeded",
+            "[ \"$rc\" -eq 70 ] && status=cwd_not_found",
+            "[ \"$rc\" -eq 71 ] && status=cwd_outside_root",
+            "[ \"$rc\" -eq 72 ] && status=cwd_not_directory",
             "if [ \"$rc\" -eq 124 ] || [ \"$rc\" -eq 137 ]; then status=timeout; fi",
             f"printf '{{\"status\":\"%s\",\"job_id\":\"{job_id}\",\"exit_code\":%s,\"finished_at\":\"%s\"}}\\n' \"$status\" \"$rc\" \"$finished\" > \"$JOB_DIR/status.json\"",
         ]
@@ -128,7 +220,6 @@ def start_remote_job(
         "started_at": started,
         "timeout_ms": timeout_ms,
     }
-    local_record = job_record_path(endpoint, job_id)
     atomic_write_json(local_record, record)
     result = make_result(
         tool="remote.bash",
@@ -240,12 +331,19 @@ def remote_job_tail(endpoint: Endpoint | None, *, job_id: str, lines: int = 80, 
     started = utc_now_iso()
     start = time.monotonic()
     remote_dir = PurePosixPath(record["remote_dir"])
+    warnings = []
+    if lines > MAX_JOB_TAIL_LINES:
+        warnings.append(f"lines clamped from {lines} to {MAX_JOB_TAIL_LINES}")
+        lines = MAX_JOB_TAIL_LINES
+    if lines < 1:
+        lines = 1
     commands: list[str] = []
     if stream in {"stdout", "both"}:
-        commands.append(f"echo __STDOUT__; tail -n {int(lines)} {shlex.quote(str(remote_dir / 'stdout.log'))} 2>/dev/null || true")
+        commands.append(f"echo __STDOUT__; tail -n {int(lines)} {shlex.quote(str(remote_dir / 'stdout.log'))} 2>/dev/null | head -c {MAX_TEXT_CHARS} || true")
     if stream in {"stderr", "both"}:
-        commands.append(f"echo __STDERR__; tail -n {int(lines)} {shlex.quote(str(remote_dir / 'stderr.log'))} 2>/dev/null || true")
+        commands.append(f"echo __STDERR__; tail -n {int(lines)} {shlex.quote(str(remote_dir / 'stderr.log'))} 2>/dev/null | head -c {MAX_TEXT_CHARS} || true")
     completed = run_script(endpoint, "\n".join(commands), timeout_ms=20000)
+    text = compact_text(completed.stdout)
     result = make_result(
         tool="remote.job_tail",
         target=endpoint.to_result_target(),
@@ -254,10 +352,11 @@ def remote_job_tail(endpoint: Endpoint | None, *, job_id: str, lines: int = 80, 
         summary=f"Remote job tail for {job_id}.",
         started_at=started,
         duration_ms=_duration_ms(start),
-        preview={"tail": completed.stdout, "stderr": completed.stderr},
-        extra={"job_id": job_id},
+        preview={"tail": text, "stderr": completed.stderr},
+        warnings=warnings,
+        extra={"job_id": job_id, "lines": lines},
     )
-    return {"text": completed.stdout, "result": result}
+    return {"text": text, "result": result}
 
 
 def remote_job_stop(endpoint: Endpoint | None, *, job_id: str, force: bool = False) -> dict[str, Any]:

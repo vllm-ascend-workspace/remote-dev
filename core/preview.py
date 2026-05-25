@@ -1,7 +1,13 @@
 from __future__ import annotations
 
-DEFAULT_HEAD_CHARS = 12000
-DEFAULT_TAIL_CHARS = 12000
+MAX_TEXT_CHARS = 12000
+MAX_READ_LINES = 500
+MAX_JOB_TAIL_LINES = 500
+MAX_GREP_MATCHES = 500
+MAX_LINE_CHARS = 2000
+
+DEFAULT_HEAD_CHARS = 4000
+DEFAULT_TAIL_CHARS = 4000
 
 
 def text_preview(
@@ -44,3 +50,13 @@ def stdout_stderr_preview(stdout: str, stderr: str) -> dict[str, object]:
 
 def tail_text(value: str, limit: int = DEFAULT_TAIL_CHARS) -> str:
     return value if len(value) <= limit else value[-limit:]
+
+
+def compact_text(value: str, *, limit: int = MAX_TEXT_CHARS) -> str:
+    if len(value) <= limit:
+        return value
+    marker = "\n<remote-dev text truncated; full output is available via refs/resources>\n"
+    keep = max(0, limit - len(marker))
+    head = keep // 2
+    tail = keep - head
+    return value[:head] + marker + value[-tail:]

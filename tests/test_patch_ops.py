@@ -125,6 +125,91 @@ class PatchOpsTests(unittest.TestCase):
             self.assertFalse(source.exists())
             self.assertEqual(target.read_text(encoding="utf-8"), "new\n")
 
+    def test_codex_patch_is_atomic_across_multiple_files_on_late_context_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "a.py"
+            second = root / "b.py"
+            first.write_text("old a\n", encoding="utf-8")
+            second.write_text("old b\n", encoding="utf-8")
+            payload = {
+                "root": str(root),
+                "cwd": str(root),
+                "ops": [
+                    {"kind": "update", "path": "a.py", "hunks": [{"old": "old a\n", "new": "new a\n"}]},
+                    {"kind": "update", "path": "b.py", "hunks": [{"old": "missing\n", "new": "new b\n"}]},
+                ],
+            }
+            proc = subprocess.run(
+                [sys.executable, "-c", patch_ops.REMOTE_CODEX_PATCH_PY],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads(proc.stdout)
+            self.assertEqual(result["status"], "context_mismatch")
+            self.assertEqual(first.read_text(encoding="utf-8"), "old a\n")
+            self.assertEqual(second.read_text(encoding="utf-8"), "old b\n")
+
+    def test_codex_patch_is_atomic_for_add_then_failed_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target.py"
+            new_file = root / "new.py"
+            target.write_text("old\n", encoding="utf-8")
+            payload = {
+                "root": str(root),
+                "cwd": str(root),
+                "ops": [
+                    {"kind": "add", "path": "new.py", "content": "created\n"},
+                    {"kind": "update", "path": "target.py", "hunks": [{"old": "missing\n", "new": "new\n"}]},
+                ],
+            }
+            proc = subprocess.run(
+                [sys.executable, "-c", patch_ops.REMOTE_CODEX_PATCH_PY],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads(proc.stdout)
+            self.assertEqual(result["status"], "context_mismatch")
+            self.assertFalse(new_file.exists())
+            self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+
+    def test_codex_patch_is_atomic_for_move_then_failed_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "old.py"
+            moved = root / "new.py"
+            other = root / "other.py"
+            source.write_text("old\n", encoding="utf-8")
+            other.write_text("other\n", encoding="utf-8")
+            payload = {
+                "root": str(root),
+                "cwd": str(root),
+                "ops": [
+                    {"kind": "update", "path": "old.py", "move_to": "new.py", "hunks": []},
+                    {"kind": "update", "path": "other.py", "hunks": [{"old": "missing\n", "new": "new\n"}]},
+                ],
+            }
+            proc = subprocess.run(
+                [sys.executable, "-c", patch_ops.REMOTE_CODEX_PATCH_PY],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads(proc.stdout)
+            self.assertEqual(result["status"], "context_mismatch")
+            self.assertTrue(source.exists())
+            self.assertFalse(moved.exists())
+            self.assertEqual(other.read_text(encoding="utf-8"), "other\n")
+
     def test_unified_patch_records_before_sha_and_diffstat(self) -> None:
         original_runner = patch_ops.run_script
         try:
@@ -155,6 +240,37 @@ class PatchOpsTests(unittest.TestCase):
                 self.assertEqual(changed["before_sha256"], expected_before)
                 self.assertIsNotNone(changed["after_sha256"])
                 self.assertIn("a.py", payload["result"]["preview"]["diffstat"])
+        finally:
+            patch_ops.run_script = original_runner  # type: ignore[assignment]
+
+    def test_unified_patch_rejects_symlink_target_before_git_apply(self) -> None:
+        original_runner = patch_ops.run_script
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                real = repo / "real.py"
+                link = repo / "link.py"
+                real.write_text("old\n", encoding="utf-8")
+                link.symlink_to(real)
+                endpoint = Endpoint(host="1.2.3.4", port=46000, root=str(repo), cwd=str(repo))
+                from core.ssh_transport import RemoteCompleted
+
+                def fake_run_script(_endpoint, script, **_kwargs):
+                    proc = subprocess.run(["bash", "-s"], input=script, cwd=repo, capture_output=True, text=True, check=False)
+                    return RemoteCompleted(proc.returncode, proc.stdout, proc.stderr)
+
+                patch_ops.run_script = fake_run_script  # type: ignore[assignment]
+                patch = """diff --git a/link.py b/link.py
+--- a/link.py
++++ b/link.py
+@@ -1 +1 @@
+-old
++new
+"""
+                payload = patch_ops.remote_apply_patch(endpoint, patch=patch, cwd=str(repo))
+                self.assertEqual(payload["result"]["outcome"], "blocked", payload["text"])
+                self.assertEqual(payload["result"]["status"], "symlink_not_allowed")
+                self.assertEqual(real.read_text(encoding="utf-8"), "old\n")
         finally:
             patch_ops.run_script = original_runner  # type: ignore[assignment]
 

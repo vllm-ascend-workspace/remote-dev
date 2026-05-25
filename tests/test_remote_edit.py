@@ -49,6 +49,36 @@ class RemoteEditTests(unittest.TestCase):
             state_store.substrate_root = original_state_root  # type: ignore[assignment]
             file_ops.run_remote_python = original_runner  # type: ignore[assignment]
 
+    def test_remote_edit_does_not_use_read_ledger_from_different_client_context(self) -> None:
+        endpoint = Endpoint(host="1.2.3.4", port=46000)
+        original_state_root = state_store.substrate_root
+        original_runner = file_ops.run_remote_python
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                state_store.substrate_root = lambda: Path(tmp)  # type: ignore[assignment]
+                state_store.write_read_ledger(
+                    endpoint,
+                    {"path": "/vllm-workspace/foo.py", "sha256": "before", "size": 3, "mtime_ns": 1},
+                    client_context_id="agent-a",
+                )
+
+                def fail_if_called(*_args, **_kwargs):
+                    raise AssertionError("remote edit should not execute without same-context read ledger")
+
+                file_ops.run_remote_python = fail_if_called  # type: ignore[assignment]
+                payload = file_ops.remote_edit(
+                    endpoint,
+                    file_path="/vllm-workspace/foo.py",
+                    old_string="a",
+                    new_string="b",
+                    client_context_id="agent-b",
+                )
+                self.assertEqual(payload["result"]["outcome"], "blocked")
+                self.assertEqual(payload["result"]["status"], "read_required")
+        finally:
+            state_store.substrate_root = original_state_root  # type: ignore[assignment]
+            file_ops.run_remote_python = original_runner  # type: ignore[assignment]
+
 
 if __name__ == "__main__":
     unittest.main()

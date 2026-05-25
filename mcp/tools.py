@@ -220,16 +220,16 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
         return remote_monitor(endpoint, command=str(args["command"]), cwd=args.get("cwd"), description=args.get("description"), timeout_ms=timeout_ms, pattern=args.get("pattern"), runtime_env=args.get("runtime_env"), env=args.get("env") if isinstance(args.get("env"), dict) else {})
     if name == "remote.read":
         assert endpoint is not None
-        return remote_read(endpoint, file_path=str(args["file_path"]), offset=int(args.get("offset") or 1), limit=int(args.get("limit") or 200), allow_symlink=bool(args.get("allow_symlink", False)), timeout_ms=timeout_ms)
+        return remote_read(endpoint, file_path=str(args["file_path"]), offset=int(args.get("offset") or 1), limit=int(args.get("limit") or 200), allow_symlink=bool(args.get("allow_symlink", False)), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
     if name == "remote.write":
         assert endpoint is not None
-        return remote_write(endpoint, file_path=str(args["file_path"]), content=str(args.get("content", "")), overwrite=bool(args.get("overwrite", False)), create_dirs=bool(args.get("create_dirs", False)), timeout_ms=timeout_ms)
+        return remote_write(endpoint, file_path=str(args["file_path"]), content=str(args.get("content", "")), overwrite=bool(args.get("overwrite", False)), create_dirs=bool(args.get("create_dirs", False)), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
     if name == "remote.edit":
         assert endpoint is not None
-        return remote_edit(endpoint, file_path=str(args["file_path"]), old_string=str(args["old_string"]), new_string=str(args["new_string"]), replace_all=bool(args.get("replace_all", False)), timeout_ms=timeout_ms)
+        return remote_edit(endpoint, file_path=str(args["file_path"]), old_string=str(args["old_string"]), new_string=str(args["new_string"]), replace_all=bool(args.get("replace_all", False)), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
     if name == "remote.multi_edit":
         assert endpoint is not None
-        return remote_multi_edit(endpoint, file_path=str(args["file_path"]), edits=list(args.get("edits") or []), timeout_ms=timeout_ms)
+        return remote_multi_edit(endpoint, file_path=str(args["file_path"]), edits=list(args.get("edits") or []), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
     if name == "remote.glob":
         assert endpoint is not None
         return remote_glob(endpoint, pattern=str(args["pattern"]), path=args.get("path"), limit=int(args.get("limit") or 100), respect_gitignore=bool(args.get("respect_gitignore", False)), timeout_ms=timeout_ms)

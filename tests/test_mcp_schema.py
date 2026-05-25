@@ -16,7 +16,7 @@ import core.state_store as state_store  # noqa: E402
 import mcp.tools as mcp_tools  # noqa: E402
 from core.endpoint import Endpoint  # noqa: E402
 from core.ssh_transport import RemoteCompleted  # noqa: E402
-from mcp.schemas import ALIASES, TOOL_SCHEMAS  # noqa: E402
+from mcp.schemas import ALIASES, ENDPOINT_SELECTOR_ANY_OF, TOOL_SCHEMAS  # noqa: E402
 from mcp.tools import list_resources, list_tools, read_resource  # noqa: E402
 
 
@@ -50,6 +50,17 @@ class McpSchemaTests(unittest.TestCase):
     def test_underscore_aliases_map_to_canonical_names(self) -> None:
         self.assertEqual(ALIASES["remote_read"], "remote.read")
         self.assertIn("remote.bash", TOOL_SCHEMAS)
+
+    def test_normal_tools_express_endpoint_selector_anyof(self) -> None:
+        job_tools = {"remote.job_status", "remote.job_tail", "remote.job_stop"}
+        for name, schema in TOOL_SCHEMAS.items():
+            if name in job_tools:
+                self.assertNotIn({"anyOf": ENDPOINT_SELECTOR_ANY_OF}, schema.get("allOf", []))
+            else:
+                self.assertIn({"anyOf": ENDPOINT_SELECTOR_ANY_OF}, schema.get("allOf", []), name)
+        self.assertIn({"required": ["host", "port"]}, ENDPOINT_SELECTOR_ANY_OF)
+        self.assertIn({"required": ["alias"]}, ENDPOINT_SELECTOR_ANY_OF)
+        self.assertIn({"required": ["session_id"]}, ENDPOINT_SELECTOR_ANY_OF)
 
     def test_resources_include_endpoint_index(self) -> None:
         resources = {resource["uri"] for resource in list_resources()}

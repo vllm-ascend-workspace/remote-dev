@@ -6,6 +6,7 @@ from typing import Any
 from .endpoint import Endpoint
 from .errors import PathPolicyError
 from .path_policy import join_under_root
+from .preview import MAX_GREP_MATCHES, MAX_LINE_CHARS, MAX_TEXT_CHARS, compact_text
 from .result import make_result, utc_now_iso
 from .ssh_transport import run_remote_python
 
@@ -69,6 +70,7 @@ if op == "grep":
     if not pattern:
         fail("pattern_required", "RemoteGrep requires pattern")
     limit = int(payload.get("limit") or 100)
+    max_line_chars = int(payload.get("max_line_chars") or 2000)
     output_mode = payload.get("output_mode") or "files_with_matches"
     glob_pattern = payload.get("glob")
     type_name = payload.get("type")
@@ -94,13 +96,22 @@ if op == "grep":
         if proc.returncode not in (0, 1):
             fail("failed", proc.stderr[-4000:])
         lines = proc.stdout.splitlines()
+        truncated_line_count = 0
+        if output_mode == "content":
+            capped = []
+            for line in lines:
+                if len(line) > max_line_chars:
+                    line = line[:max_line_chars] + "<remote-dev line truncated>"
+                    truncated_line_count += 1
+                capped.append(line)
+            lines = capped
         print(json.dumps({
             "status": "ok",
             "engine": "rg",
             "output_mode": output_mode,
             "matches": lines[:limit],
             "truncated": len(lines) > limit,
-            "warnings": warnings,
+            "warnings": warnings + ([f"{truncated_line_count} line(s) truncated to {max_line_chars} chars"] if truncated_line_count else []),
         }, sort_keys=True))
         raise SystemExit(0)
 
@@ -124,6 +135,8 @@ if op == "grep":
         else:
             for idx, line in enumerate(text.splitlines(), start=1):
                 if pattern in line:
+                    if len(line) > max_line_chars:
+                        line = line[:max_line_chars] + "<remote-dev line truncated>"
                     matches.append(f"{path}:{idx}:{line}")
                     if len(matches) >= limit:
                         break
@@ -138,6 +151,23 @@ fail("unsupported_op", f"unsupported search op: {op}")
 
 def _duration_ms(start: float) -> int:
     return int(round((time.monotonic() - start) * 1000))
+
+
+def _compact_matches(matches: list[Any]) -> tuple[list[str], bool]:
+    visible: list[str] = []
+    total = 0
+    truncated = False
+    for item in matches:
+        text = str(item)
+        if len(text) > MAX_LINE_CHARS:
+            text = text[:MAX_LINE_CHARS] + "<remote-dev line truncated>"
+            truncated = True
+        if total + len(text) > MAX_TEXT_CHARS:
+            truncated = True
+            break
+        visible.append(text)
+        total += len(text)
+    return visible, truncated or len(visible) < len(matches)
 
 
 def remote_glob(
@@ -172,6 +202,7 @@ def remote_glob(
     )
     matches = data.get("matches", []) if isinstance(data.get("matches"), list) else []
     status = str(data.get("status", "failed"))
+    visible_matches, text_truncated = _compact_matches([str(item.get("path", item)) for item in matches])
     result = make_result(
         tool="remote.glob",
         target=endpoint.to_result_target(),
@@ -180,11 +211,11 @@ def remote_glob(
         summary=f"RemoteGlob found {len(matches)} paths.",
         started_at=started,
         duration_ms=_duration_ms(start),
-        preview={"matches": matches, "truncated": bool(data.get("truncated", False))},
+        preview={"matches": visible_matches, "truncated": bool(data.get("truncated", False)) or text_truncated},
         warnings=["respect_gitignore is not implemented for RemoteGlob"] if respect_gitignore else [],
-        extra={"matches": matches, "truncated": bool(data.get("truncated", False)), "error": data.get("error")},
+        extra={"matches": visible_matches, "truncated": bool(data.get("truncated", False)) or text_truncated, "error": data.get("error")},
     )
-    text = "\n".join([str(item.get("path", item)) for item in matches]) + ("\n<truncated>\n" if data.get("truncated") else "\n")
+    text = compact_text("\n".join(visible_matches) + ("\n<truncated>\n" if data.get("truncated") or text_truncated else "\n"))
     return {"text": text, "result": result}
 
 
@@ -202,6 +233,12 @@ def remote_grep(
 ) -> dict[str, Any]:
     started = utc_now_iso()
     start = time.monotonic()
+    local_warnings = []
+    if limit > MAX_GREP_MATCHES:
+        local_warnings.append(f"limit clamped from {limit} to {MAX_GREP_MATCHES}")
+        limit = MAX_GREP_MATCHES
+    if limit < 1:
+        limit = 1
     raw_path = path or endpoint.effective_cwd
     try:
         base = join_under_root(endpoint.root, endpoint.effective_cwd, raw_path)
@@ -221,12 +258,14 @@ def remote_grep(
             "output_mode": output_mode,
             "multiline": multiline,
             "limit": limit,
+            "max_line_chars": MAX_LINE_CHARS,
         },
         timeout_ms=timeout_ms,
     )
     matches = data.get("matches", []) if isinstance(data.get("matches"), list) else []
     status = str(data.get("status", "failed"))
-    warnings = data.get("warnings", []) if isinstance(data.get("warnings"), list) else []
+    warnings = local_warnings + (data.get("warnings", []) if isinstance(data.get("warnings"), list) else [])
+    visible_matches, text_truncated = _compact_matches(matches)
     result = make_result(
         tool="remote.grep",
         target=endpoint.to_result_target(),
@@ -235,11 +274,11 @@ def remote_grep(
         summary=f"RemoteGrep found {len(matches)} matches.",
         started_at=started,
         duration_ms=_duration_ms(start),
-        preview={"matches": matches, "truncated": bool(data.get("truncated", False))},
+        preview={"matches": visible_matches, "truncated": bool(data.get("truncated", False)) or text_truncated},
         warnings=warnings,
-        extra={"matches": matches, "engine": data.get("engine"), "output_mode": output_mode, "truncated": bool(data.get("truncated", False)), "error": data.get("error")},
+        extra={"matches": visible_matches, "engine": data.get("engine"), "output_mode": output_mode, "truncated": bool(data.get("truncated", False)) or text_truncated, "error": data.get("error")},
     )
-    text = "\n".join(str(item) for item in matches) + ("\n<truncated>\n" if data.get("truncated") else "\n")
+    text = compact_text("\n".join(visible_matches) + ("\n<truncated>\n" if data.get("truncated") or text_truncated else "\n"))
     return {"text": text, "result": result}
 
 
