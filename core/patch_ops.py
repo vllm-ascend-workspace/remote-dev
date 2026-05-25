@@ -123,7 +123,7 @@ virtual = {}
 touched_paths = []
 for op in ops:
     kind = op["kind"]
-    path = resolve_path(op["path"], parent_ok=kind == "add")
+    path = resolve_path(op["path"], parent_ok=True)
     before_bytes = file_bytes(path)
     before_sha = file_sha_bytes(before_bytes)
     before_text = before_bytes.decode("utf-8", errors="replace") if before_bytes is not None else ""

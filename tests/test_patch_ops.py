@@ -125,6 +125,37 @@ class PatchOpsTests(unittest.TestCase):
             self.assertFalse(source.exists())
             self.assertEqual(target.read_text(encoding="utf-8"), "new\n")
 
+    def test_codex_patch_executor_updates_file_added_in_same_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "old.py"
+            target = root / "new.py"
+            payload = {
+                "root": str(root),
+                "cwd": str(root),
+                "ops": [
+                    {"kind": "add", "path": "old.py", "content": "old\n"},
+                    {
+                        "kind": "update",
+                        "path": "old.py",
+                        "move_to": "new.py",
+                        "hunks": [{"old": "old\n", "new": "new\n"}],
+                    },
+                ],
+            }
+            proc = subprocess.run(
+                [sys.executable, "-c", patch_ops.REMOTE_CODEX_PATCH_PY],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads(proc.stdout)
+            self.assertEqual(result["status"], "applied")
+            self.assertFalse(source.exists())
+            self.assertEqual(target.read_text(encoding="utf-8"), "new\n")
+
     def test_codex_patch_is_atomic_across_multiple_files_on_late_context_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
