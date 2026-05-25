@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("REMOTE_DEV_SESSION_ID", f"mcp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
 
 SUBSTRATE_ROOT = Path(__file__).resolve().parents[1]
 if str(SUBSTRATE_ROOT) not in sys.path:

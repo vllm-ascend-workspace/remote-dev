@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import os
 import sys
 import json
 import subprocess
@@ -162,6 +164,23 @@ class McpSchemaTests(unittest.TestCase):
         response = json.loads(body.decode("utf-8"))
         self.assertEqual(response["id"], 1)
         self.assertIn("tools", response["result"])
+
+    def test_mcp_server_sets_process_level_ledger_scope(self) -> None:
+        from core.state_store import resolve_ledger_scope
+
+        original = os.environ.pop("REMOTE_DEV_SESSION_ID", None)
+        try:
+            import mcp.server as mcp_server
+
+            importlib.reload(mcp_server)
+            scope = resolve_ledger_scope()
+            self.assertTrue(scope.startswith("mcp-"))
+            self.assertNotEqual(scope, "default")
+        finally:
+            if original is None:
+                os.environ.pop("REMOTE_DEV_SESSION_ID", None)
+            else:
+                os.environ["REMOTE_DEV_SESSION_ID"] = original
 
 
 if __name__ == "__main__":

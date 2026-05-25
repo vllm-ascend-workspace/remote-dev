@@ -6,7 +6,7 @@ Last updated: 2026-05-25.
 
 - Local contract gates pass:
   - `python3 -m compileall -q .remote-dev .agents`
-  - `python3 -m unittest discover -s .remote-dev/tests` -> 68 tests
+  - `python3 -m unittest discover -s .remote-dev/tests` -> 70 tests
   - `python3 -m unittest discover -s .agents/tests` -> 15 tests
   - `python3 .remote-dev/tools/sync_claude_skills.py --check`
   - `git diff --check -- .remote-dev .agents AGENTS.md CLAUDE.md .mcp.json .codex .claude .gitignore`
@@ -88,6 +88,10 @@ Last updated: 2026-05-25.
   blocks secret-like command argv even without hooks.
 - Remote read, grep, job-tail, and bash text output are capped; full logs remain
   available through refs/resources.
+- Claude project skills are lightweight generated shims that point back to the
+  canonical `.agents/skills/<name>/SKILL.md` sources instead of full mirrors.
+- The MCP server sets a process-local `REMOTE_DEV_SESSION_ID` so default read
+  ledgers are isolated per server process.
 - Remote toolbox explicit `--job-id` duplicates are blocked before remote process
   launch; non-ok `remote_job_start.py` statuses now exit nonzero.
 - Added `validate_remote_dev_scaffold.py` as a repeatable JSON-reporting local

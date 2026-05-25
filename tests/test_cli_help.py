@@ -26,7 +26,7 @@ class CliHelpTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertIn("usage:", proc.stdout)
 
-    def test_claude_skill_mirror_check_passes(self) -> None:
+    def test_claude_skill_shim_check_passes(self) -> None:
         proc = subprocess.run(
             [sys.executable, str(ROOT / ".remote-dev" / "tools" / "sync_claude_skills.py"), "--check"],
             capture_output=True,
@@ -34,6 +34,16 @@ class CliHelpTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_claude_skills_are_lightweight_shims(self) -> None:
+        for source in sorted((ROOT / ".agents" / "skills").glob("*/SKILL.md")):
+            target = ROOT / ".claude" / "skills" / source.parent.name / "SKILL.md"
+            with self.subTest(skill=source.parent.name):
+                self.assertTrue(target.exists())
+                body = target.read_text(encoding="utf-8")
+                self.assertIn(f"`.agents/skills/{source.parent.name}/SKILL.md`", body)
+                self.assertLessEqual(len(body.splitlines()), 60)
+                self.assertNotEqual(body, source.read_text(encoding="utf-8"))
 
     def test_cli_errors_return_result_contract_without_traceback(self) -> None:
         proc = subprocess.run(

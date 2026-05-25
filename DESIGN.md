@@ -28,7 +28,7 @@ Layer B is the shared substrate:
 - background job registry
 - artifact manifests and pull verification
 - Claude/Codex hook guards
-- MCP adapter
+- MCP server
 
 Layer C is the vLLM-Ascend workflow layer under `.agents/skills/`. Those skills
 should consume remote-dev tools instead of teaching agents a separate remote
@@ -50,7 +50,7 @@ including file moves and end-of-file markers, plus unified diffs.
 Phase 4 implements search, monitor/jobs, and artifact manifest/pull/push tools.
 
 Phase 5 adds MCP, Claude/Codex configuration examples, hook guards, and
-generated Claude skill mirrors.
+generated lightweight Claude skill shims.
 
 The MCP server supports standard stdio `Content-Length` JSON-RPC framing. The
 newline-delimited JSON-RPC mode is retained only as a lightweight local test
@@ -71,7 +71,7 @@ stdout/stderr reads, and local artifact manifests:
 Phase 6 keeps existing VAWS wrappers as compatibility backend while
 vLLM-Ascend skills are progressively rewritten as remote-dev consumers.
 
-Generated Claude Code skill mirrors are checked with:
+Generated Claude Code skill shims are checked with:
 
 ```bash
 python3 .remote-dev/tools/sync_claude_skills.py --check
