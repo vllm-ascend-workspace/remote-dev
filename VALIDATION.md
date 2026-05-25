@@ -6,7 +6,7 @@ Last updated: 2026-05-25.
 
 - Local contract gates pass:
   - `python3 -m compileall -q .remote-dev .agents`
-  - `python3 -m unittest discover -s .remote-dev/tests` -> 70 tests
+  - `python3 -m unittest discover -s .remote-dev/tests` -> 71 tests
   - `python3 -m unittest discover -s .agents/tests` -> 15 tests
   - `python3 .remote-dev/tools/sync_claude_skills.py --check`
   - `git diff --check -- .remote-dev .agents AGENTS.md CLAUDE.md .mcp.json .codex .claude .gitignore`
@@ -29,6 +29,15 @@ Last updated: 2026-05-25.
   `2d6fdc38c2fae31b165177210ccbfb974863777d7b7d6273edbdcb18b9146525`.
 - Both scratch sessions were removed with container, worktree, and lease cleanup;
   validation session records now show `status=removed`, and lease maps are empty.
+- Subagent-driven stress validation created three additional managed sessions
+  across two remote hosts, each with 10 parallel scratch workers. The initial
+  run exposed a Codex-format `remote.apply_patch` virtual-state bug for patches
+  that add a file and update/move it in the same payload. After the fix, a
+  10-worker managed-session rerun and a 10-worker direct-endpoint rerun both
+  passed.
+- Remote-toolbox stress passed on both stress hosts with parallelism 8, 24
+  concurrent `remote_exec` checks, 12 background jobs, and 256 artifact files
+  per host. Stress sessions and leases were cleaned up afterward.
 - Two NPU-leased managed sessions were created concurrently on `<npu-validation-host>`
   for heavy parallel validation:
   - `<heavy-session-a>` with isolated container SSH port and one leased NPU.
@@ -78,6 +87,8 @@ Last updated: 2026-05-25.
 - Unified `remote.apply_patch` records before sha and real diffstat.
 - Codex-format `remote.apply_patch` validates all ops before writing and rolls
   back best-effort if commit fails.
+- Codex-format `remote.apply_patch` now lets later ops read virtual files added
+  earlier in the same patch payload.
 - Unified-diff `remote.apply_patch` rejects symlink and non-regular targets in
   remote preflight before `git apply`.
 - Background `remote.bash` validates cwd before launching a job and preserves the
