@@ -268,28 +268,20 @@ class SafeLocalPathProperties(unittest.TestCase):
 
         run_cases(500, body, label="safe local artifact path")
 
-    @unittest.expectedFailure
-    def test_known_defect_parent_directories_are_created_outside_base_before_the_check(self) -> None:
-        """KNOWN DEFECT (medium-low): ``_safe_local_artifact_path`` runs
-        ``candidate.parent.mkdir(parents=True)`` *before* resolving and
-        comparing against ``base``. If the local artifact directory contains a
-        symlinked directory (``linkdir -> outside``), a manifest relpath such as
-        ``linkdir/sub/x`` creates ``outside/sub`` and only then rejects the path.
-        The rejection is correct; the side effect outside base is not.
-        Evidence: ``outside/sub`` exists after the ValueError."""
+    def test_parent_directories_are_not_created_outside_base(self) -> None:
+        """``mkdir(parents=True)`` used to run before the containment
+        check. A relpath through ``linkdir -> outside`` created
+        ``outside/sub`` and only then raised ValueError."""
         outside = self.base.parent / "outside"
         with self.assertRaises(ValueError):
             artifact_ops._safe_local_artifact_path(self.base, "linkdir/sub/x.bin")
         self.assertFalse((outside / "sub").exists(), "directory created outside the local artifact dir")
 
-    @unittest.expectedFailure
-    def test_known_defect_dangling_symlink_or_file_in_parent_position_crashes_the_pull(self) -> None:
-        """KNOWN DEFECT (low): when a manifest relpath descends through an
-        existing non-directory (a dangling symlink or a regular file), the
-        eager ``mkdir`` raises ``FileExistsError``/``NotADirectoryError``.
-        ``remote_artifact_pull`` only catches ``ValueError``, so the tool call
-        crashes with an internal error instead of a ``blocked`` result.
-        Evidence: ``FileExistsError`` for ``linkfile/sub/x``."""
+    def test_dangling_symlink_or_file_in_parent_position_is_value_error(self) -> None:
+        """A parent that is a dangling symlink or a regular file used to
+        raise ``FileExistsError`` from mkdir. ``remote_artifact_pull`` only
+        catches ``ValueError``, so the tool crashed instead of returning
+        ``blocked``."""
         (self.base / "plainfile").write_bytes(b"x")
         for relpath in ("linkfile/sub/x", "plainfile/x"):
             with self.subTest(relpath=relpath):
