@@ -52,7 +52,9 @@ if op == "glob":
     pattern = payload.get("pattern") or "*"
     limit = int(payload.get("limit") or 100)
     matches = []
-    for item in glob_mod.glob(pattern, root_dir=str(base), recursive=True):
+    # One-shot helper: chdir so glob(pattern, recursive=True) works on Python 3.9 (no root_dir).
+    os.chdir(str(base))
+    for item in glob_mod.glob(pattern, recursive=True):
         path = base / item
         try:
             st = path.lstat()
