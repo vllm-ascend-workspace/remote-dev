@@ -473,6 +473,61 @@ class LegacyLedgerMigrationTests(unittest.TestCase):
         unrelated = harness.write("shared.py", "fresh-context", "v3 from new context\n")
         self.assertEqual(unrelated["status"], "written", unrelated)
 
+    def test_legacy_v1_at_current_looking_path_is_not_authorization(self) -> None:
+        for ctx_a in ("agent/1", None):
+            for action in ("write", "edit", "multi_edit"):
+                with self.subTest(ctx_a=ctx_a, action=action):
+                    harness = LedgerHarness(self)
+                    harness.path("shared.py").write_text("v2 external\n", encoding="utf-8")
+                    ctx_b = state_store.resolve_ledger_scope(ctx_a)
+                    self.assertNotEqual(ctx_a, ctx_b)
+                    alias_path = _plant_legacy_ledger(
+                        harness, "shared.py", ctx_b, sha(b"v2 external\n")
+                    )
+                    current_path = read_ledger.ledger_path(
+                        harness.endpoint,
+                        join_under_root(harness.endpoint.root, harness.endpoint.effective_cwd, "shared.py"),
+                        ctx_a,
+                    )
+                    self.assertEqual(alias_path, current_path)
+                    saved = alias_path.read_bytes()
+                    if action == "write":
+                        result = harness.write("shared.py", ctx_a, "v3 from stale view\n")
+                    elif action == "edit":
+                        result = harness.edit("shared.py", ctx_a, "v2 external\n", "v3 from stale view\n")
+                    else:
+                        result = harness.multi_edit(
+                            "shared.py",
+                            ctx_a,
+                            [{"old_string": "v2 external\n", "new_string": "v3 from stale view\n"}],
+                        )
+                    self.assertEqual(result["status"], "read_required", result)
+                    self.assertEqual(harness.path("shared.py").read_text(encoding="utf-8"), "v2 external\n")
+                    self.assertEqual(alias_path.read_bytes(), saved)
+                    harness.read("shared.py", ctx_a)
+                    if action == "write":
+                        ok = harness.write("shared.py", ctx_a, "v3 after reread\n")
+                        ok_status = "written"
+                    elif action == "edit":
+                        ok = harness.edit("shared.py", ctx_a, "v2 external\n", "v3 after reread\n")
+                        ok_status = "edited"
+                    else:
+                        ok = harness.multi_edit(
+                            "shared.py",
+                            ctx_a,
+                            [{"old_string": "v2 external\n", "new_string": "v3 after reread\n"}],
+                        )
+                        ok_status = "edited"
+                    self.assertEqual(ok["status"], ok_status, ok)
+                    self.assertEqual(harness.path("shared.py").read_text(encoding="utf-8"), "v3 after reread\n")
+                    current = read_ledger.load_read(
+                        harness.endpoint,
+                        join_under_root(harness.endpoint.root, harness.endpoint.effective_cwd, "shared.py"),
+                        ctx_a,
+                    )
+                    self.assertEqual(current["schema_version"], state_store.LEDGER_SCHEMA_VERSION)
+                    self.assertEqual(current["ledger_scope_encoding"], state_store.LEDGER_SCOPE_ENCODING)
+
     def test_new_file_without_prior_read_still_writes(self) -> None:
         harness = LedgerHarness(self)
         result = harness.write("brand-new.py", "agent/1", "created without read\n")

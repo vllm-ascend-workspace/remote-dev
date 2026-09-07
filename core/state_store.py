@@ -17,6 +17,8 @@ LEDGER_SCOPE_ENV_VARS = ("CLAUDE_SESSION_ID", "CODEX_SESSION_ID", "CODEX_RUN_ID"
 LEDGER_SCOPE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 LEDGER_SCOPE_PREFIX = "id-"
 LEDGER_NO_CONTEXT_SCOPE = "default"
+LEDGER_SCHEMA_VERSION = "remote-dev.read_ledger.v2"
+LEDGER_SCOPE_ENCODING = "id-sha256"
 
 
 def state_root() -> Path:
@@ -196,7 +198,8 @@ def write_read_ledger(endpoint: Endpoint, file_info: dict[str, Any], client_cont
     scope = resolve_ledger_scope(client_context_id)
     path = read_ledger_path(endpoint, str(file_info["path"]), client_context_id)
     payload = {
-        "schema_version": "remote-dev.read_ledger.v1",
+        "schema_version": LEDGER_SCHEMA_VERSION,
+        "ledger_scope_encoding": LEDGER_SCOPE_ENCODING,
         "endpoint_id": endpoint.endpoint_id,
         "ledger_scope": scope,
         "file_path": file_info["path"],
@@ -223,14 +226,19 @@ def load_read_ledger(endpoint: Endpoint, file_path: str, client_context_id: str 
 class WriteLedgerGuard(NamedTuple):
     """Stale-write authorization for one (endpoint, file, context).
 
-    ``ledger`` is the current-scope record when one exists. ``read_required``
-    is True when only a pre-repair ledger exists for this context: that SHA
-    is not trusted, and the caller must re-read before writing.
+    ``ledger`` is a current-encoding record when one exists. ``read_required``
+    is True when only a pre-repair ledger exists for this context, including a
+    v1 file occupying the current-looking path: that SHA is not trusted, and
+    the caller must re-read before writing.
     """
 
     ledger: dict[str, Any] | None
     read_required: bool
     scope: str
+
+
+def _ledger_record_is_current(data: dict[str, Any]) -> bool:
+    return data.get("schema_version") == LEDGER_SCHEMA_VERSION and data.get("ledger_scope_encoding") == LEDGER_SCOPE_ENCODING
 
 
 def load_write_ledger_guard(
@@ -240,16 +248,17 @@ def load_write_ledger_guard(
 ) -> WriteLedgerGuard:
     """Load the write/edit guard without treating a mapping change as absence.
 
-    A current-scope ledger authorizes this context. A legacy-scope file for
-    the same effective id is preserved and forces a fresh same-context read
-    instead of using its SHA or allowing an unguarded overwrite.
+    A current-encoding ledger authorizes this context. A legacy v1 file is
+    preserved and forces a fresh same-context read instead of using its SHA,
+    even when it already occupies the current-looking path.
     """
     scope = resolve_ledger_scope(client_context_id)
     current = read_ledger_path(endpoint, file_path, client_context_id)
     if current.exists():
         data = read_json(current)
-        ledger = data if isinstance(data, dict) else None
-        return WriteLedgerGuard(ledger=ledger, read_required=False, scope=scope)
+        if isinstance(data, dict) and _ledger_record_is_current(data):
+            return WriteLedgerGuard(ledger=data, read_required=False, scope=scope)
+        return WriteLedgerGuard(ledger=None, read_required=True, scope=scope)
     raw = _effective_ledger_context_id(client_context_id)
     if raw:
         fingerprint = path_fingerprint(file_path)

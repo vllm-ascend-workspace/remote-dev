@@ -94,8 +94,9 @@ interactive calls should use the client's confirmation flow.
   retains the existing empty-string deletion behavior.
 - Path containment, symlink checks, read ledgers, patch atomicity, and SSH
   execution behavior are unchanged for client wiring. Read-ledger directory
-  names now use a uniform `id-<sha256>` encoding per nonempty context id;
-  see README. No client-specific schema fork is needed.
+  names now use a uniform `id-<sha256>` encoding per nonempty context id,
+  and current-encoding records use schema `remote-dev.read_ledger.v2`; see
+  README. No client-specific schema fork is needed.
 
 ## Transport/MCP compatibility verification (pre-lifecycle), 2026-08-27
 

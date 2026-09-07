@@ -135,6 +135,8 @@ class ReadLedgerTests(unittest.TestCase):
                 loaded = state_store.load_read_ledger(endpoint, "/vllm-workspace/foo.py", client_context_id="context-a")
                 self.assertIsNotNone(loaded)
                 self.assertEqual(loaded["ledger_scope"], scope_a)
+                self.assertEqual(loaded["schema_version"], state_store.LEDGER_SCHEMA_VERSION)
+                self.assertEqual(loaded["ledger_scope_encoding"], state_store.LEDGER_SCOPE_ENCODING)
             finally:
                 state_store.substrate_root = original  # type: ignore[assignment]
 
@@ -173,6 +175,47 @@ class ReadLedgerTests(unittest.TestCase):
                 other = state_store.load_write_ledger_guard(endpoint, file_path, "unrelated-context")
                 self.assertFalse(other.read_required)
                 self.assertIsNone(other.ledger)
+            finally:
+                state_store.substrate_root = original  # type: ignore[assignment]
+
+    def test_write_guard_rejects_legacy_v1_at_current_looking_path(self) -> None:
+        endpoint = Endpoint(host="1.2.3.4", port=46000)
+        file_path = "/vllm-workspace/foo.py"
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=False):
+            for name in state_store.LEDGER_SCOPE_ENV_VARS:
+                os.environ.pop(name, None)
+            original = state_store.substrate_root
+            try:
+                state_store.substrate_root = lambda: Path(tmp)  # type: ignore[assignment]
+                for ctx in ("agent/1", None):
+                    with self.subTest(ctx=ctx):
+                        current_scope = state_store.resolve_ledger_scope(ctx)
+                        current_path = (
+                            state_store.ensure_endpoint_state(endpoint)
+                            / "reads"
+                            / current_scope
+                            / f"{path_fingerprint(file_path)}.json"
+                        )
+                        state_store.atomic_write_json(
+                            current_path,
+                            {
+                                "schema_version": "remote-dev.read_ledger.v1",
+                                "endpoint_id": endpoint.endpoint_id,
+                                "ledger_scope": current_scope,
+                                "file_path": file_path,
+                                "sha256": "legacy-matching-sha",
+                                "size": 3,
+                                "mtime_ns": 1,
+                            },
+                        )
+                        guard = state_store.load_write_ledger_guard(endpoint, file_path, ctx)
+                        self.assertTrue(guard.read_required, current_scope)
+                        self.assertIsNone(guard.ledger)
+                        self.assertEqual(guard.scope, current_scope)
+                        self.assertTrue(current_path.exists())
+                        loaded = state_store.load_read_ledger(endpoint, file_path, ctx)
+                        self.assertIsNotNone(loaded)
+                        self.assertEqual(loaded["sha256"], "legacy-matching-sha")
             finally:
                 state_store.substrate_root = original  # type: ignore[assignment]
 

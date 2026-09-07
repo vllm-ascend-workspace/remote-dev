@@ -80,10 +80,13 @@ no-context fallback remains `default` and does not collide with a caller who
 explicitly supplies that word. A ledger is never required for an edit or
 write of a file this context has not previously read. After a successful
 read, later writes in that context are checked against the recorded SHA.
-Ledgers written by earlier encodings are kept in place; a write or edit that
-finds only those older files returns structured `read_required` until the
-same context reads the file again. A legacy shared SHA is not authorization
-for a distinct context.
+Ledgers written by earlier encodings are kept in place. A write or edit that
+finds only those older files — including a v1 record occupying the current
+`id-<sha256>` or `default` path — returns structured `read_required` until
+the same context reads the file again. Path or `ledger_scope` matching the
+current computed string is not enough: only a record written under the
+current encoding (schema `remote-dev.read_ledger.v2`) authorizes a later
+write. A legacy shared SHA is not authorization for a distinct context.
 
 ## Resolver plugin interface
 
