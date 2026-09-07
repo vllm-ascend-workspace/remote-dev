@@ -175,7 +175,18 @@ python3 tools/remote_bash.py --selector session_id=abc --command 'nproc'
 | `REMOTE_DEV_ENDPOINTS_FILE`     | Alias file(s), `os.pathsep` separated, read first         |
 | `REMOTE_DEV_STATE_DIR`          | Local state directory (default `<checkout>/state`)        |
 | `REMOTE_DEV_SSH_MUX_DIR`        | OpenSSH ControlMaster dir (default `~/.ssh/remote-dev-mux`)|
+| `REMOTE_DEV_SSH_MUX`            | Process SSH multiplexing: unset or `1` uses the shared ControlMaster; `0` forces independent connections; other values error |
 | `REMOTE_DEV_SESSION_ID`         | Read-ledger scope when no client id is given              |
+
+`REMOTE_DEV_SSH_MUX` is process-scoped and is read without changing global SSH
+configuration or the shared ControlMaster socket. Leave it unset or set it to
+`1` to keep today's shared-mux path, including the per-identity `ControlPath`
+suffix. Set it to exact `0` in a CLI process that must not join the shared
+master (`ControlMaster=no`, `ControlPath=none`, `ControlPersist=no` on every
+SSH invocation from that process). Accepted values are unset, `1`, and `0`;
+any other value is a configuration error. Ordinary serving and parity calls
+keep the default shared mux; a caller that needs independent connections must
+set `0` in that process.
 
 ## MCP server and clients
 
