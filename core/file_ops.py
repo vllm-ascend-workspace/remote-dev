@@ -9,7 +9,7 @@ from .path_policy import assert_under_root, join_under_root
 from .preview import MAX_LINE_CHARS, MAX_READ_LINES, compact_text
 from .result import make_result, new_invocation_id, utc_now_iso
 from .ssh_transport import run_remote_python
-from .state_store import load_read_ledger, resolve_ledger_scope, write_read_ledger
+from .state_store import load_write_ledger_guard, resolve_ledger_scope, write_read_ledger
 
 REMOTE_FILE_PY = r'''
 import difflib
@@ -384,7 +384,11 @@ def remote_write(
         path = join_under_root(endpoint.root, endpoint.effective_cwd, file_path)
     except PathPolicyError as exc:
         return _path_blocked_result(endpoint, "remote.write", file_path, str(exc), started, start)
-    ledger = load_read_ledger(endpoint, path, client_context_id)
+    expected_sha, blocked = _expected_sha256_or_read_required(
+        endpoint, path, client_context_id, "remote.write", started, start
+    )
+    if blocked:
+        return blocked
     data = run_remote_python(
         endpoint,
         REMOTE_FILE_PY,
@@ -396,7 +400,7 @@ def remote_write(
             "content": content,
             "overwrite": overwrite,
             "create_dirs": create_dirs,
-            "expected_sha256": ledger.get("sha256") if ledger else None,
+            "expected_sha256": expected_sha,
         },
         timeout_ms=timeout_ms,
     )
@@ -419,7 +423,11 @@ def remote_edit(
         path = join_under_root(endpoint.root, endpoint.effective_cwd, file_path)
     except PathPolicyError as exc:
         return _path_blocked_result(endpoint, "remote.edit", file_path, str(exc), started, start)
-    ledger = load_read_ledger(endpoint, path, client_context_id)
+    expected_sha, blocked = _expected_sha256_or_read_required(
+        endpoint, path, client_context_id, "remote.edit", started, start
+    )
+    if blocked:
+        return blocked
     data = run_remote_python(
         endpoint,
         REMOTE_FILE_PY,
@@ -431,7 +439,7 @@ def remote_edit(
             "old_string": old_string,
             "new_string": new_string,
             "replace_all": replace_all,
-            "expected_sha256": ledger.get("sha256") if ledger else None,
+            "expected_sha256": expected_sha,
         },
         timeout_ms=timeout_ms,
     )
@@ -452,7 +460,11 @@ def remote_multi_edit(
         path = join_under_root(endpoint.root, endpoint.effective_cwd, file_path)
     except PathPolicyError as exc:
         return _path_blocked_result(endpoint, "remote.multi_edit", file_path, str(exc), started, start)
-    ledger = load_read_ledger(endpoint, path, client_context_id)
+    expected_sha, blocked = _expected_sha256_or_read_required(
+        endpoint, path, client_context_id, "remote.multi_edit", started, start
+    )
+    if blocked:
+        return blocked
     data = run_remote_python(
         endpoint,
         REMOTE_FILE_PY,
@@ -462,11 +474,48 @@ def remote_multi_edit(
             "cwd": endpoint.effective_cwd,
             "file_path": path,
             "edits": edits,
-            "expected_sha256": ledger.get("sha256") if ledger else None,
+            "expected_sha256": expected_sha,
         },
         timeout_ms=timeout_ms,
     )
     return _write_like_result(endpoint, "remote.multi_edit", path, data, started, start, client_context_id=client_context_id)
+
+
+def _expected_sha256_or_read_required(
+    endpoint: Endpoint,
+    path: str,
+    client_context_id: str | None,
+    tool: str,
+    started: str,
+    start: float,
+) -> tuple[str | None, dict[str, Any] | None]:
+    guard = load_write_ledger_guard(endpoint, path, client_context_id)
+    if guard.read_required:
+        return None, _read_required_result(endpoint, tool, path, started, start, guard.scope)
+    return (guard.ledger.get("sha256") if guard.ledger else None), None
+
+
+def _read_required_result(
+    endpoint: Endpoint,
+    tool: str,
+    path: str,
+    started: str,
+    start: float,
+    ledger_scope: str,
+) -> dict[str, Any]:
+    error = "re-read this file in the same client context before writing; an older ledger scope is not authorization"
+    result = make_result(
+        tool=tool,
+        target=endpoint.to_result_target(),
+        outcome="blocked",
+        status="read_required",
+        summary=f"{tool} blocked for {path}",
+        started_at=started,
+        duration_ms=_duration_ms(start),
+        preview={"stderr": error},
+        extra={"error": error, "ledger_scope": ledger_scope},
+    )
+    return {"text": result["summary"] + "\n" + error + "\n", "result": result}
 
 
 def _write_like_result(

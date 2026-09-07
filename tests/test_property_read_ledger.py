@@ -25,13 +25,16 @@ from typing import Any
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+TESTS = Path(__file__).resolve().parent
+for _path in (ROOT, TESTS):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 import core.file_ops as file_ops  # noqa: E402
 import core.read_ledger as read_ledger  # noqa: E402
 import core.state_store as state_store  # noqa: E402
 from core.endpoint import Endpoint  # noqa: E402
+from core.path_policy import join_under_root, path_fingerprint  # noqa: E402
 from test_property_support import DOC_HOSTS, MULTIBYTE, Gen, run_cases, run_remote_script  # noqa: E402
 
 CONTEXTS = ("ctx-a", "ctx-b", None)
@@ -175,9 +178,13 @@ class StaleWriteGuardProperties(unittest.TestCase):
             harness = LedgerHarness(self)
             rel = "/".join(gen.text("abc_" + MULTIBYTE, 1, 6) for _ in range(gen.integer(1, 3)))
             path = str(harness.root / rel)
-            # At least one ASCII alphanumeric keeps the context out of the
-            # fingerprint fallback (see the known defect in LedgerScopeProperties).
-            ctx = gen.choice((None, gen.text("abc019", 1, 1) + gen.text("abc/ .:" + MULTIBYTE, 0, 29)))
+            ctx = gen.choice((
+                None,
+                gen.text("abc019", 1, 1) + gen.text("abc/ .:" + MULTIBYTE, 0, 29),
+                gen.text(".-_", 1, 8),
+                gen.text(MULTIBYTE, 1, 4),
+                "a" * gen.integer(81, 100),
+            ))
             info = {"path": path, "sha256": gen.text("0123456789abcdef", 64, 64), "size": gen.integer(0, 10**6), "mtime_ns": gen.integer(0, 10**18), "offset": 1, "limit": 200}
             ledger_path = read_ledger.record_read(harness.endpoint, info, ctx)
             self.assertTrue(ledger_path.is_relative_to(harness.state), "ledger must live under the substrate state dir")
@@ -204,11 +211,9 @@ class LedgerScopeProperties(unittest.TestCase):
 
     def test_scope_is_a_safe_single_path_segment(self) -> None:
         def body(gen: Gen, _index: int) -> None:
-            # Shapes that reach the fingerprint fallback (no ASCII alphanumeric,
-            # or longer than 80 chars) are covered by the known-defect test.
             raw = gen.one_of(
                 lambda: gen.text("abcXYZ019", 1, 1) + gen.text("abcXYZ019_.-/\\ :;\n\x00" + MULTIBYTE, 0, 39),
-                lambda: gen.choice(("", "/a", "a/../b", "-a-", "_b_", ".c.", "a" * 80, "/" + "a" * 79)),
+                lambda: gen.choice(("", "/a", "a/../b", "-a-", "_b_", ".c.", "a" * 80, "/" + "a" * 79, "...", "漢字", "a" * 81)),
             )
             scope = state_store.resolve_ledger_scope(raw)
             self.assertRegex(scope, r"^[A-Za-z0-9_.-]+$")
@@ -217,11 +222,15 @@ class LedgerScopeProperties(unittest.TestCase):
             self.assertLessEqual(len(scope), 80)
             self.assertEqual(scope, state_store.resolve_ledger_scope(raw), "scope must be deterministic")
             if not raw:
-                self.assertEqual(scope, "default")
+                self.assertEqual(scope, state_store.LEDGER_NO_CONTEXT_SCOPE)
+            else:
+                self.assertRegex(scope, r"^id-[0-9a-f]{64}$")
+                self.assertNotEqual(scope, raw)
+                self.assertNotEqual(scope, state_store.resolve_ledger_scope(scope))
 
         run_cases(600, body, label="ledger scope safety")
 
-    def test_environment_fallback_is_ordered_and_sanitized(self) -> None:
+    def test_environment_fallback_is_ordered_and_encoded(self) -> None:
         def body(gen: Gen, _index: int) -> None:
             chosen = gen.subset(state_store.LEDGER_SCOPE_ENV_VARS)
             for name in state_store.LEDGER_SCOPE_ENV_VARS:
@@ -229,33 +238,57 @@ class LedgerScopeProperties(unittest.TestCase):
             for name in chosen:
                 os.environ[name] = f"{name.lower()}/value"
             scope = state_store.resolve_ledger_scope(None)
+            explicit = state_store.resolve_ledger_scope("explicit")
+            self.assertRegex(explicit, r"^id-[0-9a-f]{64}$")
             if not chosen:
-                self.assertEqual(scope, "default")
+                self.assertEqual(scope, state_store.LEDGER_NO_CONTEXT_SCOPE)
+                self.assertNotEqual(explicit, scope)
             else:
                 first = next(name for name in state_store.LEDGER_SCOPE_ENV_VARS if name in chosen)
-                sanitized = f"{first.lower()}_value"
-                self.assertTrue(scope.startswith(sanitized), (scope, sanitized))
-                self.assertNotEqual(scope, sanitized, "sanitized env values must keep a disambiguating digest")
-            self.assertEqual(state_store.resolve_ledger_scope("explicit"), "explicit", "explicit context wins over env")
+                raw = f"{first.lower()}/value"
+                self.assertEqual(scope, state_store.resolve_ledger_scope(raw))
+                self.assertNotEqual(scope, raw)
+                self.assertNotEqual(explicit, scope, "explicit context wins over env")
 
         run_cases(64, body, label="ledger scope env fallback")
 
     def test_long_or_punctuation_only_context_ids_degrade_to_a_safe_scope(self) -> None:
-        """Client context ids are not under our control. Falling back to
-        ``path_fingerprint`` (which requires an absolute remote path) made
-        ``resolve_ledger_scope('a' * 81)`` and ``resolve_ledger_scope('...')``
-        raise ``PathPolicyError`` before any remote call. Hash the raw id
-        instead so every file tool still gets a single safe path segment."""
+        """Client context ids are not under our control. Hash every nonempty
+        effective id so every file tool still gets a single safe path segment."""
         for raw in ("a" * 81, "...", "-_-", "漢字", "sess-" + "0" * 90):
             scope = state_store.resolve_ledger_scope(raw)
-            self.assertRegex(scope, r"^[A-Za-z0-9_.-]+$")
+            self.assertRegex(scope, r"^id-[0-9a-f]{64}$")
             self.assertLessEqual(len(scope), 80)
+
+    def test_distinct_effective_ids_map_to_distinct_scopes(self) -> None:
+        def body(gen: Gen, _index: int) -> None:
+            raw_a = gen.one_of(
+                lambda: gen.text("abcXYZ019_.-/:" + MULTIBYTE, 1, 24),
+                lambda: gen.choice(("agent/1", "agent_1", "agent_1-e23fba9d", "default", "...", "-_-", "a" * 81, "")),
+            )
+            raw_b = gen.one_of(
+                lambda: gen.text("abcXYZ019_.-/:" + MULTIBYTE, 1, 24),
+                lambda: gen.choice(("agent/1", "agent_1", "agent_1-e23fba9d", "default", "explicit", "漢字")),
+            )
+            if raw_a:
+                encoded = state_store.resolve_ledger_scope(raw_a)
+                self.assertNotEqual(encoded, state_store.resolve_ledger_scope(encoded))
+            effective_a = raw_a or None
+            effective_b = raw_b or None
+            scope_a = state_store.resolve_ledger_scope(effective_a)
+            scope_b = state_store.resolve_ledger_scope(effective_b)
+            if (raw_a or "") != (raw_b or ""):
+                self.assertNotEqual(scope_a, scope_b, (raw_a, raw_b, scope_a, scope_b))
+            else:
+                self.assertEqual(scope_a, scope_b)
+
+        run_cases(400, body, label="ledger scope injectivity")
 
     def test_distinct_contexts_do_not_share_one_ledger_scope(self) -> None:
         """Unsafe characters used to map to ``_`` without a digest, so
         ``agent/1`` and ``agent_1`` shared a ledger directory. Context B's
         fresh read then refreshed "A's" guard and A's stale write passed.
-        Sanitized-but-changed ids now carry a digest of the raw value."""
+        Every nonempty id now uses a uniform hash encoding."""
         harness = LedgerHarness(self)
         harness.path("shared.py").write_text("v1\n", encoding="utf-8")
         harness.read("shared.py", "agent/1")
@@ -264,6 +297,187 @@ class LedgerScopeProperties(unittest.TestCase):
         result = harness.write("shared.py", "agent/1", "v3 from a stale view\n")
         self.assertNotEqual(state_store.resolve_ledger_scope("agent/1"), state_store.resolve_ledger_scope("agent_1"))
         self.assertEqual(result["status"], "file_changed_since_read", result)
+        self.assertEqual(harness.path("shared.py").read_text(encoding="utf-8"), "v2 external\n")
+
+
+def _plant_legacy_ledger(harness: LedgerHarness, rel: str, scope: str, digest: str) -> Path:
+    file_path = join_under_root(harness.endpoint.root, harness.endpoint.effective_cwd, rel)
+    legacy_path = (
+        state_store.ensure_endpoint_state(harness.endpoint)
+        / "reads"
+        / scope
+        / f"{path_fingerprint(file_path)}.json"
+    )
+    state_store.atomic_write_json(
+        legacy_path,
+        {
+            "schema_version": "remote-dev.read_ledger.v1",
+            "endpoint_id": harness.endpoint.endpoint_id,
+            "ledger_scope": scope,
+            "file_path": file_path,
+            "sha256": digest,
+            "size": 3,
+            "mtime_ns": 1,
+            "read_at": "2026-01-01T00:00:00Z",
+        },
+    )
+    return legacy_path
+
+
+class EncodedLookalikeIsolationTests(unittest.TestCase):
+    """A raw id equal to another id's encoded namespace must not share a ledger."""
+
+    def test_encoded_lookalike_cannot_refresh_stale_write_guard(self) -> None:
+        ctx_a = "agent/1"
+        ctx_b = "agent_1-e23fba9d"
+        self.assertNotEqual(state_store.resolve_ledger_scope(ctx_a), state_store.resolve_ledger_scope(ctx_b))
+        harness = LedgerHarness(self)
+        harness.path("shared.py").write_text("v1\n", encoding="utf-8")
+        harness.read("shared.py", ctx_a)
+        harness.path("shared.py").write_text("v2 external\n", encoding="utf-8")
+        harness.read("shared.py", ctx_b)
+        result = harness.write("shared.py", ctx_a, "v3 from stale view\n")
+        self.assertEqual(result["status"], "file_changed_since_read", result)
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(harness.path("shared.py").read_text(encoding="utf-8"), "v2 external\n")
+        harness.read("shared.py", ctx_a)
+        self.assertEqual(harness.write("shared.py", ctx_a, "v3 after reread\n")["status"], "written")
+        self.assertEqual(harness.path("shared.py").read_text(encoding="utf-8"), "v3 after reread\n")
+
+    def test_absent_context_and_explicit_default_are_distinct(self) -> None:
+        harness = LedgerHarness(self)
+        self.assertEqual(state_store.resolve_ledger_scope(None), state_store.LEDGER_NO_CONTEXT_SCOPE)
+        self.assertNotEqual(state_store.resolve_ledger_scope("default"), state_store.LEDGER_NO_CONTEXT_SCOPE)
+        harness.path("shared.py").write_text("v1\n", encoding="utf-8")
+        harness.read("shared.py", None)
+        harness.path("shared.py").write_text("v2 external\n", encoding="utf-8")
+        harness.read("shared.py", "default")
+        result = harness.write("shared.py", None, "v3 from stale default\n")
+        self.assertEqual(result["status"], "file_changed_since_read", result)
+        self.assertEqual(harness.path("shared.py").read_text(encoding="utf-8"), "v2 external\n")
+        harness.read("shared.py", None)
+        self.assertEqual(harness.write("shared.py", None, "v3 after reread\n")["status"], "written")
+
+    def test_current_encoded_scope_used_as_raw_id_stays_independent(self) -> None:
+        ctx_a = "agent/1"
+        ctx_b = state_store.resolve_ledger_scope(ctx_a)
+        harness = LedgerHarness(self)
+        harness.path("shared.py").write_text("v1\n", encoding="utf-8")
+        harness.read("shared.py", ctx_a)
+        harness.path("shared.py").write_text("v2 external\n", encoding="utf-8")
+        harness.read("shared.py", ctx_b)
+        result = harness.write("shared.py", ctx_a, "v3 from stale view\n")
+        self.assertEqual(result["status"], "file_changed_since_read", result)
+        self.assertEqual(harness.path("shared.py").read_text(encoding="utf-8"), "v2 external\n")
+
+    def test_write_edit_and_multi_edit_keep_independent_ledgers(self) -> None:
+        ctx_a = "agent/1"
+        ctx_b = "agent_1-e23fba9d"
+        for action in ("write", "edit", "multi_edit"):
+            with self.subTest(action=action):
+                harness = LedgerHarness(self)
+                harness.path("shared.py").write_text("v1\n", encoding="utf-8")
+                harness.read("shared.py", ctx_a)
+                harness.path("shared.py").write_text("v2 external\n", encoding="utf-8")
+                harness.read("shared.py", ctx_b)
+                if action == "write":
+                    blocked = harness.write("shared.py", ctx_a, "v3 from stale view\n")
+                elif action == "edit":
+                    blocked = harness.edit("shared.py", ctx_a, "v2 external\n", "v3 from stale view\n")
+                else:
+                    blocked = harness.multi_edit(
+                        "shared.py", ctx_a, [{"old_string": "v2 external\n", "new_string": "v3 from stale view\n"}]
+                    )
+                self.assertEqual(blocked["status"], "file_changed_since_read", blocked)
+                self.assertEqual(harness.path("shared.py").read_text(encoding="utf-8"), "v2 external\n")
+                if action == "write":
+                    allowed = harness.write("shared.py", ctx_b, "v3 from b\n")
+                    ok_status = "written"
+                elif action == "edit":
+                    allowed = harness.edit("shared.py", ctx_b, "v2 external\n", "v3 from b\n")
+                    ok_status = "edited"
+                else:
+                    allowed = harness.multi_edit(
+                        "shared.py", ctx_b, [{"old_string": "v2 external\n", "new_string": "v3 from b\n"}]
+                    )
+                    ok_status = "edited"
+                self.assertEqual(allowed["status"], ok_status, allowed)
+                self.assertEqual(harness.path("shared.py").read_text(encoding="utf-8"), "v3 from b\n")
+
+
+class LegacyLedgerMigrationTests(unittest.TestCase):
+    def test_legacy_disambiguated_ledger_requires_fresh_read_and_is_preserved(self) -> None:
+        harness = LedgerHarness(self)
+        harness.path("shared.py").write_text("v2 external\n", encoding="utf-8")
+        legacy_path = _plant_legacy_ledger(harness, "shared.py", "agent_1-e23fba9d", sha(b"v1\n"))
+        result = harness.write("shared.py", "agent/1", "v3 from stale view\n")
+        self.assertEqual(result["status"], "read_required", result)
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(harness.path("shared.py").read_text(encoding="utf-8"), "v2 external\n")
+        self.assertTrue(legacy_path.exists(), "legacy ledgers must not be deleted")
+        harness.read("shared.py", "agent/1")
+        self.assertEqual(harness.write("shared.py", "agent/1", "v3 after reread\n")["status"], "written")
+        self.assertEqual(harness.path("shared.py").read_text(encoding="utf-8"), "v3 after reread\n")
+        self.assertTrue(legacy_path.exists())
+        current = read_ledger.load_read(
+            harness.endpoint,
+            join_under_root(harness.endpoint.root, harness.endpoint.effective_cwd, "shared.py"),
+            "agent/1",
+        )
+        self.assertIsNotNone(current)
+        self.assertEqual(current["ledger_scope"], state_store.resolve_ledger_scope("agent/1"))
+        self.assertNotEqual(current["ledger_scope"], "agent_1-e23fba9d")
+
+    def test_legacy_sanitized_ledger_requires_fresh_read_for_write_edit_and_multi_edit(self) -> None:
+        for action in ("write", "edit", "multi_edit"):
+            with self.subTest(action=action):
+                harness = LedgerHarness(self)
+                harness.path("shared.py").write_text("v2 external\n", encoding="utf-8")
+                legacy_path = _plant_legacy_ledger(harness, "shared.py", "agent_1", sha(b"v1\n"))
+                if action == "write":
+                    result = harness.write("shared.py", "agent/1", "v3 from stale view\n")
+                elif action == "edit":
+                    result = harness.edit("shared.py", "agent/1", "v2 external\n", "v3 from stale view\n")
+                else:
+                    result = harness.multi_edit(
+                        "shared.py", "agent/1", [{"old_string": "v2 external\n", "new_string": "v3 from stale view\n"}]
+                    )
+                self.assertEqual(result["status"], "read_required", result)
+                self.assertEqual(harness.path("shared.py").read_text(encoding="utf-8"), "v2 external\n")
+                self.assertTrue(legacy_path.exists())
+                harness.read("shared.py", "agent/1")
+                if action == "write":
+                    ok = harness.write("shared.py", "agent/1", "v3 after reread\n")
+                    ok_status = "written"
+                elif action == "edit":
+                    ok = harness.edit("shared.py", "agent/1", "v2 external\n", "v3 after reread\n")
+                    ok_status = "edited"
+                else:
+                    ok = harness.multi_edit(
+                        "shared.py", "agent/1", [{"old_string": "v2 external\n", "new_string": "v3 after reread\n"}]
+                    )
+                    ok_status = "edited"
+                self.assertEqual(ok["status"], ok_status, ok)
+                self.assertTrue(legacy_path.exists())
+
+    def test_legacy_shared_sha_is_not_authorization_for_a_distinct_context(self) -> None:
+        harness = LedgerHarness(self)
+        harness.path("shared.py").write_text("v2 external\n", encoding="utf-8")
+        legacy_path = _plant_legacy_ledger(harness, "shared.py", "agent_1-e23fba9d", sha(b"v2 external\n"))
+        # The colliding raw id used to pass through onto this directory. Do not
+        # treat that shared SHA as a fresh read for this distinct context.
+        result = harness.write("shared.py", "agent_1-e23fba9d", "v3 stolen guard\n")
+        self.assertEqual(result["status"], "read_required", result)
+        self.assertEqual(harness.path("shared.py").read_text(encoding="utf-8"), "v2 external\n")
+        self.assertTrue(legacy_path.exists())
+        unrelated = harness.write("shared.py", "fresh-context", "v3 from new context\n")
+        self.assertEqual(unrelated["status"], "written", unrelated)
+
+    def test_new_file_without_prior_read_still_writes(self) -> None:
+        harness = LedgerHarness(self)
+        result = harness.write("brand-new.py", "agent/1", "created without read\n")
+        self.assertEqual(result["status"], "written", result)
+        self.assertEqual(harness.path("brand-new.py").read_text(encoding="utf-8"), "created without read\n")
 
 
 if __name__ == "__main__":

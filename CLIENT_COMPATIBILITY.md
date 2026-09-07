@@ -93,7 +93,9 @@ interactive calls should use the client's confirmation flow.
 - `remote_multi_edit.edits` exposes typed item fields; omitted `new_string`
   retains the existing empty-string deletion behavior.
 - Path containment, symlink checks, read ledgers, patch atomicity, and SSH
-  execution behavior are unchanged. No client-specific schema fork is needed.
+  execution behavior are unchanged for client wiring. Read-ledger directory
+  names now use a uniform `id-<sha256>` encoding per nonempty context id;
+  see README. No client-specific schema fork is needed.
 
 ## Transport/MCP compatibility verification (pre-lifecycle), 2026-08-27
 

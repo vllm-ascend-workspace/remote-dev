@@ -74,8 +74,16 @@ observe; they are the place to add policy if you need it.
 Read ledgers are optional optimistic-concurrency checks scoped by
 `client_context_id`, then `CLAUDE_SESSION_ID`, `CODEX_SESSION_ID`,
 `CODEX_RUN_ID`, `REMOTE_DEV_SESSION_ID`. The MCP server sets a process-local
-`REMOTE_DEV_SESSION_ID` at startup. A ledger is never required for an edit or
-write to be permitted.
+`REMOTE_DEV_SESSION_ID` at startup. Each nonempty effective context id is
+stored under one filesystem-safe directory `id-<sha256 of the raw id>`. The
+no-context fallback remains `default` and does not collide with a caller who
+explicitly supplies that word. A ledger is never required for an edit or
+write of a file this context has not previously read. After a successful
+read, later writes in that context are checked against the recorded SHA.
+Ledgers written by earlier encodings are kept in place; a write or edit that
+finds only those older files returns structured `read_required` until the
+same context reads the file again. A legacy shared SHA is not authorization
+for a distinct context.
 
 ## Resolver plugin interface
 
