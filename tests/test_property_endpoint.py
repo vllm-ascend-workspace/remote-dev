@@ -214,16 +214,16 @@ class DirectEndpointProperties(ResolverIsolation):
         with self.assertRaises(EndpointError):
             resolve_endpoint({"host": "203.0.113.5", "port": 22, "cwd": "relative"})
 
-    @unittest.expectedFailure
-    def test_known_defect_user_field_can_inject_ssh_options(self) -> None:
-        """KNOWN DEFECT (high): ``Endpoint.destination()`` is ``f"{user}@{host}"``
-        and is appended to ``ssh`` argv positionally. A ``user`` beginning with
-        ``-`` (from a tool argument or an alias file) is parsed by ``ssh`` as an
-        option — e.g. ``-oProxyCommand=...`` runs a local command. Neither
-        ``_direct_endpoint`` nor ``ssh_base_cmd`` rejects it or uses ``-l``.
-        Evidence: argv ends with ``'-oProxyCommand=marker@203.0.113.5'``."""
+    def test_user_field_cannot_inject_ssh_options(self) -> None:
+        """A ``user`` beginning with ``-`` (from a tool argument or an alias
+        file) used to be spliced into argv as ``user@host`` and parsed by
+        ``ssh`` as an option — e.g. ``-oProxyCommand=...`` ran a local
+        command. ``ssh_base_cmd`` now uses ``-l user`` and ``-- host``.
+        Evidence: the last destination token is the host, not an option."""
         endpoint = resolve_endpoint({"host": "203.0.113.5", "port": 22, "user": "-oProxyCommand=marker"})
         argv = ssh_base_cmd(endpoint)
+        self.assertEqual(argv[argv.index("-l") + 1], "-oProxyCommand=marker")
+        self.assertEqual(argv[argv.index("--") + 1], "203.0.113.5")
         destination = argv[-1]
         self.assertFalse(destination.startswith("-"), f"destination is parsed as an ssh option: {argv}")
 
@@ -233,8 +233,9 @@ class DirectEndpointProperties(ResolverIsolation):
             endpoint = resolve_endpoint({"host": gen.choice(DOC_HOSTS), "port": gen.integer(1, 65535), "user": user})
             argv = ssh_base_cmd(endpoint)
             self.assertEqual(argv[0], "ssh")
-            self.assertEqual(argv[-1], f"{user}@{endpoint.host}")
-            self.assertEqual(argv[-3:-1], ["-p", str(endpoint.port)])
+            self.assertEqual(argv[argv.index("-l") + 1], user)
+            self.assertEqual(argv[argv.index("-p") + 1], str(endpoint.port))
+            self.assertEqual(argv[argv.index("--") + 1], endpoint.host)
             timeout_options = [item for item in argv if item.startswith("ConnectTimeout=")]
             self.assertEqual(len(timeout_options), 1)
             self.assertGreaterEqual(int(timeout_options[0].split("=")[1]), 1)
