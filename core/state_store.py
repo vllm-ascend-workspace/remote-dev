@@ -121,12 +121,19 @@ def resolve_ledger_scope(client_context_id: str | None = None) -> str:
                 break
     if not raw:
         return "default"
-    safe = LEDGER_SCOPE_RE.sub("_", raw).strip("._-")
-    if not safe:
-        safe = _ledger_scope_digest(raw)
-    if len(safe) > 80:
-        safe = f"{safe[:48]}-{_ledger_scope_digest(raw)}"
-    return safe
+    sanitized = LEDGER_SCOPE_RE.sub("_", raw).strip("._-")
+    digest = _ledger_scope_digest(raw)
+    if not sanitized:
+        return digest
+    if sanitized != raw:
+        # Sanitization folded distinct ids onto one segment (`agent/1`
+        # and `agent_1`). Keep a digest so the stale-write guard cannot
+        # be refreshed by the other context.
+        suffix = "-" + digest[:8]
+        return sanitized[: 80 - len(suffix)] + suffix
+    if len(sanitized) > 80:
+        return f"{sanitized[:48]}-{digest}"
+    return sanitized
 
 
 def read_ledger_path(endpoint: Endpoint, file_path: str, client_context_id: str | None = None) -> Path:

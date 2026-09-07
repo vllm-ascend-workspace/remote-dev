@@ -233,7 +233,9 @@ class LedgerScopeProperties(unittest.TestCase):
                 self.assertEqual(scope, "default")
             else:
                 first = next(name for name in state_store.LEDGER_SCOPE_ENV_VARS if name in chosen)
-                self.assertEqual(scope, f"{first.lower()}_value")
+                sanitized = f"{first.lower()}_value"
+                self.assertTrue(scope.startswith(sanitized), (scope, sanitized))
+                self.assertNotEqual(scope, sanitized, "sanitized env values must keep a disambiguating digest")
             self.assertEqual(state_store.resolve_ledger_scope("explicit"), "explicit", "explicit context wins over env")
 
         run_cases(64, body, label="ledger scope env fallback")
@@ -249,15 +251,11 @@ class LedgerScopeProperties(unittest.TestCase):
             self.assertRegex(scope, r"^[A-Za-z0-9_.-]+$")
             self.assertLessEqual(len(scope), 80)
 
-    @unittest.expectedFailure
-    def test_known_defect_distinct_contexts_can_share_one_ledger_scope(self) -> None:
-        """KNOWN DEFECT (low-medium): ``resolve_ledger_scope`` maps unsafe
-        characters to ``_`` without a disambiguating digest, so distinct client
-        contexts such as ``agent/1`` and ``agent_1`` share a ledger directory.
-        With shared state, context A's stale write passes because context B's
-        fresh read refreshed "A's" ledger — the guard is bypassed by an
-        unrelated party. Evidence: ``resolve_ledger_scope('agent/1') ==
-        resolve_ledger_scope('agent_1')`` and the end-to-end write below."""
+    def test_distinct_contexts_do_not_share_one_ledger_scope(self) -> None:
+        """Unsafe characters used to map to ``_`` without a digest, so
+        ``agent/1`` and ``agent_1`` shared a ledger directory. Context B's
+        fresh read then refreshed "A's" guard and A's stale write passed.
+        Sanitized-but-changed ids now carry a digest of the raw value."""
         harness = LedgerHarness(self)
         harness.path("shared.py").write_text("v1\n", encoding="utf-8")
         harness.read("shared.py", "agent/1")

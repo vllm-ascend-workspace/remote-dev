@@ -53,6 +53,12 @@ class ReadLedgerTests(unittest.TestCase):
             finally:
                 state_store.substrate_root = original  # type: ignore[assignment]
 
+    def test_read_ledger_scope_separates_sanitized_lookalikes(self) -> None:
+        self.assertNotEqual(
+            state_store.resolve_ledger_scope("agent/1"),
+            state_store.resolve_ledger_scope("agent_1"),
+        )
+
     def test_read_ledger_scope_degrades_awkward_context_ids(self) -> None:
         for raw in ("a" * 81, "...", "-_-", "漢字"):
             scope = state_store.resolve_ledger_scope(raw)
