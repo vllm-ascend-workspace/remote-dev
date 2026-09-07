@@ -1,0 +1,55 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__remote-dev__remote_apply_patch",
+      "mcp__remote-dev__remote_artifact_manifest",
+      "mcp__remote-dev__remote_artifact_pull",
+      "mcp__remote-dev__remote_artifact_push",
+      "mcp__remote-dev__remote_read",
+      "mcp__remote-dev__remote_write",
+      "mcp__remote-dev__remote_edit",
+      "mcp__remote-dev__remote_multi_edit",
+      "mcp__remote-dev__remote_bash",
+      "mcp__remote-dev__remote_glob",
+      "mcp__remote-dev__remote_grep",
+      "mcp__remote-dev__remote_ls",
+      "mcp__remote-dev__remote_monitor",
+      "mcp__remote-dev__remote_job_status",
+      "mcp__remote-dev__remote_job_tail",
+      "mcp__remote-dev__remote_job_stop",
+      "mcp__remote-dev__remote_context_snapshot",
+      "mcp__remote-dev__remote_probe"
+    ],
+    "deny": [
+      "Bash(sshpass *)",
+      "Bash(expect *)",
+      "Bash(scp *)",
+      "Bash(sftp *)",
+      "Bash(rsync *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /absolute/path/to/remote-dev/hooks/claude_remote_guard.py",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__remote-dev__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /absolute/path/to/remote-dev/hooks/claude_remote_guard.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -6,8 +6,8 @@ import sys
 import unittest
 from pathlib import Path
 
-HOOKS = Path(__file__).resolve().parents[1] / "hooks"
-REPO_ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
+HOOKS = ROOT / "hooks"
 if str(HOOKS) not in sys.path:
     sys.path.insert(0, str(HOOKS))
 
@@ -112,10 +112,13 @@ class HookGuardTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stderr, "")
 
-    def test_claude_settings_hooks_mcp_remote_tools(self) -> None:
-        settings = json.loads((REPO_ROOT / ".claude" / "settings.example.json").read_text(encoding="utf-8"))
+    def test_claude_settings_example_hooks_mcp_remote_tools(self) -> None:
+        settings = json.loads((ROOT / "examples" / "claude-settings.example.json").read_text(encoding="utf-8"))
         matchers = {item["matcher"] for item in settings["hooks"]["PreToolUse"]}
         self.assertIn("mcp__remote-dev__.*", matchers)
+        for item in settings["hooks"]["PreToolUse"]:
+            for hook in item["hooks"]:
+                self.assertIn("hooks/claude_remote_guard.py", hook["command"])
 
     def test_codex_hook_returns_allow_json_shape(self) -> None:
         payload = {"tool_name": "remote.bash", "arguments": {"command": "curl --password secret"}}

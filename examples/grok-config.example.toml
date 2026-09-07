@@ -1,0 +1,13 @@
+# Grok Build project configuration for the remote-dev MCP server.
+# Copy to <project>/.grok/config.toml and replace the placeholder path.
+[mcp_servers.remote-dev]
+command = "python3"
+args = ["/absolute/path/to/remote-dev/mcp/server.py"]
+enabled = true
+startup_timeout_sec = 20
+tool_timeout_sec = 600
+
+[mcp_servers.remote-dev.env]
+REMOTE_DEV_DEFAULT_USER = "root"
+REMOTE_DEV_DEFAULT_ROOT = "/"
+REMOTE_DEV_DEFAULT_CWD = "/vllm-workspace"

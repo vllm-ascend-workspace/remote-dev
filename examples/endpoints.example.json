@@ -1,0 +1,12 @@
+{
+  "endpoints": {
+    "example-lab": {
+      "host": "example.invalid",
+      "port": 22,
+      "user": "root",
+      "root": "/",
+      "cwd": "/vllm-workspace",
+      "runtime_env_file": "/etc/profile.d/example-toolchain.sh"
+    }
+  }
+}
