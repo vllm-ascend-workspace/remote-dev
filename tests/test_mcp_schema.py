@@ -13,13 +13,13 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-REPO_ROOT = ROOT.parent
 
+import core.endpoint as endpoint_module  # noqa: E402
 import core.state_store as state_store  # noqa: E402
 import mcp.tools as mcp_tools  # noqa: E402
 from core.endpoint import Endpoint  # noqa: E402
 from core.ssh_transport import RemoteCompleted  # noqa: E402
-from mcp.schemas import ALIASES, ENDPOINT_SELECTOR_DESCRIPTION, TOOL_SCHEMAS  # noqa: E402
+from mcp.schemas import ALIASES, ENDPOINT_PROPS, ENDPOINT_SELECTOR_DESCRIPTION, TOOL_SCHEMAS  # noqa: E402
 from mcp.tools import list_resources, list_tools, read_resource  # noqa: E402
 
 
@@ -61,14 +61,32 @@ class McpSchemaTests(unittest.TestCase):
         for name in names:
             self.assertRegex(name, r"^[A-Za-z0-9_-]{1,64}$")
 
-    def test_cursor_entry_uses_the_shared_server_and_environment(self) -> None:
-        shared = json.loads((REPO_ROOT / ".mcp.json").read_text())["mcpServers"]["remote-dev"]
-        cursor = json.loads((REPO_ROOT / ".cursor" / "mcp.json").read_text())["mcpServers"]["remote-dev"]
-        self.assertEqual(cursor["type"], "stdio")
-        self.assertEqual(cursor["command"], shared["command"])
-        self.assertEqual(cursor["env"], shared["env"])
-        self.assertEqual(cursor["args"], shared["args"])
-        self.assertTrue((REPO_ROOT / shared["args"][0]).is_file())
+    def test_example_mcp_entry_points_at_the_server_and_documents_consumer_wiring(self) -> None:
+        example = json.loads((ROOT / "examples" / "mcp.json").read_text())["mcpServers"]["remote-dev"]
+        self.assertEqual(example["type"], "stdio")
+        self.assertEqual(example["command"], "python3")
+        self.assertTrue(example["args"][0].endswith("/mcp/server.py"))
+        self.assertTrue((ROOT / "mcp" / "server.py").is_file())
+        for key in ("REMOTE_DEV_DEFAULT_USER", "REMOTE_DEV_DEFAULT_ROOT", "REMOTE_DEV_DEFAULT_CWD", "REMOTE_DEV_RESOLVERS", "REMOTE_DEV_STATE_DIR"):
+            self.assertIn(key, example["env"])
+        # Example files must not carry real endpoint data.
+        text = json.dumps(example)
+        self.assertNotRegex(text, r"\b(?!0\.)(?:\d{1,3}\.){3}\d{1,3}\b")
+
+    def test_only_remote_tools_are_advertised(self) -> None:
+        # Coordinator/task facades (formerly vaws.*) are not remote-development
+        # semantics and live in the consumer, not in this server.
+        for name in TOOL_SCHEMAS:
+            self.assertTrue(name.startswith("remote."), name)
+        self.assertEqual(len(TOOL_SCHEMAS), 18)
+
+    def test_endpoint_props_carry_no_consumer_selectors(self) -> None:
+        for legacy in ("session_id", "session_file", "machine"):
+            self.assertNotIn(legacy, ENDPOINT_PROPS)
+        self.assertIn("runtime_env_file", ENDPOINT_PROPS)
+        # Consumer selector keys still travel through the open object.
+        for schema in TOOL_SCHEMAS.values():
+            self.assertTrue(schema["additionalProperties"])
 
     def test_underscore_aliases_map_to_canonical_names(self) -> None:
         self.assertEqual(ALIASES["remote_read"], "remote.read")
@@ -77,7 +95,7 @@ class McpSchemaTests(unittest.TestCase):
     def test_normal_tools_describe_endpoint_selector_requirement(self) -> None:
         job_tools = {"remote.job_status", "remote.job_tail", "remote.job_stop"}
         for name, schema in TOOL_SCHEMAS.items():
-            if name in job_tools or name.startswith("vaws."):
+            if name in job_tools:
                 self.assertNotIn(ENDPOINT_SELECTOR_DESCRIPTION, schema.get("description", ""))
             else:
                 self.assertIn(ENDPOINT_SELECTOR_DESCRIPTION, schema.get("description", ""), name)
@@ -119,22 +137,41 @@ class McpSchemaTests(unittest.TestCase):
     def test_missing_endpoint_is_rejected_before_tool_execution(self) -> None:
         from core.errors import EndpointError
 
-        lib_dir = str(REPO_ROOT / ".agents" / "lib")
-        if lib_dir not in sys.path:
-            sys.path.insert(0, lib_dir)
-        import vaws_remote_toolbox
-
-        # Hermetic regardless of the developer machine's own session bindings:
-        # simulate "no endpoint target anywhere" so the auto-bind path fails.
-        with patch.object(
-            vaws_remote_toolbox,
-            "resolve_remote_target",
-            side_effect=vaws_remote_toolbox.RemoteToolboxError("no session target (test)"),
-        ):
+        # Hermetic regardless of the developer machine's environment: with no
+        # resolver registered there is no target anywhere, so the server must
+        # refuse before touching the tool implementation.
+        with patch.object(endpoint_module, "_RESOLVERS", []), patch.object(endpoint_module, "_ENV_RESOLVERS_LOADED", True):
             with patch.object(mcp_tools, "remote_apply_patch") as execute:
                 with self.assertRaises(EndpointError):
                     mcp_tools.call_tool("remote.apply_patch", {"patch": "test"})
                 execute.assert_not_called()
+
+    def test_consumer_selector_reaches_registered_resolver_through_call_tool(self) -> None:
+        def by_session(payload):
+            return {"host": "10.0.0.9", "port": 2200, "cwd": "/w/" + payload["session_id"]} if payload.get("session_id") else None
+
+        entry = endpoint_module.RegisteredResolver(name="sessions", resolve=by_session, fields=("session_id",))
+        with patch.object(endpoint_module, "_RESOLVERS", [entry]), patch.object(endpoint_module, "_ENV_RESOLVERS_LOADED", True):
+            with patch.object(mcp_tools, "remote_apply_patch", return_value={}) as execute:
+                mcp_tools.call_tool("remote_apply_patch", {"session_id": "s9", "patch": "payload"})
+            endpoint = execute.call_args.args[0]
+            self.assertEqual((endpoint.host, endpoint.port, endpoint.cwd), ("10.0.0.9", 2200, "/w/s9"))
+            self.assertEqual(endpoint.kind, "resolver:sessions")
+
+    def test_job_tools_only_resolve_when_a_selector_is_present(self) -> None:
+        entry = endpoint_module.RegisteredResolver(name="sessions", resolve=lambda payload: {"host": "10.0.0.9", "port": 2200}, fields=("session_id",))
+        with patch.object(endpoint_module, "_RESOLVERS", [entry]), patch.object(endpoint_module, "_ENV_RESOLVERS_LOADED", True):
+            with patch.object(mcp_tools, "remote_job_status", return_value={}) as execute:
+                mcp_tools.call_tool("remote.job_status", {"job_id": "job-abc"})
+                self.assertIsNone(execute.call_args.args[0])
+                mcp_tools.call_tool("remote.job_status", {"job_id": "job-abc", "session_id": "s1"})
+                self.assertEqual(execute.call_args.args[0].host, "10.0.0.9")
+
+    def test_unknown_tool_is_rejected_before_endpoint_resolution(self) -> None:
+        with patch.object(mcp_tools, "resolve_endpoint") as resolve:
+            with self.assertRaises(KeyError):
+                mcp_tools.call_tool("vaws.session", {"context_file": "x"})
+            resolve.assert_not_called()
 
     def test_missing_patch_is_rejected_before_remote_execution(self) -> None:
         import core.patch_ops as patch_ops
@@ -244,7 +281,7 @@ class McpSchemaTests(unittest.TestCase):
         encoded = json.dumps(request, separators=(",", ":")).encode("utf-8")
         framed = b"Content-Length: " + str(len(encoded)).encode("ascii") + b"\r\n\r\n" + encoded
         proc = subprocess.run(
-            [sys.executable, str(REPO_ROOT / ".remote-dev" / "mcp" / "server.py")],
+            [sys.executable, str(ROOT / "mcp" / "server.py")],
             input=framed,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
