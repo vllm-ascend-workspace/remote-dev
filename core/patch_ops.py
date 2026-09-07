@@ -155,6 +155,8 @@ for op in ops:
             old = hunk["old"]
             new = hunk["new"]
             anchor = hunk.get("anchor") or ""
+            if old == "":
+                fail("context_mismatch", f"patch hunk has no context in {path}; refuse unanchored insertion", hunk_index=hunk_index)
             if old not in after_text:
                 fail("context_mismatch", f"patch context not found in {path}; re-run remote.read before retrying", hunk_index=hunk_index)
             if anchor:

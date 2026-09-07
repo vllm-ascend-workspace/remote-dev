@@ -457,17 +457,16 @@ class CodexExecutorProperties(unittest.TestCase):
         self.assertEqual(data["status"], "applied", data)
         self.assertEqual((root / "a.py").read_text(encoding="utf-8"), "def first():\n    return 1\n\ndef second():\n    return 2\n")
 
-    @unittest.expectedFailure
-    def test_known_defect_context_free_hunk_is_inserted_at_file_start(self) -> None:
-        """KNOWN DEFECT (low-medium): a hunk with only ``+`` lines has
-        ``old == ''``; ``'' in text`` is always true and ``replace('', new, 1)``
-        prepends. An unanchored insertion is applied at offset 0 and reported as
-        ``applied`` instead of being rejected as ambiguous.
-        Evidence: file becomes ``INSERTED\\none\\ntwo\\n``."""
+    def test_context_free_hunk_is_rejected(self) -> None:
+        """A hunk with only ``+`` lines has ``old == ''``. ``'' in text`` is
+        always true and ``replace('', new, 1)`` prepends, so an unanchored
+        insertion was applied at offset 0 and reported as ``applied``.
+        Refuse it as ambiguous instead."""
         root = self._root(5)
         (root / "a.py").write_text("one\ntwo\n", encoding="utf-8")
         data = self._run(root, [{"kind": "update", "path": "a.py", "hunks": [{"old": "", "new": "INSERTED\n"}]}])
         self.assertNotEqual(data["status"], "applied", "context-free hunk must be rejected, not prepended")
+        self.assertEqual((root / "a.py").read_text(encoding="utf-8"), "one\ntwo\n")
 
 
 class UnifiedDiffProperties(unittest.TestCase):
