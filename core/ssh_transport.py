@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .endpoint import Endpoint
+from .errors import RemoteExecutionError
 
 # ControlMaster socket directory. Consumers that already keep an OpenSSH mux
 # directory for their own tooling can point remote-dev at it so both share
@@ -20,6 +21,11 @@ _MUX_DIR = Path(os.environ.get("REMOTE_DEV_SSH_MUX_DIR") or (Path.home() / ".ssh
 # Decide mux-dir readiness once per process. None = undecided, True/False =
 # usable / not usable.
 _MUX_READY: bool | None = None
+
+# Process-scoped multiplexing switch. Unset or exact "1" keeps the shared
+# ControlMaster; exact "0" forces independent connections. Read on each
+# invocation; never written back to os.environ or cached as a module global.
+SSH_MUX_ENV = "REMOTE_DEV_SSH_MUX"
 
 
 @dataclass
@@ -67,7 +73,38 @@ def _control_master_options(identity_file: str | None = None) -> list[str]:
     ]
 
 
+def _independent_ssh_connection_options() -> list[str]:
+    # ControlMaster=no alone is not enough: a client can still attach to an
+    # existing ControlPath. ControlPath=none blocks socket reuse, and
+    # ControlPersist=no blocks inherited persistence.
+    return [
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "ControlPersist=no",
+    ]
+
+
+def _shared_mux_requested() -> bool:
+    """Read REMOTE_DEV_SSH_MUX without mutating os.environ or module globals."""
+    value = os.environ.get(SSH_MUX_ENV)
+    if value is None or value == "1":
+        return True
+    if value == "0":
+        return False
+    raise RemoteExecutionError(
+        f"{SSH_MUX_ENV}={value!r} is not supported; accepted values are unset, "
+        f"'1' (shared ControlMaster), or '0' (independent connections)"
+    )
+
+
 def ssh_base_cmd(endpoint: Endpoint) -> list[str]:
+    if _shared_mux_requested():
+        mux_options = _control_master_options(endpoint.identity_file)
+    else:
+        mux_options = _independent_ssh_connection_options()
     cmd = [
         "ssh",
         "-o",
@@ -78,7 +115,7 @@ def ssh_base_cmd(endpoint: Endpoint) -> list[str]:
         "LogLevel=ERROR",
         "-o",
         f"ConnectTimeout={max(1, int(endpoint.connect_timeout_ms / 1000))}",
-        *_control_master_options(endpoint.identity_file),
+        *mux_options,
     ]
     if endpoint.identity_file:
         cmd.extend(["-i", endpoint.identity_file])
