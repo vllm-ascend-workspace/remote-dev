@@ -1,6 +1,31 @@
-# Remote-Dev Scaffold Validation
+# Remote-Dev Validation Record
 
-Last updated: 2026-08-27.
+Last updated: 2026-09-07 (standalone extraction).
+
+## Standalone Extraction (2026-09-07)
+
+remote-dev was extracted from `.remote-dev/` in the vllm-ascend-workspace
+scaffold with `git filter-repo` (history preserved, files moved to the repo
+root) and then decoupled in reviewable commits: explicit-only endpoint
+resolution with a resolver plugin interface, removal of the VAWS task facade
+and the coordinator job supervisor, and environment-configured runtime
+preamble / mux dir / state dir. Local gates at extraction time on macOS with
+Python 3.11:
+
+- `python3 -m compileall -q .` passes.
+- `python3 -m unittest discover -s tests` passes (see `docs/HANDOFF.md` for
+  the count at the time of extraction and the list of removed/rewritten
+  tests).
+- `python3 tools/validate_remote_dev_scaffold.py --local-only` passes:
+  18 MCP tools, 18 CLI fallbacks, max 3 tool-specific required fields.
+
+Nothing below this line was rerun on the standalone checkout. All live
+endpoint, managed-session, parity, serving, benchmark and profiling evidence
+was collected inside the scaffold and depends on scaffold components
+(`session-management`, `remote-code-parity`, VAWS sessions) that are not part
+of this repository. The remote-endpoint behaviour of the standalone code is
+therefore **unproven without hardware** until the live smoke is rerun with
+`--host/--port` against a reachable SSH host.
 
 ## Current Client Compatibility Evidence (2026-08-27)
 

@@ -1,33 +1,43 @@
 # Remote-dev client compatibility
 
-Updated 2026-08-27. One server and one schema set serve every client; model
-credentials and provider settings are separate and are not changed by this setup.
+Updated 2026-09-07 for the standalone repository. One server and one schema
+set serve every client; model credentials and provider settings are separate
+and are not changed by this setup.
+
+> Evidence below dated 2026-08-27 was gathered while remote-dev lived at
+> `.remote-dev/` inside the vllm-ascend-workspace scaffold. Paths in that
+> section refer to that layout. The tool names, schemas, framing and dispatch
+> rules it exercised are unchanged here; the four `vaws_*` task tools it
+> mentions have since been removed (18 `remote_*` tools remain), and the
+> scaffold-specific selectors (`session_id`, `session_file`, `machine`) are
+> now consumer resolver fields rather than built-in schema properties.
 
 ## Configuration
 
-Start each client in this repository. Register the MCP once per client, not once
-per model:
+Register the MCP once per client in the *consuming* project, not once per
+model. Starting points live in `examples/`:
 
-| Client | Project configuration | Server identifier |
-| --- | --- | --- |
-| Kimi Code | `.mcp.json` | `remote-dev` |
-| Claude Code, including DeepSeek V4 | `.mcp.json` | `remote-dev` |
-| Cursor IDE / Cursor Agent | `.cursor/mcp.json` | `remote-dev` |
-| Codex | `.codex/config.toml` | `remote_dev` |
-| Grok Build | `.grok/config.toml` | `remote-dev` |
+| Client | Project configuration | Example | Server identifier |
+| --- | --- | --- | --- |
+| Kimi Code | `.mcp.json` | `examples/mcp.json` | `remote-dev` |
+| Claude Code, including DeepSeek V4 | `.mcp.json` | `examples/mcp.json` | `remote-dev` |
+| Cursor IDE / Cursor Agent | `.cursor/mcp.json` | `examples/mcp.json` | `remote-dev` |
+| Codex | `.codex/config.toml` | `examples/codex-config.example.toml` | `remote_dev` |
+| Grok Build | `.grok/config.toml` | `examples/grok-config.example.toml` | `remote-dev` |
 
-All entries launch `.remote-dev/mcp/server.py` with Python 3. Copy the Codex/Grok
-`config.example.toml` to the adjacent `config.toml`, then replace the placeholder
-checkout path. Actual machine-specific TOML files are ignored by Git. Do not add
-model credentials to these files. Restart existing sessions after schema/config
-changes so they rediscover tools.
+All entries launch `mcp/server.py` from this checkout with Python 3. Replace
+the placeholder absolute paths, and add `REMOTE_DEV_RESOLVERS`,
+`REMOTE_DEV_STATE_DIR`, `REMOTE_DEV_ENDPOINTS_FILE` and
+`REMOTE_DEV_RUNTIME_ENV_FILE` to the server `env` when the consumer needs
+them (see README). Do not add model credentials or real endpoint data to
+these files. Restart existing sessions after schema/config changes so they
+rediscover tools.
 
-Cursor's checked-in entry uses the same repository-relative server path as
-`.mcp.json`; open the repository as the workspace and run Cursor Agent from its
-root. Its [official MCP configuration](https://cursor.com/docs/mcp) documents
-`${workspaceFolder}` interpolation, but Cursor Agent `2026.08.25-3e8eec8` passed
-that expression literally to Python in a real startup check. The relative path
-avoids that CLI incompatibility. Use `cursor-agent` explicitly when Grok also
+Cursor's [official MCP configuration](https://cursor.com/docs/mcp) documents
+`${workspaceFolder}` interpolation, but Cursor Agent `2026.08.25-3e8eec8`
+passed that expression literally to Python in a real startup check. Use a
+project-relative path (when this checkout is vendored inside the project) or
+an absolute path instead. Use `cursor-agent` explicitly when Grok also
 provides an `agent` command; the shared MCP does not require changing either
 client's shell aliases.
 
@@ -76,8 +86,9 @@ interactive calls should use the client's confirmation flow.
   or `$ref`. Kimi's provider rejects the former root `type` plus `anyOf` shape
   before the requested tool is executed, including on an ordinary chat prompt.
 - Conditional requirements are documented in schema descriptions and enforced
-  by the existing server: supply `host` + `port`, an alias, or a managed selector;
-  supply non-empty `patch` or legacy `command` for patches. `patch` takes
+  by the existing server: supply `host` + `port`, an alias, or a selector
+  field claimed by a registered resolver plugin; supply non-empty `patch` or
+  legacy `command` for patches. `patch` takes
   precedence. Missing endpoint/payload is rejected before remote execution.
 - `remote_multi_edit.edits` exposes typed item fields; omitted `new_string`
   retains the existing empty-string deletion behavior.
@@ -134,9 +145,9 @@ Remote Python 3.9.9 unit validation:
   exactly the same 8 failures. No unrelated skill packages were changed to mask
   this baseline.
 
-The focused CI command is in `.github/workflows/remote-dev.yml`; the full suite
-can be reproduced with `python3 -B -m unittest discover -s .remote-dev/tests` on
-a remote validation host. These unit tests use temporary files and mocked
+The focused CI command was in the scaffold's `.github/workflows/remote-dev.yml`;
+this repository's `.github/workflows/ci.yml` runs the whole suite with
+`python3 -m unittest discover -s tests`. These unit tests use temporary files and mocked
 transports and do not require NPU access.
 
 These checks establish this MCP integration at the versions above, not every
