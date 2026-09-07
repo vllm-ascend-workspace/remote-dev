@@ -11,6 +11,7 @@ from .job_ops import start_remote_job
 from .path_policy import assert_under_root
 from .preview import compact_text, stdout_stderr_preview
 from .result import make_result, new_invocation_id, utc_now_iso
+from .runtime_env import runtime_env_lines
 from .ssh_transport import run_script
 from .state_store import atomic_write_json, atomic_write_text, new_log_dir
 
@@ -97,9 +98,7 @@ def remote_bash(
     started = utc_now_iso()
     start = time.monotonic()
     log_dir = new_log_dir(endpoint, "bash", invocation_id)
-    runtime_lines = [
-        "if [ -f /etc/profile.d/vaws-ascend-env.sh ]; then set +u; . /etc/profile.d/vaws-ascend-env.sh; set -u; fi"
-    ] if runtime_enabled else []
+    runtime_lines = runtime_env_lines(endpoint, runtime_enabled)
     validation = "\n".join(
         [
             "python3 - <<'REMOTE_DEV_VALIDATE'",
@@ -168,7 +167,7 @@ def remote_bash(
             "exit_code": completed.returncode,
             "timed_out": completed.timed_out,
             "command_preview": command[:500],
-            "environment": {"runtime_env": runtime_enabled, "env_keys": sorted(env), "timeout_ms": timeout_ms},
+            "environment": {"runtime_env": runtime_enabled, "runtime_env_file": endpoint.runtime_env_file, "env_keys": sorted(env), "timeout_ms": timeout_ms},
         },
     )
     atomic_write_json(result_path, result)

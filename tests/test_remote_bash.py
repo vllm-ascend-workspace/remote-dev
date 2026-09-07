@@ -80,6 +80,62 @@ class RemoteBashTests(unittest.TestCase):
             state_store.substrate_root = original_state_root  # type: ignore[assignment]
             shell_ops.run_script = original_runner  # type: ignore[assignment]
 
+    def test_runtime_env_preamble_is_explicit_per_endpoint(self) -> None:
+        # No consumer-specific profile script is baked into the substrate: the
+        # preamble appears only when the endpoint names a runtime_env_file.
+        original_state_root = state_store.substrate_root
+        original_runner = shell_ops.run_script
+        scripts = []
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                state_store.substrate_root = lambda: Path(tmp)  # type: ignore[assignment]
+
+                def fake_run_script(_endpoint, script, **_kwargs):
+                    scripts.append(script)
+                    return RemoteCompleted(0, "ok\n", "")
+
+                shell_ops.run_script = fake_run_script  # type: ignore[assignment]
+                plain = Endpoint(host="1.2.3.4", port=46000)
+                shell_ops.remote_bash(plain, command="echo ok")
+                self.assertNotIn("profile.d", scripts[-1])
+                self.assertNotIn("set +u; .", scripts[-1])
+
+                configured = Endpoint(host="1.2.3.4", port=46000, runtime_env_file="/etc/profile.d/tool chain.sh")
+                payload = shell_ops.remote_bash(configured, command="echo ok")
+                self.assertIn("if [ -f '/etc/profile.d/tool chain.sh' ]; then set +u; . '/etc/profile.d/tool chain.sh'; set -u; fi", scripts[-1])
+                self.assertEqual(payload["result"]["environment"]["runtime_env_file"], "/etc/profile.d/tool chain.sh")
+
+                shell_ops.remote_bash(configured, command="echo ok", runtime_env=False)
+                self.assertNotIn("profile.d", scripts[-1])
+        finally:
+            state_store.substrate_root = original_state_root  # type: ignore[assignment]
+            shell_ops.run_script = original_runner  # type: ignore[assignment]
+
+    def test_background_job_records_runtime_env_file_and_restores_it(self) -> None:
+        endpoint = Endpoint(host="1.2.3.4", port=46000, runtime_env_file="/etc/profile.d/toolchain.sh")
+        original_state_root = state_store.substrate_root
+        original_runner = job_ops.run_script
+        scripts = []
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                state_store.substrate_root = lambda: Path(tmp)  # type: ignore[assignment]
+
+                def fake_run_script(_endpoint, script, **_kwargs):
+                    scripts.append(script)
+                    return RemoteCompleted(0, "4242\n", "")
+
+                job_ops.run_script = fake_run_script  # type: ignore[assignment]
+                payload = job_ops.start_remote_job(endpoint, command="echo ok", job_id="job-runtime-env")
+                self.assertEqual(payload["result"]["status"], "running")
+                self.assertIn(". /etc/profile.d/toolchain.sh", scripts[-1])
+                record = state_store.read_json(Path(payload["result"]["refs"]["job_record"]))
+                self.assertEqual(record["runtime_env_file"], "/etc/profile.d/toolchain.sh")
+                restored = job_ops.endpoint_from_job_record(record)
+                self.assertEqual(restored.runtime_env_file, "/etc/profile.d/toolchain.sh")
+        finally:
+            state_store.substrate_root = original_state_root  # type: ignore[assignment]
+            job_ops.run_script = original_runner  # type: ignore[assignment]
+
     def test_background_remote_bash_missing_cwd_does_not_start_job(self) -> None:
         endpoint = Endpoint(host="1.2.3.4", port=46000)
         original_state_root = state_store.substrate_root

@@ -16,6 +16,15 @@ LEDGER_SCOPE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 def state_root() -> Path:
+    """Local runtime state directory.
+
+    Defaults to ``<checkout>/state`` (ignored by Git). ``REMOTE_DEV_STATE_DIR``
+    relocates it so an embedding consumer can keep remote-dev state next to
+    its own untracked state instead of inside this checkout.
+    """
+    configured = os.environ.get("REMOTE_DEV_STATE_DIR")
+    if configured:
+        return Path(configured).expanduser()
     return substrate_root() / "state"
 
 

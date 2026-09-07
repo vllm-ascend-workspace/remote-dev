@@ -12,10 +12,13 @@ from typing import Any
 
 from .endpoint import Endpoint
 
-_MUX_DIR = Path.home() / ".ssh" / "vaws-mux"
+# ControlMaster socket directory. Consumers that already keep an OpenSSH mux
+# directory for their own tooling can point remote-dev at it so both share
+# one master connection per endpoint.
+_MUX_DIR = Path(os.environ.get("REMOTE_DEV_SSH_MUX_DIR") or (Path.home() / ".ssh" / "remote-dev-mux")).expanduser()
 
-# Decide mux-dir readiness once per process (see .agents/lib/vaws_ssh.py for the
-# rationale). None = undecided, True/False = usable / not usable.
+# Decide mux-dir readiness once per process. None = undecided, True/False =
+# usable / not usable.
 _MUX_READY: bool | None = None
 
 
@@ -28,7 +31,7 @@ class RemoteCompleted:
 
 
 def _control_master_options(identity_file: str | None = None) -> list[str]:
-    """OpenSSH connection reuse; shares the mux dir with the .agents tooling.
+    """OpenSSH connection reuse through a ControlMaster socket directory.
 
     Prepared once per process. On failure we emit a single visible warning
     instead of silently disabling reuse (which reads as "the remote is slow").

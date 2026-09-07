@@ -8,9 +8,10 @@ from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any
 
-from .endpoint import Endpoint
+from .endpoint import DEFAULT_CWD, Endpoint
 from .preview import MAX_JOB_TAIL_LINES, MAX_TEXT_CHARS, compact_text
 from .result import make_result, utc_now_iso
+from .runtime_env import runtime_env_lines
 from .ssh_transport import run_script
 from .state_store import atomic_write_json, find_job_record, job_record_path
 
@@ -132,9 +133,7 @@ def start_remote_job(
     remote_dir = remote_job_dir(endpoint, job_id)
     timeout_prefix = f"timeout {int(timeout_ms / 1000)} " if timeout_ms else ""
     env_lines = [f"export {require_env_name(key)}={shlex.quote(str(value))}" for key, value in sorted(env.items())]
-    runtime_lines = [
-        "if [ -f /etc/profile.d/vaws-ascend-env.sh ]; then set +u; . /etc/profile.d/vaws-ascend-env.sh; set -u; fi"
-    ] if runtime_enabled else []
+    runtime_lines = runtime_env_lines(endpoint, runtime_enabled)
     status_running = shlex.quote('{"status":"running","job_id":"' + job_id + '","started_at":"' + started + '"}')
     runner = "\n".join(
         [
@@ -216,6 +215,7 @@ def start_remote_job(
         "cwd": cwd,
         "env_keys": sorted(env),
         "runtime_env": runtime_enabled,
+        "runtime_env_file": endpoint.runtime_env_file,
         "remote_dir": remote_dir,
         "started_at": started,
         "timeout_ms": timeout_ms,
@@ -251,8 +251,9 @@ def _endpoint_from_record(record: dict[str, Any]) -> Endpoint:
         port=int(target["port"]),
         user=str(target.get("user") or "root"),
         root=str(target.get("root") or "/"),
-        cwd=str(target.get("cwd") or "/vllm-workspace"),
+        cwd=str(target.get("cwd") or DEFAULT_CWD),
         runtime_env=bool(target.get("runtime_env", True)),
+        runtime_env_file=str(target["runtime_env_file"]) if target.get("runtime_env_file") else None,
         kind=str(target.get("kind") or "direct-endpoint"),
         alias=str(target["alias"]) if target.get("alias") else None,
     )

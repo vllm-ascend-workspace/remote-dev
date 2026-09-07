@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import unittest
@@ -65,6 +66,18 @@ class SshTransportTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertNotEqual(first, plain)
         self.assertTrue(first.startswith(plain))
+
+    def test_mux_dir_defaults_under_home_and_honours_env_override(self) -> None:
+        # The mux directory is remote-dev's own by default; a consumer that
+        # wants to share its existing OpenSSH mux dir sets REMOTE_DEV_SSH_MUX_DIR.
+        self.assertEqual(ssh_transport._MUX_DIR, Path.home() / ".ssh" / "remote-dev-mux")
+        code = (
+            "import sys; sys.path.insert(0, %r); import core.ssh_transport as t; print(t._MUX_DIR)" % str(ROOT)
+        )
+        env = {**os.environ, "REMOTE_DEV_SSH_MUX_DIR": "/tmp/shared-mux"}
+        proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "/tmp/shared-mux")
 
     def test_ssh_base_cmd_passes_identity_file_into_control_path(self) -> None:
         with_identity = Endpoint(host="1.2.3.4", port=46000, identity_file="/keys/a")
