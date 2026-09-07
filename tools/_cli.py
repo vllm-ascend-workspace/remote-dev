@@ -12,7 +12,7 @@ add_substrate_to_path()
 
 from core.artifact_ops import remote_artifact_manifest, remote_artifact_pull, remote_artifact_push  # noqa: E402
 from core.context_snapshot import remote_context_snapshot, remote_probe  # noqa: E402
-from core.endpoint import EndpointError, resolve_endpoint  # noqa: E402
+from core.endpoint import EndpointError, has_selector, resolve_endpoint  # noqa: E402
 from core.file_ops import remote_edit, remote_ls, remote_multi_edit, remote_read, remote_write  # noqa: E402
 from core.job_ops import remote_job_status, remote_job_stop, remote_job_tail  # noqa: E402
 from core.patch_ops import remote_apply_patch  # noqa: E402
@@ -29,12 +29,28 @@ def add_endpoint_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cwd", default=None)
     parser.add_argument("--runtime-env", dest="runtime_env", action="store_true", default=None)
     parser.add_argument("--no-runtime-env", dest="runtime_env", action="store_false")
+    parser.add_argument("--runtime-env-file", dest="runtime_env_file", help="Remote profile script sourced before commands when runtime env is enabled.")
     parser.add_argument("--identity-file")
     parser.add_argument("--connect-timeout-ms", type=int)
-    parser.add_argument("--alias")
-    parser.add_argument("--session-id")
-    parser.add_argument("--session-file")
-    parser.add_argument("--machine")
+    parser.add_argument("--alias", help="Endpoint alias from the endpoint alias files.")
+    parser.add_argument(
+        "--selector",
+        action="append",
+        metavar="KEY=VALUE",
+        help="Extra selector field for a registered endpoint resolver (repeatable), e.g. --selector session_id=abc.",
+    )
+
+
+def parse_selectors(items: list[str] | None) -> dict[str, str]:
+    selectors: dict[str, str] = {}
+    for item in items or []:
+        if "=" not in item:
+            raise ValueError(f"bad --selector item {item!r}; expected KEY=VALUE")
+        key, value = item.split("=", 1)
+        if not key:
+            raise ValueError(f"bad --selector item {item!r}; empty key")
+        selectors[key] = value
+    return selectors
 
 
 def endpoint_payload(args: argparse.Namespace) -> dict[str, Any]:
@@ -46,16 +62,15 @@ def endpoint_payload(args: argparse.Namespace) -> dict[str, Any]:
         "root",
         "cwd",
         "runtime_env",
+        "runtime_env_file",
         "identity_file",
         "connect_timeout_ms",
         "alias",
-        "session_id",
-        "session_file",
-        "machine",
     ):
         value = getattr(args, key, None)
         if value is not None:
             payload[key] = value
+    payload.update(parse_selectors(getattr(args, "selector", None)))
     return payload
 
 
@@ -175,7 +190,7 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
     data = load_input_json(args.input_json) if args.input_json else {}
     data = {**endpoint_payload(args), **data}
     endpoint = None
-    if tool not in {"job_status", "job_tail", "job_stop"} or any(data.get(k) for k in ("host", "port", "alias", "session_id", "session_file", "machine")):
+    if tool not in {"job_status", "job_tail", "job_stop"} or has_selector(data):
         endpoint = resolve_endpoint(data)
     timeout_ms = int(data.get("timeout_ms") or args.timeout_ms)
     if tool == "bash":

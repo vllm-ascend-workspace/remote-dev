@@ -13,10 +13,10 @@ from typing import Any
 
 
 REMOTE_DEV_ROOT = Path(__file__).resolve().parents[1]
-REPO_ROOT = REMOTE_DEV_ROOT.parent
 if str(REMOTE_DEV_ROOT) not in sys.path:
     sys.path.insert(0, str(REMOTE_DEV_ROOT))
 
+from core.endpoint import DEFAULT_CWD, has_selector, selector_fields  # noqa: E402
 from mcp.schemas import ALIASES, ENDPOINT_PROPS, ENDPOINT_SELECTOR_DESCRIPTION, TOOL_SCHEMAS  # noqa: E402
 from mcp.tools import call_tool, list_resources, list_tools, read_resource  # noqa: E402
 
@@ -29,7 +29,7 @@ def run_command(name: str, argv: list[str]) -> dict[str, Any]:
     started = time.monotonic()
     proc = subprocess.run(
         argv,
-        cwd=REPO_ROOT,
+        cwd=REMOTE_DEV_ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -49,27 +49,9 @@ def run_command(name: str, argv: list[str]) -> dict[str, Any]:
 
 def local_checks() -> list[dict[str, Any]]:
     commands = [
-        ("compileall", ["python3", "-m", "compileall", "-q", ".remote-dev", ".agents"]),
-        ("remote_dev_unittest", ["python3", "-m", "unittest", "discover", "-s", ".remote-dev/tests"]),
-        ("agents_unittest", ["python3", "-m", "unittest", "discover", "-s", ".agents/tests"]),
-        ("claude_skill_shims", ["python3", ".remote-dev/tools/sync_claude_skills.py", "--check"]),
-        (
-            "diff_check",
-            [
-                "git",
-                "diff",
-                "--check",
-                "--",
-                ".remote-dev",
-                ".agents",
-                "AGENTS.md",
-                "CLAUDE.md",
-                ".mcp.json",
-                ".codex",
-                ".claude",
-                ".gitignore",
-            ],
-        ),
+        ("compileall", [sys.executable, "-m", "compileall", "-q", "."]),
+        ("remote_dev_unittest", [sys.executable, "-m", "unittest", "discover", "-s", "tests"]),
+        ("diff_check", ["git", "diff", "--check", "--", "."]),
     ]
     results = []
     for name, argv in commands:
@@ -161,12 +143,16 @@ def endpoint_payload(args: argparse.Namespace) -> dict[str, Any]:
         "root": args.root,
         "cwd": cwd,
         "connect_timeout_ms": args.connect_timeout_ms,
+        "runtime_env_file": args.runtime_env_file,
         "alias": args.alias,
-        "session_id": args.session_id,
-        "session_file": args.session_file,
-        "machine": args.machine,
     }
-    return {key: value for key, value in payload.items() if value is not None}
+    payload = {key: value for key, value in payload.items() if value is not None}
+    for item in args.selector or []:
+        if "=" not in item:
+            raise SystemExit(f"bad --selector item {item!r}; expected KEY=VALUE")
+        key, value = item.split("=", 1)
+        payload[key] = value
+    return payload
 
 
 def run_parallel_worker(endpoint: dict[str, Any], scratch: str, index: int, timeout_ms: int) -> dict[str, Any]:
@@ -196,11 +182,11 @@ def run_parallel_worker(endpoint: dict[str, Any], scratch: str, index: int, time
 
 def live_endpoint_checks(args: argparse.Namespace) -> dict[str, Any]:
     endpoint = endpoint_payload(args)
-    if not any(endpoint.get(key) for key in ("host", "alias", "session_id", "session_file", "machine")):
-        return {"status": "skipped", "reason": "no endpoint selector was provided"}
+    if not has_selector(endpoint):
+        return {"status": "skipped", "reason": f"no endpoint selector was provided (known selector fields: {', '.join(selector_fields())})"}
     timeout_ms = args.timeout_ms
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    scratch_root = (endpoint.get("cwd") or "/vllm-workspace").rstrip("/")
+    scratch_root = (endpoint.get("cwd") or DEFAULT_CWD).rstrip("/")
     scratch = f"{scratch_root}/.remote-dev/validation/{stamp}"
     narrow_endpoint = {**endpoint, "root": scratch_root, "cwd": scratch_root}
     checks: list[dict[str, Any]] = []
@@ -303,10 +289,9 @@ def main() -> int:
     parser.add_argument("--root", default="/")
     parser.add_argument("--cwd")
     parser.add_argument("--connect-timeout-ms", type=int, default=10000)
-    parser.add_argument("--alias")
-    parser.add_argument("--session-id")
-    parser.add_argument("--session-file")
-    parser.add_argument("--machine")
+    parser.add_argument("--runtime-env-file", dest="runtime_env_file")
+    parser.add_argument("--alias", help="Endpoint alias from the endpoint alias files.")
+    parser.add_argument("--selector", action="append", metavar="KEY=VALUE", help="Selector field for a registered endpoint resolver (repeatable).")
     parser.add_argument("--timeout-ms", type=int, default=30000)
     parser.add_argument("--parallel-workers", type=int, default=3)
     parser.add_argument("--skip-local", action="store_true")

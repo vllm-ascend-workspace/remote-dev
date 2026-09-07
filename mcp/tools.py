@@ -13,7 +13,7 @@ if str(SUBSTRATE_ROOT) not in sys.path:
 
 from core.artifact_ops import remote_artifact_manifest, remote_artifact_pull, remote_artifact_push  # noqa: E402
 from core.context_snapshot import remote_context_snapshot, remote_probe  # noqa: E402
-from core.endpoint import resolve_endpoint  # noqa: E402
+from core.endpoint import has_selector, resolve_endpoint  # noqa: E402
 from core.file_ops import remote_edit, remote_ls, remote_multi_edit, remote_read, remote_write  # noqa: E402
 from core.job_ops import endpoint_from_job_record, require_job_id, remote_job_status, remote_job_stop, remote_job_tail  # noqa: E402
 from core.monitor_ops import remote_monitor  # noqa: E402
@@ -219,7 +219,9 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     if name.startswith("vaws."):
         return vaws_call(name, args)
     endpoint = None
-    if name not in {"remote.job_status", "remote.job_tail", "remote.job_stop"} or any(args.get(k) for k in ("host", "port", "alias", "session_id", "session_file", "machine")):
+    # Job tools can locate their endpoint from the local job record, so they
+    # only resolve when the caller supplied an explicit selector.
+    if name not in {"remote.job_status", "remote.job_tail", "remote.job_stop"} or has_selector(args):
         endpoint = resolve_endpoint(args)
     timeout_ms = int(args.get("timeout_ms") or args.get("timeout") or 120000)
     if name == "remote.bash":

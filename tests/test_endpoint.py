@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,13 +12,21 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-REPO_ROOT = ROOT.parent
-AGENTS_LIB = str(REPO_ROOT / ".agents" / "lib")
-if AGENTS_LIB not in sys.path:
-    sys.path.insert(0, AGENTS_LIB)
 
-from core.endpoint import Endpoint, resolve_endpoint  # noqa: E402
-import vaws_session_id  # noqa: E402
+import core.endpoint as endpoint_module  # noqa: E402
+from core.endpoint import (  # noqa: E402
+    BUILTIN_SELECTOR_FIELDS,
+    Endpoint,
+    EndpointError,
+    clear_resolvers,
+    has_selector,
+    register_resolver,
+    registered_resolvers,
+    resolve_endpoint,
+    resolver_setup,
+    selector_fields,
+    unregister_resolver,
+)
 
 
 class EndpointTests(unittest.TestCase):
@@ -31,50 +41,211 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(endpoint.user, "root")
         self.assertEqual(endpoint.root, "/")
         self.assertEqual(endpoint.effective_cwd, "/vllm-workspace")
+        self.assertEqual(endpoint.kind, "direct-endpoint")
+
+    def test_direct_endpoint_rejects_non_integer_port(self) -> None:
+        with self.assertRaises(EndpointError):
+            resolve_endpoint({"host": "1.2.3.4", "port": "not-a-port"})
+
+    def test_runtime_env_file_is_explicit_and_recorded_in_target(self) -> None:
+        plain = resolve_endpoint({"host": "1.2.3.4", "port": 22})
+        self.assertIsNone(plain.runtime_env_file)
+        self.assertNotIn("runtime_env_file", plain.to_result_target())
+        configured = resolve_endpoint({"host": "1.2.3.4", "port": 22, "runtime_env_file": "/etc/profile.d/toolchain.sh"})
+        self.assertEqual(configured.runtime_env_file, "/etc/profile.d/toolchain.sh")
+        self.assertEqual(configured.to_result_target()["runtime_env_file"], "/etc/profile.d/toolchain.sh")
 
 
-class FindSessionBindingTests(unittest.TestCase):
-    """The cwd-upward auto-bind walk stops at the repository root (D2)."""
-
+class AliasFileTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        base = Path(self.temp.name).resolve()
-        self.repo = base / "repo"
-        self.deep = self.repo / "a" / "b"
-        self.deep.mkdir(parents=True)
-        self.elsewhere = base / "elsewhere"
-        self.elsewhere.mkdir()
-        self._write_binding(base, "sess-stray-above-repo")
-
-    def _write_binding(self, directory: Path, session_id: str) -> None:
-        state = directory / ".vaws-local"
-        state.mkdir(parents=True, exist_ok=True)
-        (state / "current-session.json").write_text(
-            json.dumps({"schema_version": 1, "session_id": session_id, "source": "test"}),
+        self.alias_file = Path(self.temp.name) / "endpoints.json"
+        self.alias_file.write_text(
+            json.dumps({"endpoints": {"lab": {"host": "10.0.0.5", "port": 2222, "root": "/srv", "cwd": "/srv/app"}}}),
             encoding="utf-8",
         )
+        patcher = mock.patch.dict(os.environ, {"REMOTE_DEV_ENDPOINTS_FILE": str(self.alias_file)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-    def test_walk_finds_binding_at_or_below_repo_root(self) -> None:
-        self._write_binding(self.repo, "sess-in-repo")
-        with mock.patch.object(vaws_session_id, "_binding_walk_stop", return_value=self.repo):
-            found = vaws_session_id.find_session_binding(self.deep)
-        self.assertIsNotNone(found)
-        self.assertEqual(found[0], self.repo)
-        self.assertEqual(found[1]["session_id"], "sess-in-repo")
+    def test_alias_resolves_and_caller_fields_override(self) -> None:
+        endpoint = resolve_endpoint({"alias": "lab"})
+        self.assertEqual((endpoint.host, endpoint.port, endpoint.root, endpoint.cwd), ("10.0.0.5", 2222, "/srv", "/srv/app"))
+        self.assertEqual(endpoint.alias, "lab")
+        narrowed = resolve_endpoint({"alias": "lab", "root": "/srv/app"})
+        self.assertEqual(narrowed.root, "/srv/app")
 
-    def test_walk_ignores_stray_binding_above_repo_root(self) -> None:
-        with mock.patch.object(vaws_session_id, "_binding_walk_stop", return_value=self.repo):
-            found = vaws_session_id.find_session_binding(self.deep)
-        self.assertIsNone(found)
+    def test_unknown_alias_is_an_endpoint_error(self) -> None:
+        with self.assertRaises(EndpointError) as ctx:
+            resolve_endpoint({"alias": "missing"})
+        self.assertIn("missing", str(ctx.exception))
 
-    def test_walk_outside_repo_keeps_legacy_unbounded_behavior(self) -> None:
-        # Documented fallback: when start is not beneath the repository the
-        # stop is never reached and the walk continues to the filesystem root.
-        with mock.patch.object(vaws_session_id, "_binding_walk_stop", return_value=self.repo):
-            found = vaws_session_id.find_session_binding(self.elsewhere)
-        self.assertIsNotNone(found)
-        self.assertEqual(found[1]["session_id"], "sess-stray-above-repo")
+    def test_alias_file_env_precedes_checkout_local_files(self) -> None:
+        files = endpoint_module.alias_files()
+        self.assertEqual(files[0], self.alias_file)
+        self.assertEqual(files[-2:], [ROOT / "endpoints.json", ROOT / "endpoints.local.json"])
+
+
+class ResolverPluginTests(unittest.TestCase):
+    """Consumers inject their own alias/session semantics; remote-dev never
+    imports the consumer."""
+
+    def setUp(self) -> None:
+        self._saved = list(endpoint_module._RESOLVERS)
+        clear_resolvers()
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        clear_resolvers()
+        endpoint_module._RESOLVERS.extend(self._saved)
+
+    def test_no_selector_and_no_resolver_is_rejected_with_guidance(self) -> None:
+        with self.assertRaises(EndpointError) as ctx:
+            resolve_endpoint({})
+        message = str(ctx.exception)
+        self.assertIn("no endpoint target", message)
+        self.assertIn("registered resolvers: none", message)
+        # The former consumer-specific selectors are gone from the substrate.
+        self.assertEqual(selector_fields(), BUILTIN_SELECTOR_FIELDS)
+        for legacy in ("session_id", "session_file", "machine"):
+            self.assertFalse(has_selector({legacy: "x"}), legacy)
+
+    def test_resolver_dict_result_becomes_endpoint_and_caller_overrides_shape(self) -> None:
+        seen: list[dict] = []
+
+        def by_session(payload):
+            seen.append(payload)
+            if not payload.get("session_id"):
+                return None
+            return {"host": "10.1.1.1", "port": 40000, "cwd": "/work/" + payload["session_id"], "source": {"session": payload["session_id"]}}
+
+        register_resolver(by_session, name="sessions", fields=("session_id",))
+        self.assertIn("session_id", selector_fields())
+        self.assertTrue(has_selector({"session_id": "s1"}))
+
+        endpoint = resolve_endpoint({"session_id": "s1", "root": "/work"})
+        self.assertEqual((endpoint.host, endpoint.port), ("10.1.1.1", 40000))
+        self.assertEqual(endpoint.root, "/work")
+        self.assertEqual(endpoint.cwd, "/work/s1")
+        self.assertEqual(endpoint.kind, "resolver:sessions")
+        self.assertEqual(endpoint.source, {"session": "s1", "resolver": "sessions"})
+        self.assertEqual(seen[-1]["session_id"], "s1")
+
+    def test_resolver_may_return_endpoint_instance(self) -> None:
+        register_resolver(lambda payload: Endpoint(host="10.2.2.2", port=22, kind="managed") if payload.get("machine") else None, name="machines", fields=("machine",))
+        endpoint = resolve_endpoint({"machine": "npu-a"})
+        self.assertEqual(endpoint.kind, "managed")
+        self.assertEqual(endpoint.host, "10.2.2.2")
+
+    def test_resolvers_run_in_order_and_declining_resolver_is_skipped(self) -> None:
+        calls: list[str] = []
+
+        def first(payload):
+            calls.append("first")
+            return None
+
+        def second(payload):
+            calls.append("second")
+            return {"host": "10.3.3.3", "port": 22}
+
+        register_resolver(first, name="first")
+        register_resolver(second, name="second")
+        endpoint = resolve_endpoint({})
+        self.assertEqual(calls, ["first", "second"])
+        self.assertEqual(endpoint.host, "10.3.3.3")
+
+    def test_resolver_is_consulted_for_empty_payload_so_consumer_can_auto_bind(self) -> None:
+        # The former cwd-upward worktree auto-bind now lives in the consumer.
+        register_resolver(lambda payload: {"host": "10.4.4.4", "port": 22} if not payload else None, name="auto-bind")
+        self.assertEqual(resolve_endpoint({}).host, "10.4.4.4")
+
+    def test_direct_and_alias_take_precedence_over_resolvers(self) -> None:
+        register_resolver(lambda payload: {"host": "10.9.9.9", "port": 9}, name="greedy")
+        self.assertEqual(resolve_endpoint({"host": "1.2.3.4", "port": 22}).host, "1.2.3.4")
+
+    def test_resolver_exception_is_reported_as_endpoint_error(self) -> None:
+        def broken(payload):
+            raise RuntimeError("inventory unreadable")
+
+        register_resolver(broken, name="broken")
+        with self.assertRaises(EndpointError) as ctx:
+            resolve_endpoint({})
+        self.assertIn("broken", str(ctx.exception))
+        self.assertIn("inventory unreadable", str(ctx.exception))
+
+    def test_resolver_bad_return_type_is_rejected(self) -> None:
+        register_resolver(lambda payload: "10.0.0.1:22", name="stringy")
+        with self.assertRaises(EndpointError):
+            resolve_endpoint({})
+
+    def test_duplicate_names_rejected_and_unregister_works(self) -> None:
+        register_resolver(lambda payload: None, name="dup")
+        with self.assertRaises(EndpointError):
+            register_resolver(lambda payload: None, name="dup")
+        self.assertTrue(unregister_resolver("dup"))
+        self.assertFalse(unregister_resolver("dup"))
+        self.assertEqual(registered_resolvers(), ())
+
+
+class EnvResolverLoadingTests(unittest.TestCase):
+    """``REMOTE_DEV_RESOLVERS`` lets a consumer load plugins into the MCP
+    server process without remote-dev importing anything by name."""
+
+    PLUGIN = '''
+from core.endpoint import register_resolver, resolver_setup
+
+def plain(payload):
+    if payload.get("box"):
+        return {"host": "10.5.5.5", "port": 5, "cwd": "/box/" + payload["box"]}
+    return None
+
+@resolver_setup
+def setup():
+    register_resolver(plain, name="boxes", fields=("box",))
+'''
+
+    def _run(self, spec: str, payload: dict) -> dict:
+        code = (
+            "import json, sys; sys.path.insert(0, %r)\n"
+            "from core.endpoint import resolve_endpoint, selector_fields, registered_resolvers, EndpointError\n"
+            "try:\n"
+            "    ep = resolve_endpoint(%r)\n"
+            "    print(json.dumps({'host': ep.host, 'cwd': ep.cwd, 'kind': ep.kind, 'fields': list(selector_fields()), 'resolvers': [r.name for r in registered_resolvers()]}))\n"
+            "except EndpointError as exc:\n"
+            "    print(json.dumps({'error': str(exc)}))\n"
+        ) % (str(ROOT), payload)
+        env = {**os.environ, "REMOTE_DEV_RESOLVERS": spec}
+        proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_setup_hook_from_file_registers_fields_and_resolves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin = Path(tmp) / "consumer_plugin.py"
+            plugin.write_text(self.PLUGIN, encoding="utf-8")
+            data = self._run(f"{plugin}:setup", {"box": "b1"})
+        self.assertEqual(data["host"], "10.5.5.5")
+        self.assertEqual(data["cwd"], "/box/b1")
+        self.assertEqual(data["kind"], "resolver:boxes")
+        self.assertIn("box", data["fields"])
+        self.assertEqual(data["resolvers"], ["boxes"])
+
+    def test_plain_callable_from_file_is_registered_under_its_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin = Path(tmp) / "consumer_plugin.py"
+            plugin.write_text(self.PLUGIN, encoding="utf-8")
+            data = self._run(f"{plugin}:plain", {"box": "b2"})
+            self.assertEqual(data["resolvers"], [f"{plugin}:plain"])
+        self.assertEqual(data["cwd"], "/box/b2")
+
+    def test_missing_plugin_file_is_a_clear_endpoint_error(self) -> None:
+        data = self._run("/nonexistent/plugin.py:setup", {})
+        self.assertIn("plugin file does not exist", data["error"])
+
+    def test_module_import_failure_is_a_clear_endpoint_error(self) -> None:
+        data = self._run("remote_dev_no_such_module_xyz:setup", {})
+        self.assertIn("failed to import", data["error"])
 
 
 if __name__ == "__main__":

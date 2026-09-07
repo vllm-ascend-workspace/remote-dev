@@ -12,16 +12,17 @@ ENDPOINT_PROPS: dict[str, Any] = {
     "runtime_env": {"type": "boolean", "default": True},
     "identity_file": {"type": "string"},
     "connect_timeout_ms": {"type": "integer", "default": 10000},
-    "alias": {"type": "string"},
-    "session_id": {"type": "string"},
-    "session_file": {"type": "string"},
-    "machine": {"type": "string"},
+    "runtime_env_file": {"type": "string", "description": "Remote profile script sourced before commands when runtime_env is true."},
+    "alias": {"type": "string", "description": "Name from the endpoint alias files."},
 }
 
+# Consumer resolvers may accept additional selector keys (for example a
+# session or machine name). Schemas keep additionalProperties open so those
+# keys pass through; the server rejects payloads no resolver claims.
 ENDPOINT_SELECTOR_DESCRIPTION = (
-    "Provide at least one endpoint selector: host and port together, alias, "
-    "session_id, session_file, or machine. The server validates the selector "
-    "before connecting."
+    "Provide at least one endpoint selector: host and port together, an "
+    "alias, or a selector field understood by a registered endpoint "
+    "resolver. The server validates the selector before connecting."
 )
 
 
