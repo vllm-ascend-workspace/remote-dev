@@ -64,6 +64,20 @@ class PatchOpsTests(unittest.TestCase):
         ops = parse_codex_patch(patch)
         self.assertEqual(ops[0]["hunks"], [{"old": "old\n", "new": "new\n"}])
 
+    def test_parse_codex_keeps_hunk_anchor_text(self) -> None:
+        patch = """*** Begin Patch
+*** Update File: foo.py
+@@ def second():
+-    return 1
++    return 2
+*** End Patch
+"""
+        ops = parse_codex_patch(patch)
+        self.assertEqual(
+            ops[0]["hunks"],
+            [{"old": "    return 1\n", "new": "    return 2\n", "anchor": "def second():"}],
+        )
+
     def test_parse_unified_paths(self) -> None:
         patch = """diff --git a/a.py b/a.py
 --- a/a.py

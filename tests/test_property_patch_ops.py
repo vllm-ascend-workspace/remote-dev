@@ -442,18 +442,20 @@ class CodexExecutorProperties(unittest.TestCase):
         if data["status"] == "applied":
             self.assertEqual((root / "a.py").read_text(encoding="utf-8"), "ONE\nTWO\n")
 
-    @unittest.expectedFailure
-    def test_known_defect_hunk_anchor_after_double_at_is_ignored(self) -> None:
-        """KNOWN DEFECT (medium-high): the Codex format uses ``@@ <anchor>`` to
-        pick which occurrence of a context block to edit. The parser drops the
-        anchor text and the executor replaces the *first* occurrence of the old
-        text, so a hunk anchored at ``def second():`` edits ``def first():``
-        and reports ``applied``. This is a silent wrong-site edit.
-        Evidence: ``first`` returns 2 and ``second`` still returns 1."""
+    def test_hunk_anchor_after_double_at_selects_the_stated_site(self) -> None:
+        """The Codex format uses ``@@ <anchor>`` to pick which occurrence of
+        a context block to edit. Dropping the anchor made a hunk aimed at
+        ``def second():`` edit ``def first():`` and still report
+        ``applied`` — a silent wrong-site write.
+
+        Before: ``first`` returned 2 and ``second`` still returned 1, with
+        ``status: applied``. After: the hunk applies after the anchor, or
+        the executor refuses."""
         root = self._root(4)
         source = "def first():\n    return 1\n\ndef second():\n    return 1\n"
         (root / "a.py").write_text(source, encoding="utf-8")
         ops = parse_codex_patch("*** Begin Patch\n*** Update File: a.py\n@@ def second():\n-    return 1\n+    return 2\n*** End Patch\n")
+        self.assertEqual(ops[0]["hunks"][0].get("anchor"), "def second():")
         data = self._run(root, ops)
         self.assertEqual(data["status"], "applied", data)
         self.assertEqual((root / "a.py").read_text(encoding="utf-8"), "def first():\n    return 1\n\ndef second():\n    return 2\n")

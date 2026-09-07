@@ -149,9 +149,19 @@ for op in ops:
         for hunk_index, hunk in enumerate(op.get("hunks", [])):
             old = hunk["old"]
             new = hunk["new"]
+            anchor = hunk.get("anchor") or ""
             if old not in after_text:
                 fail("context_mismatch", f"patch context not found in {path}; re-run remote.read before retrying", hunk_index=hunk_index)
-            after_text = after_text.replace(old, new, 1)
+            if anchor:
+                pos = after_text.find(anchor)
+                if pos < 0:
+                    fail("context_mismatch", f"patch anchor {anchor!r} not found in {path}", hunk_index=hunk_index)
+                rel = after_text.find(old, pos)
+                if rel < 0:
+                    fail("context_mismatch", f"patch context not found after anchor in {path}", hunk_index=hunk_index)
+                after_text = after_text[:rel] + new + after_text[rel + len(old):]
+            else:
+                after_text = after_text.replace(old, new, 1)
         virtual[target_path] = after_text.encode("utf-8")
         if target_path != path:
             virtual[path] = DELETED
@@ -206,6 +216,13 @@ class PatchParseError(ValueError):
     pass
 
 
+def _hunk_dict(old_parts: list[str], new_parts: list[str], anchor: str) -> dict[str, str]:
+    hunk = {"old": "".join(old_parts), "new": "".join(new_parts)}
+    if anchor:
+        hunk["anchor"] = anchor
+    return hunk
+
+
 def _is_patch_boundary(line: str) -> bool:
     stripped = line.strip("\r\n")
     return (
@@ -249,6 +266,7 @@ def parse_codex_patch(patch: str) -> list[dict[str, Any]]:
             old_parts: list[str] = []
             new_parts: list[str] = []
             saw_hunk_line = False
+            current_anchor = ""
             move_to: str | None = None
             while i < len(lines) and not _is_patch_boundary(lines[i]):
                 line = lines[i]
@@ -264,10 +282,11 @@ def parse_codex_patch(patch: str) -> list[dict[str, Any]]:
                     continue
                 if line.startswith("@@"):
                     if saw_hunk_line and (old_parts or new_parts):
-                        hunks.append({"old": "".join(old_parts), "new": "".join(new_parts)})
+                        hunks.append(_hunk_dict(old_parts, new_parts, current_anchor))
                         old_parts = []
                         new_parts = []
                     saw_hunk_line = True
+                    current_anchor = stripped_line[2:].strip()
                     i += 1
                     continue
                 if not line:
@@ -287,7 +306,7 @@ def parse_codex_patch(patch: str) -> list[dict[str, Any]]:
                 saw_hunk_line = True
                 i += 1
             if old_parts or new_parts:
-                hunks.append({"old": "".join(old_parts), "new": "".join(new_parts)})
+                hunks.append(_hunk_dict(old_parts, new_parts, current_anchor))
             if not hunks and not move_to:
                 raise PatchParseError(f"update patch for {path} has no hunks")
             op: dict[str, Any] = {"kind": "update", "path": path, "hunks": hunks}
