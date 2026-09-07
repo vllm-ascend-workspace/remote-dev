@@ -139,13 +139,20 @@ def _direct_endpoint(payload: dict[str, Any]) -> Endpoint:
         port = int(payload["port"])
     except (TypeError, ValueError) as exc:
         raise EndpointError("endpoint port must be an integer") from exc
+    root = str(payload.get("root") or DEFAULT_ROOT)
+    cwd = str(payload["cwd"]) if payload.get("cwd") else None
+    if not root.startswith("/"):
+        raise EndpointError(f"endpoint root must be an absolute path, got {root!r}")
+    effective_cwd = cwd or DEFAULT_CWD or root
+    if not str(effective_cwd).startswith("/"):
+        raise EndpointError(f"endpoint cwd must be an absolute path, got {effective_cwd!r}")
     runtime_env_file = payload.get("runtime_env_file", DEFAULT_RUNTIME_ENV_FILE)
     return Endpoint(
         host=str(payload["host"]),
         port=port,
         user=str(payload.get("user") or DEFAULT_USER),
-        root=str(payload.get("root") or DEFAULT_ROOT),
-        cwd=str(payload["cwd"]) if payload.get("cwd") else None,
+        root=root,
+        cwd=cwd,
         runtime_env=bool(payload.get("runtime_env", True)),
         runtime_env_file=str(runtime_env_file) if runtime_env_file else None,
         identity_file=str(payload["identity_file"]) if payload.get("identity_file") else None,

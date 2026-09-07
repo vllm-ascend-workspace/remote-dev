@@ -202,13 +202,11 @@ class DirectEndpointProperties(ResolverIsolation):
         with self.assertRaises(EndpointError):
             resolve_endpoint({"host": "203.0.113.5", "port": 22, "connect_timeout_ms": "abc"})
 
-    @unittest.expectedFailure
-    def test_known_defect_relative_root_or_cwd_is_accepted(self) -> None:
-        """KNOWN DEFECT (medium-low): a relative ``root`` (or ``cwd``) is
-        accepted at resolution time. Every later path check then fails with
-        ``PathPolicyError('remote path must be absolute')``, which surfaces as
-        ``path_outside_root`` on unrelated tool calls — the symptom appears far
-        from the cause. Evidence: ``root='relative'`` resolves successfully."""
+    def test_relative_root_or_cwd_is_rejected_at_resolution(self) -> None:
+        """A relative ``root`` (or ``cwd``) must fail at resolution. Accepting
+        it made every later path check raise ``PathPolicyError('remote path
+        must be absolute')``, which surfaced as ``path_outside_root`` on
+        unrelated tool calls — the symptom appeared far from the cause."""
         with self.assertRaises(EndpointError):
             resolve_endpoint({"host": "203.0.113.5", "port": 22, "root": "relative"})
         with self.assertRaises(EndpointError):
