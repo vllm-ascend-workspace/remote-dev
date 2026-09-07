@@ -62,13 +62,11 @@ class TransportDetectorProperties(unittest.TestCase):
 
         run_cases(300, body, label="transport detection")
 
-    @unittest.expectedFailure
-    def test_known_defect_transport_glued_to_a_shell_operator_is_missed(self) -> None:
-        """KNOWN DEFECT (low, advisory path): ``RAW_REMOTE_RE`` requires the
-        transport to follow start-of-string or whitespace, so ``;ssh``, ``|ssh``,
-        ``&&ssh``, ``$(ssh`` and ``(ssh`` are not detected. The hooks are
-        permissive today, so this only weakens future enforcement.
-        Evidence: ``contains_raw_remote_transport('true;ssh host') is False``."""
+    def test_transport_glued_to_a_shell_operator_is_detected(self) -> None:
+        """``RAW_REMOTE_RE`` must see a transport after a shell operator, not
+        only after whitespace. ``;ssh``, ``|ssh``, ``&&ssh``, ``$(ssh`` and
+        ``(ssh`` are invocations; missing them weakens any future
+        enforcement of the advisory detector."""
         for command in ("true;ssh host", "cat x|ssh host", "a&&ssh host", "$(ssh host)", "(ssh host)"):
             with self.subTest(command=command):
                 self.assertTrue(contains_raw_remote_transport(command))
