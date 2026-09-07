@@ -16,6 +16,10 @@ class PathPolicyTests(unittest.TestCase):
     def test_join_under_root_accepts_relative_child(self) -> None:
         self.assertEqual(join_under_root("/vllm-workspace", "/vllm-workspace/src", "foo.py"), "/vllm-workspace/src/foo.py")
 
+    def test_join_under_root_rejects_non_string(self) -> None:
+        with self.assertRaises(PathPolicyError):
+            join_under_root("/vllm-workspace", "/vllm-workspace", None)  # type: ignore[arg-type]
+
     def test_join_under_root_rejects_escape(self) -> None:
         with self.assertRaises(PathPolicyError):
             join_under_root("/vllm-workspace", "/vllm-workspace/src", "../../etc/passwd")

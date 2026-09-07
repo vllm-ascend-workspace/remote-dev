@@ -243,13 +243,10 @@ class PathPolicyStringLayerProperties(unittest.TestCase):
                 with self.assertRaises(PathPolicyError):
                     assert_under_root(value, "/vllm-workspace")  # type: ignore[arg-type]
 
-    @unittest.expectedFailure
-    def test_known_defect_join_under_root_leaks_attribute_error_for_non_string(self) -> None:
-        """KNOWN DEFECT (low): ``join_under_root`` calls ``rel_or_abs.startswith``
-        before ``normalize_remote_path`` validates the type, so a ``None`` or
-        integer path raises ``AttributeError`` instead of ``PathPolicyError``.
-        MCP arguments are ``str()``-coerced today, so only direct callers hit it.
-        Evidence: ``join_under_root('/r', '/r', None)`` -> AttributeError."""
+    def test_join_under_root_rejects_non_string_with_policy_error(self) -> None:
+        """``join_under_root`` used to call ``rel_or_abs.startswith`` before
+        any type check, so ``None`` leaked ``AttributeError``. Raise
+        ``PathPolicyError`` like the other path helpers."""
         with self.assertRaises(PathPolicyError):
             join_under_root("/r", "/r", None)  # type: ignore[arg-type]
 
