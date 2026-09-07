@@ -139,6 +139,31 @@ class PatchOpsTests(unittest.TestCase):
             self.assertFalse(source.exists())
             self.assertEqual(target.read_text(encoding="utf-8"), "new\n")
 
+    def test_codex_patch_executor_composes_aliased_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sub").mkdir()
+            (root / "a.py").write_text("one\ntwo\n", encoding="utf-8")
+            payload = {
+                "root": str(root),
+                "cwd": str(root),
+                "ops": [
+                    {"kind": "update", "path": "a.py", "hunks": [{"old": "one\n", "new": "ONE\n"}]},
+                    {"kind": "update", "path": "sub/../a.py", "hunks": [{"old": "two\n", "new": "TWO\n"}]},
+                ],
+            }
+            proc = subprocess.run(
+                [sys.executable, "-c", patch_ops.REMOTE_CODEX_PATCH_PY],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads(proc.stdout)
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual((root / "a.py").read_text(encoding="utf-8"), "ONE\nTWO\n")
+
     def test_codex_patch_executor_updates_file_added_in_same_patch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

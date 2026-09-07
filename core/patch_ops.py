@@ -51,7 +51,12 @@ def resolve_path(raw, *, parent_ok=False):
         fail("not_found", f"remote path does not exist: {p}")
     if resolved != root and root not in resolved.parents:
         fail("path_outside_root", f"remote path is outside root: {resolved} not under {root}")
-    return p
+    # Overlay keys must identify one file. Unresolved Path treats
+    # `a.py` and `sub/../a.py` (or a path through an in-root dir
+    # symlink) as different keys, so an earlier hunk is discarded
+    # while both ops report applied. Keep the unresolved path only
+    # for a symlink so file_bytes / atomic_write still refuse it.
+    return p if p.is_symlink() else resolved
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()

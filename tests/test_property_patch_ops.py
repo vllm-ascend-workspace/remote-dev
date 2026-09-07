@@ -423,15 +423,15 @@ class CodexExecutorProperties(unittest.TestCase):
         self.assertEqual(data["status"], "commit_failed", data)
         self.assertEqual(snapshot_tree(root), before)
 
-    @unittest.expectedFailure
-    def test_known_defect_aliased_paths_lose_earlier_hunks_but_report_applied(self) -> None:
-        """KNOWN DEFECT (medium-high): the virtual overlay is keyed by the
-        *unresolved* ``pathlib.Path``, so ``a.py`` and ``sub/../a.py`` (or a
-        path through an in-root directory symlink) are two keys for one file.
-        The second op reads the real file, not the overlay, and the commit
-        writes both overlays in order — the later write silently discards the
-        earlier hunk while the result claims ``applied`` for both.
-        Evidence: file ends as ``one\\nTWO\\n`` instead of ``ONE\\nTWO\\n``."""
+    def test_aliased_paths_compose_hunks_on_one_file(self) -> None:
+        """The virtual overlay is keyed by the resolved path so ``a.py`` and
+        ``sub/../a.py`` (or a path through an in-root directory symlink)
+        share one overlay. Keying on the unresolved Path made the second
+        op reread the real file and the later write discard the earlier
+        hunk while both ops reported ``applied``.
+
+        Before (status applied): ``one\\nTWO\\n``.
+        After: ``ONE\\nTWO\\n``, or the executor refuses."""
         root = self._root(3)
         (root / "sub").mkdir()
         (root / "a.py").write_text("one\ntwo\n", encoding="utf-8")
@@ -439,8 +439,8 @@ class CodexExecutorProperties(unittest.TestCase):
             {"kind": "update", "path": "a.py", "hunks": [{"old": "one\n", "new": "ONE\n"}]},
             {"kind": "update", "path": "sub/../a.py", "hunks": [{"old": "two\n", "new": "TWO\n"}]},
         ])
-        if data["status"] == "applied":
-            self.assertEqual((root / "a.py").read_text(encoding="utf-8"), "ONE\nTWO\n")
+        self.assertEqual(data["status"], "applied", data)
+        self.assertEqual((root / "a.py").read_text(encoding="utf-8"), "ONE\nTWO\n")
 
     def test_hunk_anchor_after_double_at_selects_the_stated_site(self) -> None:
         """The Codex format uses ``@@ <anchor>`` to pick which occurrence of
