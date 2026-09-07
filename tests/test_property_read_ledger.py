@@ -238,18 +238,12 @@ class LedgerScopeProperties(unittest.TestCase):
 
         run_cases(64, body, label="ledger scope env fallback")
 
-    @unittest.expectedFailure
-    def test_known_defect_long_or_punctuation_only_context_ids_crash_every_file_tool(self) -> None:
-        """KNOWN DEFECT (medium): ``resolve_ledger_scope`` falls back to
-        ``path_fingerprint(raw)`` when the sanitized scope is empty or longer
-        than 80 characters, but ``path_fingerprint`` requires an *absolute
-        remote path* and raises ``PathPolicyError`` for anything else. A
-        ``client_context_id`` (or ``CLAUDE_SESSION_ID`` / ``CODEX_SESSION_ID``
-        env value) that is >80 chars, or consists only of ``. - _`` and
-        non-ASCII characters, therefore makes ``remote.read``/``write``/``edit``
-        raise before any remote call — an internal error instead of a result.
-        Evidence: ``resolve_ledger_scope('a' * 81)`` and
-        ``resolve_ledger_scope('...')`` raise PathPolicyError."""
+    def test_long_or_punctuation_only_context_ids_degrade_to_a_safe_scope(self) -> None:
+        """Client context ids are not under our control. Falling back to
+        ``path_fingerprint`` (which requires an absolute remote path) made
+        ``resolve_ledger_scope('a' * 81)`` and ``resolve_ledger_scope('...')``
+        raise ``PathPolicyError`` before any remote call. Hash the raw id
+        instead so every file tool still gets a single safe path segment."""
         for raw in ("a" * 81, "...", "-_-", "漢字", "sess-" + "0" * 90):
             scope = state_store.resolve_ledger_scope(raw)
             self.assertRegex(scope, r"^[A-Za-z0-9_.-]+$")

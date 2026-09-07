@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -100,6 +101,16 @@ def new_log_dir(endpoint: Endpoint, tool_kind: str, invocation_id: str | None = 
     return path
 
 
+def _ledger_scope_digest(raw: str) -> str:
+    """Stable path-segment digest of an arbitrary client context id.
+
+    ``path_fingerprint`` requires an absolute remote path and must not be
+    used here: client ids are not under our control and are often longer
+    than 80 characters or free of ASCII alphanumerics.
+    """
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
 def resolve_ledger_scope(client_context_id: str | None = None) -> str:
     raw = str(client_context_id) if client_context_id else None
     if not raw:
@@ -112,9 +123,9 @@ def resolve_ledger_scope(client_context_id: str | None = None) -> str:
         return "default"
     safe = LEDGER_SCOPE_RE.sub("_", raw).strip("._-")
     if not safe:
-        safe = path_fingerprint(raw)
+        safe = _ledger_scope_digest(raw)
     if len(safe) > 80:
-        safe = f"{safe[:48]}-{path_fingerprint(raw)}"
+        safe = f"{safe[:48]}-{_ledger_scope_digest(raw)}"
     return safe
 
 

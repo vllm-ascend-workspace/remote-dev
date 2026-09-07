@@ -53,6 +53,13 @@ class ReadLedgerTests(unittest.TestCase):
             finally:
                 state_store.substrate_root = original  # type: ignore[assignment]
 
+    def test_read_ledger_scope_degrades_awkward_context_ids(self) -> None:
+        for raw in ("a" * 81, "...", "-_-", "漢字"):
+            scope = state_store.resolve_ledger_scope(raw)
+            self.assertRegex(scope, r"^[A-Za-z0-9_.-]+$")
+            self.assertLessEqual(len(scope), 80)
+            self.assertNotIn(scope, {".", ".."})
+
     def test_read_ledger_scope_isolated_by_client_context(self) -> None:
         endpoint = Endpoint(host="1.2.3.4", port=46000)
         with tempfile.TemporaryDirectory() as tmp:
