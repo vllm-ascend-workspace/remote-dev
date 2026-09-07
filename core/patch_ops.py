@@ -78,12 +78,20 @@ def exists_in_virtual(path):
     data = file_bytes(path)
     return data is not None
 
+created_dirs = []
+
 def atomic_write(path, data, mode=None):
     if path.is_symlink():
         fail("symlink_not_allowed", f"refusing to patch symlink: {path}")
     if path.exists() and not path.is_file():
         fail("not_file", f"refusing to patch non-regular file: {path}")
+    parent = path.parent
+    missing = []
+    while parent != parent.parent and not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
     path.parent.mkdir(parents=True, exist_ok=True)
+    created_dirs.extend(reversed(missing))
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "wb") as fh:
@@ -112,14 +120,24 @@ def restore(before_state):
     failed = []
     for path, state in reversed(list(before_state.items())):
         try:
+            current_exists = path.exists() or path.is_symlink()
             if state["exists"]:
+                current_bytes = path.read_bytes() if path.exists() and path.is_file() else None
+                if current_exists and current_bytes == state["bytes"]:
+                    continue
                 atomic_write(path, state["bytes"], state["mode"])
             else:
-                if path.exists() or path.is_symlink():
-                    path.unlink()
+                if not current_exists:
+                    continue
+                path.unlink()
             restored.append(str(path))
         except Exception as exc:  # noqa: BLE001
             failed.append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
+    for directory in reversed(created_dirs):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
     return {"restored": restored, "failed": failed}
 
 changed = []

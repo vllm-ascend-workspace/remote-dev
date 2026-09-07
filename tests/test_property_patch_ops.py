@@ -369,16 +369,11 @@ class CodexExecutorProperties(unittest.TestCase):
         self.assertEqual(snapshot_tree(root), before)
         self.assertIn("ok/a.py", " ".join(data["rollback_status"]["restored"]))
 
-    @unittest.expectedFailure
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores directory permissions")
-    def test_known_defect_rollback_report_lists_untouched_files_as_failed(self) -> None:
-        """KNOWN DEFECT (low): ``restore`` rewrites *every* touched path, not
-        only the ones the commit actually changed. When the commit failed
-        because a directory is unwritable, restoring the unchanged file in that
-        directory fails too, and ``rollback_status.failed`` reports a file that
-        is byte-for-byte intact. The caller cannot tell a real rollback failure
-        from this false alarm. Evidence: ``failed`` names ``locked/b.py`` while
-        the tree equals the pre-patch snapshot."""
+    def test_rollback_report_does_not_list_untouched_files_as_failed(self) -> None:
+        """``restore`` rewrote every touched path, so an unwritable
+        directory made the unchanged file there look like a rollback
+        failure. Skip paths whose bytes already match the snapshot."""
         root = self._root(6)
         (root / "ok").mkdir()
         (root / "locked").mkdir()
@@ -397,14 +392,12 @@ class CodexExecutorProperties(unittest.TestCase):
         self.assertEqual(snapshot_tree(root), before)
         self.assertEqual(data["rollback_status"]["failed"], [])
 
-    @unittest.expectedFailure
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores directory permissions")
-    def test_known_defect_rollback_leaves_directories_created_during_failed_commit(self) -> None:
-        """KNOWN DEFECT (low): when the commit phase fails, ``restore`` unlinks
-        files it created but keeps directories that ``atomic_write`` created via
-        ``mkdir(parents=True)``. A rejected patch therefore leaves new empty
-        directories behind — a weak form of half-application that a later
-        ``git status`` or glob will surface. Evidence: ``newdir/`` survives."""
+    def test_rollback_removes_directories_created_during_failed_commit(self) -> None:
+        """``restore`` unlinked files it created but kept directories
+        that ``atomic_write`` made via ``mkdir(parents=True)``. Drop
+        those empty directories so a rejected patch leaves no tree
+        residue."""
         root = self._root(2)
         (root / "locked").mkdir()
         (root / "locked" / "b.py").write_text("b1\n", encoding="utf-8")
