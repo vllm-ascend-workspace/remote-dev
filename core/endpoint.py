@@ -139,6 +139,8 @@ def _direct_endpoint(payload: dict[str, Any]) -> Endpoint:
         port = int(payload["port"])
     except (TypeError, ValueError) as exc:
         raise EndpointError("endpoint port must be an integer") from exc
+    if isinstance(payload.get("port"), bool) or not (1 <= port <= 65535):
+        raise EndpointError(f"endpoint port must be in 1..65535, got {payload['port']!r}")
     root = str(payload.get("root") or DEFAULT_ROOT)
     cwd = str(payload["cwd"]) if payload.get("cwd") else None
     if not root.startswith("/"):

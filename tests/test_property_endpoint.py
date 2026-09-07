@@ -183,12 +183,9 @@ class DirectEndpointProperties(ResolverIsolation):
         for token in ("host", "port", "alias"):
             self.assertIn(token, message)
 
-    @unittest.expectedFailure
-    def test_known_defect_port_range_is_not_validated(self) -> None:
-        """KNOWN DEFECT (low): ``_direct_endpoint`` accepts any integer port,
-        so ``port=70000`` / ``port=-1`` produce an Endpoint that can never be
-        reached and fails later inside ``ssh`` instead of at resolution.
-        Evidence: ``resolve_endpoint({'host': '203.0.113.5', 'port': 70000}).port == 70000``."""
+    def test_port_range_is_validated_at_resolution(self) -> None:
+        """``port=70000`` / ``port=-1`` must fail at resolution, not later
+        inside ``ssh``."""
         for port in (70000, -1, 65536):
             with self.assertRaises(EndpointError, msg=f"port {port} accepted"):
                 resolve_endpoint({"host": "203.0.113.5", "port": port})

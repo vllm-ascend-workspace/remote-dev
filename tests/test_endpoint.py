@@ -47,6 +47,11 @@ class EndpointTests(unittest.TestCase):
         with self.assertRaises(EndpointError):
             resolve_endpoint({"host": "1.2.3.4", "port": "not-a-port"})
 
+    def test_direct_endpoint_rejects_out_of_range_port(self) -> None:
+        for port in (70000, -1, 65536, 0):
+            with self.assertRaises(EndpointError):
+                resolve_endpoint({"host": "203.0.113.5", "port": port})
+
     def test_direct_endpoint_rejects_relative_root_or_cwd(self) -> None:
         with self.assertRaises(EndpointError):
             resolve_endpoint({"host": "203.0.113.5", "port": 22, "root": "relative"})
