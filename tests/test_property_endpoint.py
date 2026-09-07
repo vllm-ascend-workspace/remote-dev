@@ -190,12 +190,9 @@ class DirectEndpointProperties(ResolverIsolation):
             with self.assertRaises(EndpointError, msg=f"port {port} accepted"):
                 resolve_endpoint({"host": "203.0.113.5", "port": port})
 
-    @unittest.expectedFailure
-    def test_known_defect_connect_timeout_garbage_leaks_value_error(self) -> None:
-        """KNOWN DEFECT (low): ``connect_timeout_ms`` is converted with a bare
-        ``int(...)``; a non-numeric string raises ``ValueError`` rather than
-        ``EndpointError``, so MCP callers receive an internal error instead of a
-        precise resolution failure. Evidence: ``connect_timeout_ms='abc'``."""
+    def test_connect_timeout_garbage_is_an_endpoint_error(self) -> None:
+        """A non-numeric ``connect_timeout_ms`` must raise ``EndpointError``,
+        not leak ``ValueError`` to the MCP caller."""
         with self.assertRaises(EndpointError):
             resolve_endpoint({"host": "203.0.113.5", "port": 22, "connect_timeout_ms": "abc"})
 
