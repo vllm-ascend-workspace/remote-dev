@@ -88,6 +88,10 @@ class PatchOpsTests(unittest.TestCase):
 """
         self.assertEqual(parse_unified_patch_paths(patch), ["a.py"])
 
+    def test_parse_unified_paths_strips_timestamp_suffix(self) -> None:
+        patch = "--- a/x.py\t2026-01-01 00:00:00\n+++ b/x.py\t2026-01-01 00:00:01\n@@ -1 +1 @@\n-a\n+b\n"
+        self.assertEqual(parse_unified_patch_paths(patch), ["x.py"])
+
     def test_remote_apply_patch_path_escape_returns_blocked_result(self) -> None:
         endpoint = Endpoint(host="1.2.3.4", port=46000, root="/vllm-workspace")
         patch = """*** Begin Patch

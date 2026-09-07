@@ -347,11 +347,11 @@ def parse_unified_patch_paths(patch: str) -> list[str]:
     for line in patch.splitlines():
         path: str | None = None
         if line.startswith("+++ "):
-            raw = line[4:].strip()
+            raw = line[4:].split("\t", 1)[0].strip()
             if raw != "/dev/null":
                 path = raw[2:] if raw.startswith("b/") else raw
         elif line.startswith("--- "):
-            raw = line[4:].strip()
+            raw = line[4:].split("\t", 1)[0].strip()
             if raw != "/dev/null":
                 path = raw[2:] if raw.startswith("a/") else raw
         elif line.startswith("diff --git "):

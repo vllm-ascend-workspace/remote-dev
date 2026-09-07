@@ -514,13 +514,10 @@ class UnifiedDiffProperties(unittest.TestCase):
         with self.assertRaises(PatchParseError):
             parse_unified_patch_paths("@@ -1 +1 @@\n-a\n+b\n")
 
-    @unittest.expectedFailure
-    def test_known_defect_timestamp_suffix_is_kept_in_extracted_path(self) -> None:
-        """KNOWN DEFECT (low): ``diff -u`` style headers may carry a tab and a
-        timestamp (``--- a/x.py\\t2026-01-01 00:00:00``). The extractor keeps the
-        suffix, so the local pre-flight (root check, symlink check, before-hash)
-        runs on a path that ``git apply`` never touches.
-        Evidence: extracted path is ``'x.py\\t2026-01-01 00:00:00'``."""
+    def test_timestamp_suffix_is_stripped_from_extracted_path(self) -> None:
+        """``diff -u`` headers may carry a tab and a timestamp
+        (``--- a/x.py\\t2026-01-01 00:00:00``). Keeping the suffix made the
+        local pre-flight run on a path ``git apply`` never touches."""
         patch = "--- a/x.py\t2026-01-01 00:00:00\n+++ b/x.py\t2026-01-01 00:00:01\n@@ -1 +1 @@\n-a\n+b\n"
         self.assertEqual(parse_unified_patch_paths(patch), ["x.py"])
 
