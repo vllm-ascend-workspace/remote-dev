@@ -74,13 +74,10 @@ class TextPreviewProperties(unittest.TestCase):
 
         run_cases(20, body, label="multibyte previews")
 
-    @unittest.expectedFailure
-    def test_known_defect_zero_tail_chars_returns_the_whole_value_as_tail(self) -> None:
-        """KNOWN DEFECT (low): ``text_preview(value, tail_chars=0)`` slices
-        ``value[-0:]`` — the entire value — so a truncated preview carries the
-        full content in ``tail`` while claiming ``truncated: True`` with a
-        5-char head. Same ``[-0:]`` family as ``compact_text``/``tail_text``.
-        Evidence: ``len(result['tail']) == len(value)``."""
+    def test_zero_tail_chars_returns_an_empty_tail(self) -> None:
+        """``text_preview(value, tail_chars=0)`` used ``value[-0:]`` — the
+        entire value — so a truncated preview carried the full content in
+        ``tail`` while claiming ``truncated: True``."""
         value = "x" * 100
         result = preview.text_preview(value, head_chars=5, tail_chars=0)
         self.assertTrue(result["truncated"])
@@ -130,23 +127,17 @@ class CompactTextProperties(unittest.TestCase):
 
         run_cases(300, body, label="tail_text")
 
-    @unittest.expectedFailure
-    def test_known_defect_compact_text_grows_output_when_limit_is_below_marker_size(self) -> None:
-        """KNOWN DEFECT (low): ``compact_text`` computes ``keep = max(0, limit -
-        len(marker))``; when ``keep`` is 0 the tail slice is ``value[-0:]`` which
-        is the *whole* value, so the "compacted" output is ``marker + value`` —
-        longer than the input and unbounded. Only limits <= len(marker) (~74)
-        trigger it; production callers use 12000. Evidence:
-        ``len(compact_text('x' * 200, limit=50)) == 274``."""
+    def test_compact_text_stays_bounded_when_limit_is_below_marker_size(self) -> None:
+        """When ``keep`` is 0 the tail slice was ``value[-0:]`` (the whole
+        value), so the compacted output was ``marker + value``. Treat a
+        zero-length tail as empty."""
         value = "x" * 200
         result = preview.compact_text(value, limit=50)
         self.assertLessEqual(len(result), max(50, len(MARKER)))
 
-    @unittest.expectedFailure
-    def test_known_defect_tail_text_with_zero_limit_returns_everything(self) -> None:
-        """KNOWN DEFECT (low): ``tail_text(value, 0)`` evaluates ``value[-0:]``
-        and returns the entire value instead of an empty string, so a caller
-        asking for "no tail" gets an unbounded payload. Evidence: len == 200."""
+    def test_tail_text_with_zero_limit_returns_empty(self) -> None:
+        """``tail_text(value, 0)`` used ``value[-0:]`` and returned the
+        entire value. A caller asking for no tail must get ``""``."""
         self.assertEqual(preview.tail_text("x" * 200, 0), "")
 
 
