@@ -164,15 +164,12 @@ class CodexParserProperties(unittest.TestCase):
 
         run_cases(200, body, label="malformed codex patch")
 
-    @unittest.expectedFailure
-    def test_known_defect_splitlines_boundaries_alter_add_file_content(self) -> None:
-        """KNOWN DEFECT (low-medium): the parser splits with ``str.splitlines``,
-        which also breaks on ``\\x0c`` (form feed, legal in Python source),
-        ``\\r``, ``\\x1c``-``\\x1e``, ``\\x85``, ``\\u2028`` and ``\\u2029``. The
-        fragment after such a character is re-read as a new patch line: an
-        ``Add File`` body ``+a\\x0c+b`` is stored as ``a\\x0cb`` (the second
-        ``+`` is eaten), and other fragments raise a confusing parse error.
-        Evidence: ``parse_codex_patch('...+a\\x0c+b\\n...')[0]['content'] != 'a\\x0c+b\\n'``."""
+    def test_splitlines_boundaries_do_not_alter_add_file_content(self) -> None:
+        """``str.splitlines`` also breaks on ``\\x0c`` (form feed, legal in
+        Python source), ``\\r``, ``\\x1c``-``\\x1e``, ``\\x85``, ``\\u2028``
+        and ``\\u2029``. The fragment after such a character was re-read as
+        a new patch line: ``+a\\x0c+b`` became ``a\\x0cb``. Split on ``\\n``
+        only so those bytes stay in the file body."""
         for separator in SPLITLINES_EXTRA:
             content = f"a{separator}+b\n"
             text = f"*** Begin Patch\n*** Add File: f.py\n+{content}*** End Patch\n"

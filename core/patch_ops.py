@@ -221,6 +221,21 @@ class PatchParseError(ValueError):
     pass
 
 
+def _split_lf_lines(text: str) -> list[str]:
+    """Split on ``\\n`` only.
+
+    ``str.splitlines`` also breaks on form-feed, ``\\r``, ``\\x85`` and
+    Unicode line separators. Those bytes are legal file content and
+    must stay inside a single patch line.
+    """
+    if not text:
+        return []
+    if text.endswith("\n"):
+        return [line + "\n" for line in text[:-1].split("\n")]
+    parts = text.split("\n")
+    return [part + "\n" for part in parts[:-1]] + [parts[-1]]
+
+
 def _hunk_dict(old_parts: list[str], new_parts: list[str], anchor: str) -> dict[str, str]:
     hunk = {"old": "".join(old_parts), "new": "".join(new_parts)}
     if anchor:
@@ -239,7 +254,7 @@ def _is_patch_boundary(line: str) -> bool:
 
 
 def parse_codex_patch(patch: str) -> list[dict[str, Any]]:
-    lines = patch.splitlines(keepends=True)
+    lines = _split_lf_lines(patch)
     if not lines or lines[0].strip() != "*** Begin Patch":
         raise PatchParseError("Codex patch must start with *** Begin Patch")
     ops: list[dict[str, Any]] = []
