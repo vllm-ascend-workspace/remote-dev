@@ -28,13 +28,12 @@ root = pathlib.Path(payload["root"]).resolve()
 target = pathlib.Path(payload["remote_path"])
 if not target.is_absolute():
     target = pathlib.Path(payload.get("cwd") or payload["root"]) / target
-try:
-    resolved = target.resolve()
-except FileNotFoundError:
-    print(json.dumps({"status": "needs_input", "error": "remote path does not exist", "remote_path": str(target)}))
-    raise SystemExit(0)
+resolved = target.resolve()
 if resolved != root and root not in resolved.parents:
     print(json.dumps({"status": "blocked", "error": f"remote path is outside root: {resolved}", "remote_path": str(target)}))
+    raise SystemExit(0)
+if not target.exists() and not resolved.exists():
+    print(json.dumps({"status": "needs_input", "error": "remote path does not exist", "remote_path": str(target)}))
     raise SystemExit(0)
 if target.is_symlink():
     print(json.dumps({"status": "blocked", "error": "artifact symlinks are not allowed", "remote_path": str(target)}))
@@ -129,11 +128,24 @@ def _safe_local_artifact_path(base: Path, relpath: str) -> Path:
     if rel.is_absolute() or any(part in {"..", ""} for part in rel.parts):
         raise ValueError(f"unsafe artifact relpath: {relpath}")
     candidate = base.joinpath(*rel.parts)
-    candidate.parent.mkdir(parents=True, exist_ok=True)
     base_resolved = base.resolve()
+    # Check containment and the parent chain *before* mkdir. resolve()
+    # follows a pre-existing symlink prefix without creating anything, so
+    # `linkdir/sub/x` that points outside base is rejected with no
+    # side effect. A file or dangling symlink in a parent position used
+    # to raise FileExistsError from mkdir; treat that as ValueError too.
     parent_resolved = candidate.parent.resolve()
     if parent_resolved != base_resolved and base_resolved not in parent_resolved.parents:
         raise ValueError(f"artifact relpath escapes local dir: {relpath}")
+    probe = base
+    for part in rel.parts[:-1]:
+        probe = probe / part
+        if probe.is_symlink() or probe.is_file():
+            raise ValueError(f"artifact relpath escapes local dir: {relpath}")
+    try:
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ValueError(f"artifact relpath is not a creatable path: {relpath}") from exc
     if candidate.is_symlink():
         raise ValueError(f"refusing to overwrite local symlink: {candidate}")
     return candidate

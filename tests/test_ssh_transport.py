@@ -88,6 +88,18 @@ class SshTransportTests(unittest.TestCase):
         self.assertIn(expected, cmd)
         self.assertIn("/keys/a", cmd)
 
+    def test_ssh_base_cmd_cannot_turn_user_or_host_into_an_option(self) -> None:
+        # A user or host that begins with `-` must stay an argument of `-l`
+        # / the destination after `--`. OpenSSH would otherwise treat
+        # `-oProxyCommand=...` as an option and run a local command.
+        endpoint = Endpoint(host="-oProxyCommand=marker", port=22, user="-oProxyCommand=evil")
+        with mock.patch.object(ssh_transport, "_MUX_READY", False):
+            cmd = ssh_transport.ssh_base_cmd(endpoint)
+        self.assertEqual(cmd[cmd.index("-l") + 1], "-oProxyCommand=evil")
+        self.assertEqual(cmd[cmd.index("--") + 1], "-oProxyCommand=marker")
+        self.assertLess(cmd.index("-l"), cmd.index("--"))
+        self.assertNotIn("-oProxyCommand=evil@-oProxyCommand=marker", cmd)
+
 
 if __name__ == "__main__":
     unittest.main()

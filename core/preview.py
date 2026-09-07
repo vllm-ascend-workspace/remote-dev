@@ -10,6 +10,17 @@ DEFAULT_HEAD_CHARS = 4000
 DEFAULT_TAIL_CHARS = 4000
 
 
+def _tail_slice(value: str, count: int) -> str:
+    """Return a true suffix of ``count`` characters.
+
+    ``value[-0:]`` is the whole string; callers that ask for no tail
+    must get ``""``.
+    """
+    if count <= 0:
+        return ""
+    return value[-count:]
+
+
 def text_preview(
     value: str,
     *,
@@ -27,7 +38,7 @@ def text_preview(
         }
     return {
         "head": value[:head_chars],
-        "tail": value[-tail_chars:],
+        "tail": _tail_slice(value, tail_chars),
         "bytes": byte_count,
         "truncated": True,
         "head_chars": head_chars,
@@ -49,6 +60,8 @@ def stdout_stderr_preview(stdout: str, stderr: str) -> dict[str, object]:
 
 
 def tail_text(value: str, limit: int = DEFAULT_TAIL_CHARS) -> str:
+    if limit <= 0:
+        return ""
     return value if len(value) <= limit else value[-limit:]
 
 
@@ -59,4 +72,4 @@ def compact_text(value: str, *, limit: int = MAX_TEXT_CHARS) -> str:
     keep = max(0, limit - len(marker))
     head = keep // 2
     tail = keep - head
-    return value[:head] + marker + value[-tail:]
+    return value[:head] + marker + _tail_slice(value, tail)

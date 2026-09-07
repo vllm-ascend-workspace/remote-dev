@@ -132,6 +132,17 @@ def _read_endpoint_aliases() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _connect_timeout_ms(payload: dict[str, Any]) -> int:
+    raw = payload.get("connect_timeout_ms")
+    try:
+        timeout = int(raw or 10000)
+    except (TypeError, ValueError) as exc:
+        raise EndpointError("endpoint connect_timeout_ms must be an integer") from exc
+    if isinstance(raw, bool):
+        raise EndpointError("endpoint connect_timeout_ms must be an integer")
+    return timeout
+
+
 def _direct_endpoint(payload: dict[str, Any]) -> Endpoint:
     if "host" not in payload or "port" not in payload:
         raise EndpointError("direct endpoint requires host and port")
@@ -139,17 +150,26 @@ def _direct_endpoint(payload: dict[str, Any]) -> Endpoint:
         port = int(payload["port"])
     except (TypeError, ValueError) as exc:
         raise EndpointError("endpoint port must be an integer") from exc
+    if isinstance(payload.get("port"), bool) or not (1 <= port <= 65535):
+        raise EndpointError(f"endpoint port must be in 1..65535, got {payload['port']!r}")
+    root = str(payload.get("root") or DEFAULT_ROOT)
+    cwd = str(payload["cwd"]) if payload.get("cwd") else None
+    if not root.startswith("/"):
+        raise EndpointError(f"endpoint root must be an absolute path, got {root!r}")
+    effective_cwd = cwd or DEFAULT_CWD or root
+    if not str(effective_cwd).startswith("/"):
+        raise EndpointError(f"endpoint cwd must be an absolute path, got {effective_cwd!r}")
     runtime_env_file = payload.get("runtime_env_file", DEFAULT_RUNTIME_ENV_FILE)
     return Endpoint(
         host=str(payload["host"]),
         port=port,
         user=str(payload.get("user") or DEFAULT_USER),
-        root=str(payload.get("root") or DEFAULT_ROOT),
-        cwd=str(payload["cwd"]) if payload.get("cwd") else None,
+        root=root,
+        cwd=cwd,
         runtime_env=bool(payload.get("runtime_env", True)),
         runtime_env_file=str(runtime_env_file) if runtime_env_file else None,
         identity_file=str(payload["identity_file"]) if payload.get("identity_file") else None,
-        connect_timeout_ms=int(payload.get("connect_timeout_ms") or 10000),
+        connect_timeout_ms=_connect_timeout_ms(payload),
         kind=str(payload.get("kind") or "direct-endpoint"),
         alias=str(payload["alias"]) if payload.get("alias") else None,
         source=payload.get("source") if isinstance(payload.get("source"), dict) else None,

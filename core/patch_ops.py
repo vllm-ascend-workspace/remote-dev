@@ -51,7 +51,12 @@ def resolve_path(raw, *, parent_ok=False):
         fail("not_found", f"remote path does not exist: {p}")
     if resolved != root and root not in resolved.parents:
         fail("path_outside_root", f"remote path is outside root: {resolved} not under {root}")
-    return p
+    # Overlay keys must identify one file. Unresolved Path treats
+    # `a.py` and `sub/../a.py` (or a path through an in-root dir
+    # symlink) as different keys, so an earlier hunk is discarded
+    # while both ops report applied. Keep the unresolved path only
+    # for a symlink so file_bytes / atomic_write still refuse it.
+    return p if p.is_symlink() else resolved
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
@@ -73,12 +78,20 @@ def exists_in_virtual(path):
     data = file_bytes(path)
     return data is not None
 
+created_dirs = []
+
 def atomic_write(path, data, mode=None):
     if path.is_symlink():
         fail("symlink_not_allowed", f"refusing to patch symlink: {path}")
     if path.exists() and not path.is_file():
         fail("not_file", f"refusing to patch non-regular file: {path}")
+    parent = path.parent
+    missing = []
+    while parent != parent.parent and not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
     path.parent.mkdir(parents=True, exist_ok=True)
+    created_dirs.extend(reversed(missing))
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "wb") as fh:
@@ -107,14 +120,24 @@ def restore(before_state):
     failed = []
     for path, state in reversed(list(before_state.items())):
         try:
+            current_exists = path.exists() or path.is_symlink()
             if state["exists"]:
+                current_bytes = path.read_bytes() if path.exists() and path.is_file() else None
+                if current_exists and current_bytes == state["bytes"]:
+                    continue
                 atomic_write(path, state["bytes"], state["mode"])
             else:
-                if path.exists() or path.is_symlink():
-                    path.unlink()
+                if not current_exists:
+                    continue
+                path.unlink()
             restored.append(str(path))
         except Exception as exc:  # noqa: BLE001
             failed.append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
+    for directory in reversed(created_dirs):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
     return {"restored": restored, "failed": failed}
 
 changed = []
@@ -149,9 +172,21 @@ for op in ops:
         for hunk_index, hunk in enumerate(op.get("hunks", [])):
             old = hunk["old"]
             new = hunk["new"]
+            anchor = hunk.get("anchor") or ""
+            if old == "":
+                fail("context_mismatch", f"patch hunk has no context in {path}; refuse unanchored insertion", hunk_index=hunk_index)
             if old not in after_text:
                 fail("context_mismatch", f"patch context not found in {path}; re-run remote.read before retrying", hunk_index=hunk_index)
-            after_text = after_text.replace(old, new, 1)
+            if anchor:
+                pos = after_text.find(anchor)
+                if pos < 0:
+                    fail("context_mismatch", f"patch anchor {anchor!r} not found in {path}", hunk_index=hunk_index)
+                rel = after_text.find(old, pos)
+                if rel < 0:
+                    fail("context_mismatch", f"patch context not found after anchor in {path}", hunk_index=hunk_index)
+                after_text = after_text[:rel] + new + after_text[rel + len(old):]
+            else:
+                after_text = after_text.replace(old, new, 1)
         virtual[target_path] = after_text.encode("utf-8")
         if target_path != path:
             virtual[path] = DELETED
@@ -206,6 +241,28 @@ class PatchParseError(ValueError):
     pass
 
 
+def _split_lf_lines(text: str) -> list[str]:
+    """Split on ``\\n`` only.
+
+    ``str.splitlines`` also breaks on form-feed, ``\\r``, ``\\x85`` and
+    Unicode line separators. Those bytes are legal file content and
+    must stay inside a single patch line.
+    """
+    if not text:
+        return []
+    if text.endswith("\n"):
+        return [line + "\n" for line in text[:-1].split("\n")]
+    parts = text.split("\n")
+    return [part + "\n" for part in parts[:-1]] + [parts[-1]]
+
+
+def _hunk_dict(old_parts: list[str], new_parts: list[str], anchor: str) -> dict[str, str]:
+    hunk = {"old": "".join(old_parts), "new": "".join(new_parts)}
+    if anchor:
+        hunk["anchor"] = anchor
+    return hunk
+
+
 def _is_patch_boundary(line: str) -> bool:
     stripped = line.strip("\r\n")
     return (
@@ -217,7 +274,7 @@ def _is_patch_boundary(line: str) -> bool:
 
 
 def parse_codex_patch(patch: str) -> list[dict[str, Any]]:
-    lines = patch.splitlines(keepends=True)
+    lines = _split_lf_lines(patch)
     if not lines or lines[0].strip() != "*** Begin Patch":
         raise PatchParseError("Codex patch must start with *** Begin Patch")
     ops: list[dict[str, Any]] = []
@@ -249,6 +306,7 @@ def parse_codex_patch(patch: str) -> list[dict[str, Any]]:
             old_parts: list[str] = []
             new_parts: list[str] = []
             saw_hunk_line = False
+            current_anchor = ""
             move_to: str | None = None
             while i < len(lines) and not _is_patch_boundary(lines[i]):
                 line = lines[i]
@@ -264,10 +322,11 @@ def parse_codex_patch(patch: str) -> list[dict[str, Any]]:
                     continue
                 if line.startswith("@@"):
                     if saw_hunk_line and (old_parts or new_parts):
-                        hunks.append({"old": "".join(old_parts), "new": "".join(new_parts)})
+                        hunks.append(_hunk_dict(old_parts, new_parts, current_anchor))
                         old_parts = []
                         new_parts = []
                     saw_hunk_line = True
+                    current_anchor = stripped_line[2:].strip()
                     i += 1
                     continue
                 if not line:
@@ -287,7 +346,7 @@ def parse_codex_patch(patch: str) -> list[dict[str, Any]]:
                 saw_hunk_line = True
                 i += 1
             if old_parts or new_parts:
-                hunks.append({"old": "".join(old_parts), "new": "".join(new_parts)})
+                hunks.append(_hunk_dict(old_parts, new_parts, current_anchor))
             if not hunks and not move_to:
                 raise PatchParseError(f"update patch for {path} has no hunks")
             op: dict[str, Any] = {"kind": "update", "path": path, "hunks": hunks}
@@ -306,11 +365,11 @@ def parse_unified_patch_paths(patch: str) -> list[str]:
     for line in patch.splitlines():
         path: str | None = None
         if line.startswith("+++ "):
-            raw = line[4:].strip()
+            raw = line[4:].split("\t", 1)[0].strip()
             if raw != "/dev/null":
                 path = raw[2:] if raw.startswith("b/") else raw
         elif line.startswith("--- "):
-            raw = line[4:].strip()
+            raw = line[4:].split("\t", 1)[0].strip()
             if raw != "/dev/null":
                 path = raw[2:] if raw.startswith("a/") else raw
         elif line.startswith("diff --git "):

@@ -25,6 +25,8 @@ def assert_under_root(path: str, root: str) -> str:
 
 
 def join_under_root(root: str, cwd: str, rel_or_abs: str) -> str:
+    if not isinstance(rel_or_abs, str):
+        raise PathPolicyError("remote path must be a non-empty string")
     candidate = rel_or_abs if rel_or_abs.startswith("/") else posixpath.join(cwd, rel_or_abs)
     return assert_under_root(candidate, root)
 

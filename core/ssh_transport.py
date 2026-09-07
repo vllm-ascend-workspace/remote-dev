@@ -82,7 +82,10 @@ def ssh_base_cmd(endpoint: Endpoint) -> list[str]:
     ]
     if endpoint.identity_file:
         cmd.extend(["-i", endpoint.identity_file])
-    cmd.extend(["-p", str(endpoint.port), endpoint.destination()])
+    # User and host are never positional options. `-l` consumes `user`
+    # even when it begins with `-`, and `--` stops option parsing before
+    # `host`. `Endpoint.destination()` (`user@host`) is display-only.
+    cmd.extend(["-l", endpoint.user, "-p", str(endpoint.port), "--", endpoint.host])
     return cmd
 
 

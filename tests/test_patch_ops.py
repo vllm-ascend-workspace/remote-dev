@@ -64,6 +64,20 @@ class PatchOpsTests(unittest.TestCase):
         ops = parse_codex_patch(patch)
         self.assertEqual(ops[0]["hunks"], [{"old": "old\n", "new": "new\n"}])
 
+    def test_parse_codex_keeps_hunk_anchor_text(self) -> None:
+        patch = """*** Begin Patch
+*** Update File: foo.py
+@@ def second():
+-    return 1
++    return 2
+*** End Patch
+"""
+        ops = parse_codex_patch(patch)
+        self.assertEqual(
+            ops[0]["hunks"],
+            [{"old": "    return 1\n", "new": "    return 2\n", "anchor": "def second():"}],
+        )
+
     def test_parse_unified_paths(self) -> None:
         patch = """diff --git a/a.py b/a.py
 --- a/a.py
@@ -73,6 +87,10 @@ class PatchOpsTests(unittest.TestCase):
 +b
 """
         self.assertEqual(parse_unified_patch_paths(patch), ["a.py"])
+
+    def test_parse_unified_paths_strips_timestamp_suffix(self) -> None:
+        patch = "--- a/x.py\t2026-01-01 00:00:00\n+++ b/x.py\t2026-01-01 00:00:01\n@@ -1 +1 @@\n-a\n+b\n"
+        self.assertEqual(parse_unified_patch_paths(patch), ["x.py"])
 
     def test_remote_apply_patch_path_escape_returns_blocked_result(self) -> None:
         endpoint = Endpoint(host="1.2.3.4", port=46000, root="/vllm-workspace")
@@ -124,6 +142,31 @@ class PatchOpsTests(unittest.TestCase):
             self.assertEqual(result["status"], "applied")
             self.assertFalse(source.exists())
             self.assertEqual(target.read_text(encoding="utf-8"), "new\n")
+
+    def test_codex_patch_executor_composes_aliased_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sub").mkdir()
+            (root / "a.py").write_text("one\ntwo\n", encoding="utf-8")
+            payload = {
+                "root": str(root),
+                "cwd": str(root),
+                "ops": [
+                    {"kind": "update", "path": "a.py", "hunks": [{"old": "one\n", "new": "ONE\n"}]},
+                    {"kind": "update", "path": "sub/../a.py", "hunks": [{"old": "two\n", "new": "TWO\n"}]},
+                ],
+            }
+            proc = subprocess.run(
+                [sys.executable, "-c", patch_ops.REMOTE_CODEX_PATCH_PY],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads(proc.stdout)
+            self.assertEqual(result["status"], "applied")
+            self.assertEqual((root / "a.py").read_text(encoding="utf-8"), "ONE\nTWO\n")
 
     def test_codex_patch_executor_updates_file_added_in_same_patch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -304,21 +304,25 @@ class McpSchemaTests(unittest.TestCase):
         self.assertEqual(json.loads(proc.stdout)["result"]["tools"], list_tools())
 
     def test_mcp_server_sets_process_level_ledger_scope(self) -> None:
-        from core.state_store import resolve_ledger_scope
+        from core.state_store import LEDGER_SCOPE_ENV_VARS, resolve_ledger_scope
 
-        original = os.environ.pop("REMOTE_DEV_SESSION_ID", None)
+        saved = {name: os.environ.pop(name, None) for name in LEDGER_SCOPE_ENV_VARS}
         try:
             import mcp.server as mcp_server
 
             importlib.reload(mcp_server)
+            session_id = os.environ.get("REMOTE_DEV_SESSION_ID", "")
             scope = resolve_ledger_scope()
-            self.assertTrue(scope.startswith("mcp-"))
+            self.assertTrue(session_id.startswith("mcp-"), session_id)
+            self.assertTrue(scope.startswith("id-"), scope)
             self.assertNotEqual(scope, "default")
+            self.assertEqual(scope, resolve_ledger_scope(session_id))
         finally:
-            if original is None:
-                os.environ.pop("REMOTE_DEV_SESSION_ID", None)
-            else:
-                os.environ["REMOTE_DEV_SESSION_ID"] = original
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 if __name__ == "__main__":
