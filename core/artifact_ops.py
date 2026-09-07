@@ -28,13 +28,12 @@ root = pathlib.Path(payload["root"]).resolve()
 target = pathlib.Path(payload["remote_path"])
 if not target.is_absolute():
     target = pathlib.Path(payload.get("cwd") or payload["root"]) / target
-try:
-    resolved = target.resolve()
-except FileNotFoundError:
-    print(json.dumps({"status": "needs_input", "error": "remote path does not exist", "remote_path": str(target)}))
-    raise SystemExit(0)
+resolved = target.resolve()
 if resolved != root and root not in resolved.parents:
     print(json.dumps({"status": "blocked", "error": f"remote path is outside root: {resolved}", "remote_path": str(target)}))
+    raise SystemExit(0)
+if not target.exists() and not resolved.exists():
+    print(json.dumps({"status": "needs_input", "error": "remote path does not exist", "remote_path": str(target)}))
     raise SystemExit(0)
 if target.is_symlink():
     print(json.dumps({"status": "blocked", "error": "artifact symlinks are not allowed", "remote_path": str(target)}))

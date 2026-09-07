@@ -217,15 +217,11 @@ class ManifestProperties(unittest.TestCase):
         self.assertEqual(remote_manifest(root, root / "in" / ".." / ".." / "elsewhere")["status"], "blocked")
         self.assertEqual(remote_manifest(root, root / "in" / ".." / ".." / "elsewhere" / "missing")["status"], "blocked")
 
-    @unittest.expectedFailure
-    def test_known_defect_manifest_of_missing_path_reports_ok_with_zero_files(self) -> None:
-        """KNOWN DEFECT (low-medium): ``REMOTE_MANIFEST_PY`` guards the
-        missing-path case with ``except FileNotFoundError`` around
-        ``Path.resolve()``, but non-strict ``resolve()`` never raises, so a
-        mistyped ``remote_path`` yields ``status: ok, file_count: 0`` and a
-        pull of it "succeeds" with nothing transferred. The toolbox variant in
-        ``.agents/lib/vaws_remote_toolbox.py`` checks ``exists()`` explicitly.
-        Evidence: ``remote_manifest(root, root / 'missing')['status'] == 'ok'``."""
+    def test_manifest_of_missing_path_reports_needs_input(self) -> None:
+        """Non-strict ``Path.resolve()`` never raises, so the old
+        ``except FileNotFoundError`` guard was dead. A mistyped
+        ``remote_path`` yielded ``status: ok, file_count: 0`` and a pull
+        "succeeded" with nothing transferred. Check ``exists()``."""
         root = self._case_dir(1)
         data = remote_manifest(root, root / "missing")
         self.assertEqual(data["status"], "needs_input", data)
