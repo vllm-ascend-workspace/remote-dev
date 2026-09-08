@@ -8,13 +8,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO = Path(__file__).resolve().parents[1]
 
-from core.patch_ops import parse_codex_patch, parse_unified_patch_paths  # noqa: E402
-from core.endpoint import Endpoint  # noqa: E402
-import core.patch_ops as patch_ops  # noqa: E402
+from remote_dev.core.patch_ops import parse_codex_patch, parse_unified_patch_paths  # noqa: E402
+from remote_dev.core.endpoint import Endpoint  # noqa: E402
+import remote_dev.core.patch_ops as patch_ops  # noqa: E402
 
 
 class PatchOpsTests(unittest.TestCase):
@@ -294,7 +292,7 @@ class PatchOpsTests(unittest.TestCase):
                 target.write_text("old\n", encoding="utf-8")
                 expected_before = hashlib.sha256(target.read_bytes()).hexdigest()
                 script_endpoint = Endpoint(host="1.2.3.4", port=46000, root=str(repo), cwd=str(repo))
-                from core.ssh_transport import RemoteCompleted
+                from remote_dev.core.ssh_transport import RemoteCompleted
 
                 def fake_run_script(_endpoint, script, **_kwargs):
                     proc = subprocess.run(["bash", "-s"], input=script, cwd=repo, capture_output=True, text=True, check=False)
@@ -327,7 +325,7 @@ class PatchOpsTests(unittest.TestCase):
                 real.write_text("old\n", encoding="utf-8")
                 link.symlink_to(real)
                 endpoint = Endpoint(host="1.2.3.4", port=46000, root=str(repo), cwd=str(repo))
-                from core.ssh_transport import RemoteCompleted
+                from remote_dev.core.ssh_transport import RemoteCompleted
 
                 def fake_run_script(_endpoint, script, **_kwargs):
                     proc = subprocess.run(["bash", "-s"], input=script, cwd=repo, capture_output=True, text=True, check=False)

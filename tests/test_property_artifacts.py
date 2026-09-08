@@ -22,13 +22,11 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO = Path(__file__).resolve().parents[1]
 
-import core.artifact_ops as artifact_ops  # noqa: E402
-import core.state_store as state_store  # noqa: E402
-from core.endpoint import Endpoint  # noqa: E402
+import remote_dev.core.artifact_ops as artifact_ops  # noqa: E402
+import remote_dev.core.state_store as state_store  # noqa: E402
+from remote_dev.core.endpoint import Endpoint  # noqa: E402
 from test_property_support import DOC_HOSTS, MULTIBYTE, Gen, run_cases, run_remote_script  # noqa: E402
 
 NAME_ALPHABET = "abcxyz019_-." + MULTIBYTE

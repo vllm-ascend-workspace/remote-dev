@@ -10,22 +10,16 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from core.endpoint import Endpoint  # noqa: E402
-from core.errors import RemoteExecutionError  # noqa: E402
-import core.ssh_transport as ssh_transport  # noqa: E402
+from remote_dev.core.endpoint import Endpoint  # noqa: E402
+from remote_dev.core.errors import RemoteExecutionError  # noqa: E402
+import remote_dev.core.ssh_transport as ssh_transport  # noqa: E402
 
 SSH_MUX_ENV = "REMOTE_DEV_SSH_MUX"
 
 _CHILD_SSH_ARGV = """
 import json
-import sys
-sys.path.insert(0, sys.argv[1])
-from core.endpoint import Endpoint
-import core.ssh_transport as t
+from remote_dev.core.endpoint import Endpoint
+import remote_dev.core.ssh_transport as t
 t._MUX_READY = True
 endpoint = Endpoint(host="192.0.2.10", port=46000, identity_file="/keys/a")
 print(json.dumps(t.ssh_base_cmd(endpoint)))
@@ -101,9 +95,7 @@ class SshTransportTests(unittest.TestCase):
         # The mux directory is remote-dev's own by default; a consumer that
         # wants to share its existing OpenSSH mux dir sets REMOTE_DEV_SSH_MUX_DIR.
         self.assertEqual(ssh_transport._MUX_DIR, Path.home() / ".ssh" / "remote-dev-mux")
-        code = (
-            "import sys; sys.path.insert(0, %r); import core.ssh_transport as t; print(t._MUX_DIR)" % str(ROOT)
-        )
+        code = "import remote_dev.core.ssh_transport as t; print(t._MUX_DIR)"
         env = {**os.environ, "REMOTE_DEV_SSH_MUX_DIR": "/tmp/shared-mux"}
         proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False, env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -256,21 +248,21 @@ class SshMuxIsolationTests(unittest.TestCase):
             unset_env.pop(SSH_MUX_ENV, None)
 
             zero = subprocess.run(
-                [sys.executable, "-c", _CHILD_SSH_ARGV, str(ROOT)],
+                [sys.executable, "-c", _CHILD_SSH_ARGV],
                 capture_output=True,
                 text=True,
                 check=False,
                 env=zero_env,
             )
             one = subprocess.run(
-                [sys.executable, "-c", _CHILD_SSH_ARGV, str(ROOT)],
+                [sys.executable, "-c", _CHILD_SSH_ARGV],
                 capture_output=True,
                 text=True,
                 check=False,
                 env=one_env,
             )
             unset = subprocess.run(
-                [sys.executable, "-c", _CHILD_SSH_ARGV, str(ROOT)],
+                [sys.executable, "-c", _CHILD_SSH_ARGV],
                 capture_output=True,
                 text=True,
                 check=False,

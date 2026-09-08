@@ -6,12 +6,9 @@ import sys
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-HOOKS = ROOT / "hooks"
-if str(HOOKS) not in sys.path:
-    sys.path.insert(0, str(HOOKS))
+REPO = Path(__file__).resolve().parents[1]
 
-from guard_common import inspect_command, inspect_payload  # noqa: E402
+from remote_dev.hooks.guard_common import inspect_command, inspect_payload  # noqa: E402
 
 
 class HookGuardTests(unittest.TestCase):
@@ -88,7 +85,7 @@ class HookGuardTests(unittest.TestCase):
     def test_claude_hook_allows_raw_ssh(self) -> None:
         payload = {"tool_name": "Bash", "tool_input": {"command": "ssh root@1.2.3.4 hostname"}}
         proc = subprocess.run(
-            [sys.executable, str(HOOKS / "claude_remote_guard.py")],
+            [sys.executable, "-m", "remote_dev.hooks.claude_remote_guard"],
             input=json.dumps(payload),
             capture_output=True,
             text=True,
@@ -103,7 +100,7 @@ class HookGuardTests(unittest.TestCase):
             "tool_input": {"command": "echo token=abc", "host": "1.2.3.4", "port": 46000},
         }
         proc = subprocess.run(
-            [sys.executable, str(HOOKS / "claude_remote_guard.py")],
+            [sys.executable, "-m", "remote_dev.hooks.claude_remote_guard"],
             input=json.dumps(payload),
             capture_output=True,
             text=True,
@@ -113,17 +110,17 @@ class HookGuardTests(unittest.TestCase):
         self.assertEqual(proc.stderr, "")
 
     def test_claude_settings_example_hooks_mcp_remote_tools(self) -> None:
-        settings = json.loads((ROOT / "examples" / "claude-settings.example.json").read_text(encoding="utf-8"))
+        settings = json.loads((REPO / "examples" / "claude-settings.example.json").read_text(encoding="utf-8"))
         matchers = {item["matcher"] for item in settings["hooks"]["PreToolUse"]}
         self.assertIn("mcp__remote-dev__.*", matchers)
         for item in settings["hooks"]["PreToolUse"]:
             for hook in item["hooks"]:
-                self.assertIn("hooks/claude_remote_guard.py", hook["command"])
+                self.assertIn("remote_dev.hooks.claude_remote_guard", hook["command"])
 
     def test_codex_hook_returns_allow_json_shape(self) -> None:
         payload = {"tool_name": "remote.bash", "arguments": {"command": "curl --password secret"}}
         proc = subprocess.run(
-            [sys.executable, str(HOOKS / "codex_remote_guard.py")],
+            [sys.executable, "-m", "remote_dev.hooks.codex_remote_guard"],
             input=json.dumps(payload),
             capture_output=True,
             text=True,

@@ -1,12 +1,12 @@
 # Codex project configuration for the remote-dev MCP server.
-# Copy to <project>/.codex/config.toml and replace the placeholder paths.
-# Interactive MCP confirmation must remain available; headless runs need
-# explicit, invocation-scoped approvals for the exact tools they will use.
+# Copy to <project>/.codex/config.toml. Interactive MCP confirmation must
+# remain available; headless runs need explicit, invocation-scoped approvals
+# for the exact tools they will use.
 approval_policy = "on-request"
 
 [mcp_servers.remote_dev]
-command = "python3"
-args = ["/absolute/path/to/remote-dev/mcp/server.py"]
+command = "uvx"
+args = ["--from", "git+https://github.com/vllm-ascend-workspace/remote-dev@main", "remote-dev", "server"]
 startup_timeout_sec = 20
 tool_timeout_sec = 600
 enabled = true
@@ -28,6 +28,6 @@ matcher = "^Bash$|^apply_patch$|^mcp__(remote-dev|remote_dev)__.*"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = 'python3 /absolute/path/to/remote-dev/hooks/codex_remote_guard.py'
+command = 'python3 -m remote_dev.hooks.codex_remote_guard'
 timeout = 30
 statusMessage = "Checking remote development policy"

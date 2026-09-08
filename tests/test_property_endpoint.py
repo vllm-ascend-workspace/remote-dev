@@ -27,12 +27,10 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO = Path(__file__).resolve().parents[1]
 
-import core.endpoint as endpoint_mod  # noqa: E402
-from core.endpoint import (  # noqa: E402
+import remote_dev.core.endpoint as endpoint_mod  # noqa: E402
+from remote_dev.core.endpoint import (  # noqa: E402
     Endpoint,
     EndpointError,
     clear_resolvers,
@@ -40,7 +38,7 @@ from core.endpoint import (  # noqa: E402
     resolve_endpoint,
     unregister_resolver,
 )
-from core.ssh_transport import ssh_base_cmd  # noqa: E402
+from remote_dev.core.ssh_transport import ssh_base_cmd  # noqa: E402
 from test_property_support import DOC_HOSTS, Gen, run_cases  # noqa: E402
 
 GARBAGE_VALUES: tuple[Any, ...] = (None, "", 0, -1, 1.5, True, False, [], {}, "0", "x", " ", "1e3", b"bytes", ["a"], {"k": "v"})

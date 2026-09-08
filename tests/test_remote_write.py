@@ -4,12 +4,10 @@ import sys
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO = Path(__file__).resolve().parents[1]
 
-from core.endpoint import Endpoint  # noqa: E402
-import core.file_ops as file_ops  # noqa: E402
+from remote_dev.core.endpoint import Endpoint  # noqa: E402
+import remote_dev.core.file_ops as file_ops  # noqa: E402
 
 
 class RemoteWriteTests(unittest.TestCase):

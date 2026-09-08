@@ -4,28 +4,77 @@ A remote development substrate for coding agents. It makes a remote Linux
 host reachable over SSH feel like the local working tree: every native editor
 tool has a remote twin with the same semantics plus endpoint fields.
 
-| Local tool  | Remote tool          | CLI fallback                      |
-|-------------|----------------------|-----------------------------------|
-| Read        | `remote.read`        | `tools/remote_read.py`            |
-| Write       | `remote.write`       | `tools/remote_write.py`           |
-| Edit        | `remote.edit`        | `tools/remote_edit.py`            |
-| MultiEdit   | `remote.multi_edit`  | `tools/remote_multi_edit.py`      |
-| Bash        | `remote.bash`        | `tools/remote_bash.py`            |
-| Glob        | `remote.glob`        | `tools/remote_glob.py`            |
-| Grep        | `remote.grep`        | `tools/remote_grep.py`            |
-| LS          | `remote.ls`          | `tools/remote_ls.py`              |
-| Monitor     | `remote.monitor`     | `tools/remote_monitor.py`         |
-| apply_patch | `remote.apply_patch` | `tools/remote_apply_patch.py`     |
+Install the `vaws-remote-dev` package. The import package is `remote_dev`;
+the console entry is `remote-dev`.
+
+| Local tool  | Remote tool          | CLI                                      |
+|-------------|----------------------|------------------------------------------|
+| Read        | `remote.read`        | `remote-dev read`                        |
+| Write       | `remote.write`       | `remote-dev write`                       |
+| Edit        | `remote.edit`        | `remote-dev edit`                        |
+| MultiEdit   | `remote.multi_edit`  | `remote-dev multi-edit`                  |
+| Bash        | `remote.bash`        | `remote-dev bash`                        |
+| Glob        | `remote.glob`        | `remote-dev glob`                        |
+| Grep        | `remote.grep`        | `remote-dev grep`                        |
+| LS          | `remote.ls`          | `remote-dev ls`                          |
+| Monitor     | `remote.monitor`     | `remote-dev monitor`                     |
+| apply_patch | `remote.apply_patch` | `remote-dev apply-patch`                 |
 
 Plus background jobs (`remote.job_status` / `job_tail` / `job_stop`),
 artifacts (`remote.artifact_manifest` / `artifact_pull` / `artifact_push`),
 and endpoint facts (`remote.probe`, `remote.context_snapshot`). Eighteen
-tools in total, served by one stdio MCP server (`mcp/server.py`) and mirrored
-one-to-one by CLI wrappers under `tools/`.
+tools in total, served by one stdio MCP server (`remote-dev server`) and
+mirrored one-to-one by CLI subcommands. `python -m remote_dev` is equivalent
+to `remote-dev`.
 
 Runtime requirements: Python 3.9+ and an `ssh` client. No third-party
 packages. Nothing here needs GPU/NPU hardware; the remote host only needs
 `bash`, `python3`, and (for `remote.apply_patch` unified diffs) `git`.
+
+## Install and start the MCP server
+
+From a git ref (no local checkout required):
+
+```bash
+uvx --from git+https://github.com/vllm-ascend-workspace/remote-dev@main remote-dev server
+```
+
+From a clone:
+
+```bash
+uv pip install -e .
+remote-dev server
+```
+
+`.mcp.json` (Claude Code / Kimi / Cursor):
+
+```json
+{
+  "mcpServers": {
+    "remote-dev": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/vllm-ascend-workspace/remote-dev@main",
+        "remote-dev",
+        "server"
+      ],
+      "env": {
+        "REMOTE_DEV_DEFAULT_USER": "root",
+        "REMOTE_DEV_DEFAULT_ROOT": "/",
+        "REMOTE_DEV_DEFAULT_CWD": "/vllm-workspace",
+        "REMOTE_DEV_RESOLVERS": "/absolute/path/to/consumer/remote_dev_plugin.py:setup"
+      }
+    }
+  }
+}
+```
+
+If the package is already installed in the client environment, `command` can
+be `remote-dev` with `args: ["server"]`. More client examples live in
+`examples/`. See [CLIENT_COMPATIBILITY.md](CLIENT_COMPATIBILITY.md) for
+per-client notes.
 
 ## The endpoint-explicit contract
 
@@ -44,11 +93,11 @@ remote-dev resolves endpoints from explicit fields and nothing else:
 | `connect_timeout_ms` | `10000`              | SSH connect timeout                                  |
 | `alias`              | unset                | Name from the endpoint alias files                   |
 
-Resolution order in `core/endpoint.py::resolve_endpoint`:
+Resolution order in `remote_dev.core.endpoint.resolve_endpoint`:
 
 1. `host` + `port` given: use them directly.
 2. `alias` given: look it up in the alias files (`REMOTE_DEV_ENDPOINTS_FILE`,
-   then `endpoints.json` and `endpoints.local.json` beside this README; both
+   then `endpoints.json` and `endpoints.local.json` in the process cwd; both
    are git-ignored) and let explicit caller fields override the alias entry.
 3. Otherwise ask each registered resolver plugin, in registration order.
 4. Nothing claimed the payload: fail with `EndpointError` listing the known
@@ -68,8 +117,8 @@ cwd validation are still enforced, but against `/`. Pass a narrower `root`
 `--root /srv/app --cwd /srv/app`. This is a deliberate, documented default:
 the tools exist to replace ad-hoc `ssh` invocations that had no containment
 at all, and a consumer that wants a tighter default sets
-`REMOTE_DEV_DEFAULT_ROOT`. Hook guards (`hooks/`) default to *allow* and only
-observe; they are the place to add policy if you need it.
+`REMOTE_DEV_DEFAULT_ROOT`. Hook guards (`remote_dev.hooks`) default to *allow*
+and only observe; they are the place to add policy if you need it.
 
 Read ledgers are optional optimistic-concurrency checks scoped by
 `client_context_id`, then `CLAUDE_SESSION_ID`, `CODEX_SESSION_ID`,
@@ -97,7 +146,7 @@ the consumer.
 
 ```python
 # consumer/remote_dev_plugin.py
-from core.endpoint import EndpointError, register_resolver, resolver_setup
+from remote_dev.core.endpoint import EndpointError, register_resolver, resolver_setup
 
 def by_session(payload):
     session_id = payload.get("session_id")
@@ -143,7 +192,7 @@ client, CLI wrappers by a shell):
 
 ```
 REMOTE_DEV_RESOLVERS="/abs/path/consumer/remote_dev_plugin.py:setup"
-REMOTE_DEV_RESOLVERS="consumer.remote_dev_plugin:setup,other.pkg:resolver"
+REMOTE_DEV_RESOLVERS="consumer.remote_dev_plugin:setup,other.pkg:setup"
 ```
 
 Entries are `module:callable` or `/path/file.py:callable`. A callable marked
@@ -152,19 +201,23 @@ callable is registered directly under its spec string. A broken entry fails
 every resolution with the same message instead of degrading to "no
 resolvers". `examples/resolver_plugin.py` is a complete runnable example.
 
-Programmatic embedding works too: `import core.endpoint` and call
-`register_resolver` before invoking `mcp.tools.call_tool`.
+Programmatic embedding works too: `from remote_dev.core.endpoint import
+register_resolver` before invoking `remote_dev.mcp.tools.call_tool`.
+
+The public result envelope is `remote_dev.result` (`schema_version`:
+`remote-dev.result.v1`). Schema JSON ships as package data.
 
 Selector keys on the CLI travel through `--selector KEY=VALUE`:
 
 ```bash
-python3 tools/remote_bash.py --selector session_id=abc --command 'nproc'
+remote-dev bash --selector session_id=abc --command 'nproc'
 ```
 
 ## What this repository does not hold
 
 - No consumer state. `state/` (job records, read ledgers, logs, artifact
   manifests) is git-ignored and relocatable with `REMOTE_DEV_STATE_DIR`.
+  The default is `<cwd>/state`.
 - No endpoint data. `endpoints.json` / `endpoints.local.json` are
   git-ignored; ship aliases from your own tree via
   `REMOTE_DEV_ENDPOINTS_FILE`. `examples/endpoints.example.json` shows the
@@ -184,7 +237,7 @@ python3 tools/remote_bash.py --selector session_id=abc --command 'nproc'
 | `REMOTE_DEV_RUNTIME_ENV_FILE`   | Default `runtime_env_file` (unset = no preamble)          |
 | `REMOTE_DEV_RESOLVERS`          | Comma-separated resolver plugin specs                     |
 | `REMOTE_DEV_ENDPOINTS_FILE`     | Alias file(s), `os.pathsep` separated, read first         |
-| `REMOTE_DEV_STATE_DIR`          | Local state directory (default `<checkout>/state`)        |
+| `REMOTE_DEV_STATE_DIR`          | Local state directory (default `<cwd>/state`)             |
 | `REMOTE_DEV_SSH_MUX_DIR`        | OpenSSH ControlMaster dir (default `~/.ssh/remote-dev-mux`)|
 | `REMOTE_DEV_SSH_MUX`            | Process SSH multiplexing: unset or `1` uses the shared ControlMaster; `0` forces independent connections; other values error |
 | `REMOTE_DEV_SESSION_ID`         | Read-ledger scope when no client id is given              |
@@ -201,7 +254,7 @@ set `0` in that process.
 
 ## MCP server and clients
 
-`mcp/server.py` speaks JSON-RPC over stdio with `Content-Length` framing
+`remote-dev server` speaks JSON-RPC over stdio with `Content-Length` framing
 (newline-delimited JSON is accepted as a test fallback). Discovery advertises
 portable underscore names (`remote_read`, ...); dotted canonical names remain
 accepted on `tools/call`. Resources:
@@ -213,57 +266,43 @@ accepted on `tools/call`. Resources:
 - `remote://endpoint/<endpoint-id>/artifacts`
 - `remote://endpoint/<endpoint-id>/artifacts/<artifact-id>/manifest`
 
-Client configuration examples live in `examples/` (`mcp.json` for Claude
-Code / Kimi / Cursor, `codex-config.example.toml`,
-`grok-config.example.toml`, `claude-settings.example.json` with hook
-wiring). Copy one into your project and replace the placeholder paths. See
-[CLIENT_COMPATIBILITY.md](CLIENT_COMPATIBILITY.md) for per-client notes.
-
 Every tool returns `{"text": ..., "result": ...}` where `result` follows
-`schemas/result.schema.json` (`remote-dev.result.v1`): `outcome` in
-`success | needs_input | blocked | failed | timeout | cancelled`, a compact
-`preview`, and `refs` to full logs on disk. Model-visible text is capped;
-full output is reachable through refs and MCP resources.
+`remote_dev.result` / the packaged `result.schema.json` (`remote-dev.result.v1`):
+`outcome` in `success | needs_input | blocked | failed | timeout | cancelled`,
+a compact `preview`, and `refs` to full logs on disk. Model-visible text is
+capped; full output is reachable through refs and MCP resources.
 
 ## Validation
 
 ```bash
-python3 -m compileall -q .
-python3 -m unittest discover -s tests
-python3 tools/validate_remote_dev_scaffold.py --local-only
+uv pip install -e ".[test]"
+python -m pytest
+remote-dev validate --local-only
 ```
 
 Live checks need a reachable SSH host:
 
 ```bash
-python3 tools/validate_remote_dev_scaffold.py --host <host> --port <port> \
-    --root /srv/app --cwd /srv/app
-python3 tools/validate_remote_dev_scaffold.py --selector session_id=<id> --skip-local
+remote-dev validate --host <host> --port <port> --root /srv/app --cwd /srv/app
+remote-dev validate --selector session_id=<id> --skip-local
 ```
 
-The validator runs the local contract gates, reports MCP/CLI burden metrics,
-and (with an endpoint) exercises read/edit/write/bash/search, patches,
+The validator compile-checks the installed package, reports MCP/CLI burden
+metrics, and (with an endpoint) exercises read/edit/write/bash/search, patches,
 artifacts, background jobs, MCP resources and parallel scratch workers, then
 cleans up after itself.
 
 ## Layout
 
 ```
-core/        endpoint identity + resolver plugins, SSH transport, path policy,
-             permissions, read ledger, previews, file/shell/search/patch ops,
-             job registry, artifacts, context snapshot
-mcp/         stdio MCP server, tool dispatch, portable schemas, client notes
-tools/       one CLI wrapper per tool + validator
-hooks/       Claude Code / Codex PreToolUse guards (allow-by-default)
-schemas/     JSON Schemas for endpoint/result/read/edit/bash/patch/artifact
-tests/       unittest suite (mocked transports, temp state, no SSH needed)
+remote_dev/  installable package (core, mcp, hooks, tools, schemas)
+tests/       unittest suite collected by pytest (mocked transports, no SSH)
 examples/    client configs, alias file shape, resolver plugin
-docs/        DESIGN, HANDOFF (extraction notes for the former parent repo)
+docs/        design notes and historical validation evidence
 ```
 
-See [DESIGN.md](DESIGN.md) for the architecture, [VALIDATION.md](VALIDATION.md)
-for the evidence record, and [docs/HANDOFF.md](docs/HANDOFF.md) for what the
-former parent repository must change to consume this one.
+See [DESIGN.md](DESIGN.md) for the architecture and
+[VALIDATION.md](VALIDATION.md) for the evidence record.
 
 ## License
 

@@ -10,17 +10,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO = Path(__file__).resolve().parents[1]
 
-import core.endpoint as endpoint_module  # noqa: E402
-import core.state_store as state_store  # noqa: E402
-import mcp.tools as mcp_tools  # noqa: E402
-from core.endpoint import Endpoint  # noqa: E402
-from core.ssh_transport import RemoteCompleted  # noqa: E402
-from mcp.schemas import ALIASES, ENDPOINT_PROPS, ENDPOINT_SELECTOR_DESCRIPTION, TOOL_SCHEMAS  # noqa: E402
-from mcp.tools import list_resources, list_tools, read_resource  # noqa: E402
+import remote_dev.core.endpoint as endpoint_module  # noqa: E402
+import remote_dev.core.state_store as state_store  # noqa: E402
+import remote_dev.mcp.tools as mcp_tools  # noqa: E402
+from remote_dev.core.endpoint import Endpoint  # noqa: E402
+from remote_dev.core.ssh_transport import RemoteCompleted  # noqa: E402
+from remote_dev.mcp.schemas import ALIASES, ENDPOINT_PROPS, ENDPOINT_SELECTOR_DESCRIPTION, TOOL_SCHEMAS  # noqa: E402
+from remote_dev.mcp.tools import list_resources, list_tools, read_resource  # noqa: E402
 
 
 class McpSchemaTests(unittest.TestCase):
@@ -62,11 +60,10 @@ class McpSchemaTests(unittest.TestCase):
             self.assertRegex(name, r"^[A-Za-z0-9_-]{1,64}$")
 
     def test_example_mcp_entry_points_at_the_server_and_documents_consumer_wiring(self) -> None:
-        example = json.loads((ROOT / "examples" / "mcp.json").read_text())["mcpServers"]["remote-dev"]
+        example = json.loads((REPO / "examples" / "mcp.json").read_text())["mcpServers"]["remote-dev"]
         self.assertEqual(example["type"], "stdio")
-        self.assertEqual(example["command"], "python3")
-        self.assertTrue(example["args"][0].endswith("/mcp/server.py"))
-        self.assertTrue((ROOT / "mcp" / "server.py").is_file())
+        self.assertEqual(example["command"], "uvx")
+        self.assertEqual(example["args"][-2:], ["remote-dev", "server"])
         for key in ("REMOTE_DEV_DEFAULT_USER", "REMOTE_DEV_DEFAULT_ROOT", "REMOTE_DEV_DEFAULT_CWD", "REMOTE_DEV_RESOLVERS", "REMOTE_DEV_STATE_DIR"):
             self.assertIn(key, example["env"])
         # Example files must not carry real endpoint data.
@@ -135,7 +132,7 @@ class McpSchemaTests(unittest.TestCase):
         self.assertEqual(set(item["properties"]), {"old_string", "new_string", "replace_all"})
 
     def test_missing_endpoint_is_rejected_before_tool_execution(self) -> None:
-        from core.errors import EndpointError
+        from remote_dev.core.errors import EndpointError
 
         # Hermetic regardless of the developer machine's environment: with no
         # resolver registered there is no target anywhere, so the server must
@@ -174,7 +171,7 @@ class McpSchemaTests(unittest.TestCase):
             resolve.assert_not_called()
 
     def test_missing_patch_is_rejected_before_remote_execution(self) -> None:
-        import core.patch_ops as patch_ops
+        import remote_dev.core.patch_ops as patch_ops
 
         endpoint = {"host": "example.invalid", "port": 22, "root": "/tmp", "cwd": "/tmp"}
         with patch.object(patch_ops, "run_remote_python") as run_python, patch.object(patch_ops, "run_script") as run_shell:
@@ -262,7 +259,7 @@ class McpSchemaTests(unittest.TestCase):
             state_store.substrate_root = original_state_root  # type: ignore[assignment]
 
     def test_context_snapshot_can_skip_live_probe(self) -> None:
-        from mcp.tools import call_tool
+        from remote_dev.mcp.tools import call_tool
 
         payload = call_tool(
             "remote.context_snapshot",
@@ -281,7 +278,7 @@ class McpSchemaTests(unittest.TestCase):
         encoded = json.dumps(request, separators=(",", ":")).encode("utf-8")
         framed = b"Content-Length: " + str(len(encoded)).encode("ascii") + b"\r\n\r\n" + encoded
         proc = subprocess.run(
-            [sys.executable, str(ROOT / "mcp" / "server.py")],
+            [sys.executable, "-m", "remote_dev", "server"],
             input=framed,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -297,18 +294,18 @@ class McpSchemaTests(unittest.TestCase):
     def test_server_json_lines_lists_the_same_portable_schemas(self) -> None:
         request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
         proc = subprocess.run(
-            [sys.executable, str(ROOT / "mcp" / "server.py")],
+            [sys.executable, "-m", "remote_dev", "server"],
             input=json.dumps(request) + "\n", capture_output=True, text=True, check=False,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["result"]["tools"], list_tools())
 
     def test_mcp_server_sets_process_level_ledger_scope(self) -> None:
-        from core.state_store import LEDGER_SCOPE_ENV_VARS, resolve_ledger_scope
+        from remote_dev.core.state_store import LEDGER_SCOPE_ENV_VARS, resolve_ledger_scope
 
         saved = {name: os.environ.pop(name, None) for name in LEDGER_SCOPE_ENV_VARS}
         try:
-            import mcp.server as mcp_server
+            import remote_dev.mcp.server as mcp_server
 
             importlib.reload(mcp_server)
             session_id = os.environ.get("REMOTE_DEV_SESSION_ID", "")

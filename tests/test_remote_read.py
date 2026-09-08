@@ -5,14 +5,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO = Path(__file__).resolve().parents[1]
 
-from core.endpoint import Endpoint  # noqa: E402
-from core.preview import MAX_TEXT_CHARS  # noqa: E402
-import core.file_ops as file_ops  # noqa: E402
-import core.state_store as state_store  # noqa: E402
+from remote_dev.core.endpoint import Endpoint  # noqa: E402
+from remote_dev.core.preview import MAX_TEXT_CHARS  # noqa: E402
+import remote_dev.core.file_ops as file_ops  # noqa: E402
+import remote_dev.core.state_store as state_store  # noqa: E402
 
 
 class RemoteReadTests(unittest.TestCase):

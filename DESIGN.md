@@ -26,18 +26,18 @@ facts (`remote.probe`, `remote.context_snapshot`).
 
 Layer B is the shared substrate:
 
-- endpoint identity and explicit resolution (`core/endpoint.py`)
+- endpoint identity and explicit resolution (`remote_dev.core.endpoint`)
 - resolver plugin interface for consumer-owned selectors (same module)
-- SSH transport with ControlMaster reuse (`core/ssh_transport.py`)
+- SSH transport with ControlMaster reuse (`remote_dev.core.ssh_transport`)
 - full-permission default root with optional explicit root/cwd path policy
-  (`core/path_policy.py`, `core/permissions.py`)
-- optional read-ledger concurrency checks (`core/read_ledger.py`,
-  `core/state_store.py`)
-- compact previews plus full refs (`core/preview.py`, `core/result.py`)
-- background job registry (`core/job_ops.py`)
-- artifact manifests and pull/push verification (`core/artifact_ops.py`)
-- Claude/Codex hook guards (`hooks/`)
-- MCP server and resources (`mcp/`)
+  (`remote_dev.core.path_policy`, `remote_dev.core.permissions`)
+- optional read-ledger concurrency checks (`remote_dev.core.read_ledger`,
+  `remote_dev.core.state_store`)
+- compact previews plus full refs (`remote_dev.core.preview`, `remote_dev.result`)
+- background job registry (`remote_dev.core.job_ops`)
+- artifact manifests and pull/push verification (`remote_dev.core.artifact_ops`)
+- Claude/Codex hook guards (`remote_dev.hooks`)
+- MCP server and resources (`remote_dev.mcp`)
 
 Layer C is whatever the consumer builds on top: workflow skills, session
 managers, coordinators. It lives in the consumer's repository and talks to
@@ -52,7 +52,7 @@ The substrate depends on nothing but the Python standard library and an
 - Endpoint resolution accepts `host`/`port`/`user`/`root`/`cwd`/... and
   `alias`. Every other selector (session ids, machine names, worktree
   bindings) is resolved by a plugin the consumer registers via
-  `core.endpoint.register_resolver` or `REMOTE_DEV_RESOLVERS`.
+  `remote_dev.core.endpoint.register_resolver` or `REMOTE_DEV_RESOLVERS`.
 - Consumer facts that used to be constants are environment-configured:
   `REMOTE_DEV_RUNTIME_ENV_FILE` (remote profile script to source),
   `REMOTE_DEV_SSH_MUX_DIR` (shared ControlMaster directory),
@@ -104,12 +104,12 @@ stdout/stderr reads, and local artifact manifests:
 ## Validation
 
 ```bash
-python3 -m compileall -q .
-python3 -m unittest discover -s tests
-python3 tools/validate_remote_dev_scaffold.py --local-only
+uv pip install -e ".[test]"
+python -m pytest
+remote-dev validate --local-only
 ```
 
 Remote endpoint behaviour requires a reachable SSH endpoint. Use
-`validate_remote_dev_scaffold.py` with `--host/--port` (or an `--alias`, or
+`remote-dev validate` with `--host/--port` (or an `--alias`, or
 `--selector KEY=VALUE` for a registered resolver) to run the live smoke,
 including parallel scratch workers.

@@ -9,12 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-import core.endpoint as endpoint_module  # noqa: E402
-from core.endpoint import (  # noqa: E402
+import remote_dev.core.endpoint as endpoint_module  # noqa: E402
+from remote_dev.core.endpoint import (  # noqa: E402
     BUILTIN_SELECTOR_FIELDS,
     Endpoint,
     EndpointError,
@@ -99,7 +95,8 @@ class AliasFileTests(unittest.TestCase):
     def test_alias_file_env_precedes_checkout_local_files(self) -> None:
         files = endpoint_module.alias_files()
         self.assertEqual(files[0], self.alias_file)
-        self.assertEqual(files[-2:], [ROOT / "endpoints.json", ROOT / "endpoints.local.json"])
+        cwd = Path.cwd()
+        self.assertEqual(files[-2:], [cwd / "endpoints.json", cwd / "endpoints.local.json"])
 
 
 class ResolverPluginTests(unittest.TestCase):
@@ -208,7 +205,7 @@ class EnvResolverLoadingTests(unittest.TestCase):
     server process without remote-dev importing anything by name."""
 
     PLUGIN = '''
-from core.endpoint import register_resolver, resolver_setup
+from remote_dev.core.endpoint import register_resolver, resolver_setup
 
 def plain(payload):
     if payload.get("box"):
@@ -222,14 +219,14 @@ def setup():
 
     def _run(self, spec: str, payload: dict) -> dict:
         code = (
-            "import json, sys; sys.path.insert(0, %r)\n"
-            "from core.endpoint import resolve_endpoint, selector_fields, registered_resolvers, EndpointError\n"
+            "import json\n"
+            "from remote_dev.core.endpoint import resolve_endpoint, selector_fields, registered_resolvers, EndpointError\n"
             "try:\n"
             "    ep = resolve_endpoint(%r)\n"
             "    print(json.dumps({'host': ep.host, 'cwd': ep.cwd, 'kind': ep.kind, 'fields': list(selector_fields()), 'resolvers': [r.name for r in registered_resolvers()]}))\n"
             "except EndpointError as exc:\n"
             "    print(json.dumps({'error': str(exc)}))\n"
-        ) % (str(ROOT), payload)
+        ) % (payload,)
         env = {**os.environ, "REMOTE_DEV_RESOLVERS": spec}
         proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False, env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)

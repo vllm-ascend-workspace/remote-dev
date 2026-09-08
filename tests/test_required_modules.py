@@ -1,35 +1,29 @@
 from __future__ import annotations
 
 import importlib
-import sys
 import unittest
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 
 class RequiredModulesTests(unittest.TestCase):
     def test_design_named_core_modules_import(self) -> None:
         for module in (
-            "core.endpoint",
-            "core.ssh_transport",
-            "core.path_policy",
-            "core.state_store",
-            "core.result",
-            "core.preview",
-            "core.read_ledger",
-            "core.file_ops",
-            "core.shell_ops",
-            "core.search_ops",
-            "core.patch_ops",
-            "core.job_ops",
-            "core.monitor_ops",
-            "core.artifact_ops",
-            "core.context_snapshot",
-            "core.permissions",
-            "core.errors",
+            "remote_dev.result",
+            "remote_dev.core.endpoint",
+            "remote_dev.core.ssh_transport",
+            "remote_dev.core.path_policy",
+            "remote_dev.core.state_store",
+            "remote_dev.core.preview",
+            "remote_dev.core.read_ledger",
+            "remote_dev.core.file_ops",
+            "remote_dev.core.shell_ops",
+            "remote_dev.core.search_ops",
+            "remote_dev.core.patch_ops",
+            "remote_dev.core.job_ops",
+            "remote_dev.core.monitor_ops",
+            "remote_dev.core.artifact_ops",
+            "remote_dev.core.context_snapshot",
+            "remote_dev.core.permissions",
+            "remote_dev.core.errors",
         ):
             with self.subTest(module=module):
                 self.assertIsNotNone(importlib.import_module(module))

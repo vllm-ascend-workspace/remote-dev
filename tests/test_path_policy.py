@@ -4,12 +4,10 @@ import sys
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO = Path(__file__).resolve().parents[1]
 
-from core.errors import PathPolicyError  # noqa: E402
-from core.path_policy import assert_under_root, join_under_root  # noqa: E402
+from remote_dev.core.errors import PathPolicyError  # noqa: E402
+from remote_dev.core.path_policy import assert_under_root, join_under_root  # noqa: E402
 
 
 class PathPolicyTests(unittest.TestCase):

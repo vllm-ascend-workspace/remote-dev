@@ -24,17 +24,13 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[1]
-TESTS = Path(__file__).resolve().parent
-for _path in (ROOT, TESTS):
-    if str(_path) not in sys.path:
-        sys.path.insert(0, str(_path))
+REPO = Path(__file__).resolve().parents[1]
 
-import core.file_ops as file_ops  # noqa: E402
-import core.read_ledger as read_ledger  # noqa: E402
-import core.state_store as state_store  # noqa: E402
-from core.endpoint import Endpoint  # noqa: E402
-from core.path_policy import join_under_root, path_fingerprint  # noqa: E402
+import remote_dev.core.file_ops as file_ops  # noqa: E402
+import remote_dev.core.read_ledger as read_ledger  # noqa: E402
+import remote_dev.core.state_store as state_store  # noqa: E402
+from remote_dev.core.endpoint import Endpoint  # noqa: E402
+from remote_dev.core.path_policy import join_under_root, path_fingerprint  # noqa: E402
 from test_property_support import DOC_HOSTS, MULTIBYTE, Gen, run_cases, run_remote_script  # noqa: E402
 
 CONTEXTS = ("ctx-a", "ctx-b", None)

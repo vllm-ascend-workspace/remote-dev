@@ -15,7 +15,7 @@ import json
 import os
 from pathlib import Path
 
-from core.endpoint import EndpointError, register_resolver, resolver_setup
+from remote_dev.core.endpoint import EndpointError, register_resolver, resolver_setup
 
 LAB_FILE_ENV = "EXAMPLE_LAB_FILE"
 

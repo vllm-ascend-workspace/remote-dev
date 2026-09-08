@@ -1,8 +1,8 @@
 # Grok Build project configuration for the remote-dev MCP server.
-# Copy to <project>/.grok/config.toml and replace the placeholder path.
+# Copy to <project>/.grok/config.toml.
 [mcp_servers.remote-dev]
-command = "python3"
-args = ["/absolute/path/to/remote-dev/mcp/server.py"]
+command = "uvx"
+args = ["--from", "git+https://github.com/vllm-ascend-workspace/remote-dev@main", "remote-dev", "server"]
 enabled = true
 startup_timeout_sec = 20
 tool_timeout_sec = 600

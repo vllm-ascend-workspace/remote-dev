@@ -29,15 +29,13 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO = Path(__file__).resolve().parents[1]
 
-import core.patch_ops as patch_ops  # noqa: E402
-import core.state_store as state_store  # noqa: E402
-from core.endpoint import Endpoint  # noqa: E402
-from core.patch_ops import PatchParseError, parse_codex_patch, parse_unified_patch_paths  # noqa: E402
-from core.ssh_transport import RemoteCompleted  # noqa: E402
+import remote_dev.core.patch_ops as patch_ops  # noqa: E402
+import remote_dev.core.state_store as state_store  # noqa: E402
+from remote_dev.core.endpoint import Endpoint  # noqa: E402
+from remote_dev.core.patch_ops import PatchParseError, parse_codex_patch, parse_unified_patch_paths  # noqa: E402
+from remote_dev.core.ssh_transport import RemoteCompleted  # noqa: E402
 from test_property_support import DOC_HOSTS, SPLITLINES_EXTRA, Gen, run_cases, run_remote_script, snapshot_tree  # noqa: E402
 
 LINE_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789 _=()[]{}:,.'\"#*@-+éλ漢"

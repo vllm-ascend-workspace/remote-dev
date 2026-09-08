@@ -2,26 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from core.endpoint import Endpoint  # noqa: E402
-from core.path_policy import path_fingerprint  # noqa: E402
-import core.state_store as state_store  # noqa: E402
+from remote_dev.core.endpoint import Endpoint  # noqa: E402
+from remote_dev.core.path_policy import path_fingerprint  # noqa: E402
+import remote_dev.core.state_store as state_store  # noqa: E402
 
 
 class StateRootTests(unittest.TestCase):
-    def test_state_root_defaults_inside_checkout_and_env_relocates_it(self) -> None:
+    def test_state_root_defaults_to_cwd_and_env_relocates_it(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("REMOTE_DEV_STATE_DIR", None)
-            self.assertEqual(state_store.state_root(), ROOT / "state")
+            self.assertEqual(state_store.state_root(), Path.cwd() / "state")
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"REMOTE_DEV_STATE_DIR": tmp}):
             self.assertEqual(state_store.state_root(), Path(tmp))
             endpoint = Endpoint(host="1.2.3.4", port=46000)

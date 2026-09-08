@@ -5,6 +5,9 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+*.egg-info/
+dist/
+build/
 .DS_Store
 
 # Local runtime state and endpoint data are never tracked. Ship examples only.

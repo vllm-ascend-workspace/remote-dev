@@ -4,13 +4,11 @@ import sys
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO = Path(__file__).resolve().parents[1]
 
-from core.endpoint import Endpoint  # noqa: E402
-from core.preview import MAX_GREP_MATCHES, MAX_TEXT_CHARS  # noqa: E402
-import core.search_ops as search_ops  # noqa: E402
+from remote_dev.core.endpoint import Endpoint  # noqa: E402
+from remote_dev.core.preview import MAX_GREP_MATCHES, MAX_TEXT_CHARS  # noqa: E402
+import remote_dev.core.search_ops as search_ops  # noqa: E402
 
 
 class RemoteSearchTests(unittest.TestCase):

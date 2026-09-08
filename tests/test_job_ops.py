@@ -5,14 +5,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO = Path(__file__).resolve().parents[1]
 
-import core.job_ops as job_ops  # noqa: E402
-import core.state_store as state_store  # noqa: E402
-from core.endpoint import Endpoint  # noqa: E402
-from core.ssh_transport import RemoteCompleted  # noqa: E402
+import remote_dev.core.job_ops as job_ops  # noqa: E402
+import remote_dev.core.state_store as state_store  # noqa: E402
+from remote_dev.core.endpoint import Endpoint  # noqa: E402
+from remote_dev.core.ssh_transport import RemoteCompleted  # noqa: E402
 
 
 class RemoteJobStatusTests(unittest.TestCase):

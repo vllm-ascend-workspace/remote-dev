@@ -25,21 +25,16 @@ model. Starting points live in `examples/`:
 | Codex | `.codex/config.toml` | `examples/codex-config.example.toml` | `remote_dev` |
 | Grok Build | `.grok/config.toml` | `examples/grok-config.example.toml` | `remote-dev` |
 
-All entries launch `mcp/server.py` from this checkout with Python 3. Replace
-the placeholder absolute paths, and add `REMOTE_DEV_RESOLVERS`,
-`REMOTE_DEV_STATE_DIR`, `REMOTE_DEV_ENDPOINTS_FILE` and
-`REMOTE_DEV_RUNTIME_ENV_FILE` to the server `env` when the consumer needs
-them (see README). Do not add model credentials or real endpoint data to
-these files. Restart existing sessions after schema/config changes so they
-rediscover tools.
+All entries launch `remote-dev server` from the installed `vaws-remote-dev`
+package (or `uvx --from git+https://github.com/vllm-ascend-workspace/remote-dev@<ref>
+remote-dev server`). Add `REMOTE_DEV_RESOLVERS`, `REMOTE_DEV_STATE_DIR`,
+`REMOTE_DEV_ENDPOINTS_FILE` and `REMOTE_DEV_RUNTIME_ENV_FILE` to the server
+`env` when the consumer needs them (see README). Do not add model credentials
+or real endpoint data to these files. Restart existing sessions after
+schema/config changes so they rediscover tools.
 
-Cursor's [official MCP configuration](https://cursor.com/docs/mcp) documents
-`${workspaceFolder}` interpolation, but Cursor Agent `2026.08.25-3e8eec8`
-passed that expression literally to Python in a real startup check. Use a
-project-relative path (when this checkout is vendored inside the project) or
-an absolute path instead. Use `cursor-agent` explicitly when Grok also
-provides an `agent` command; the shared MCP does not require changing either
-client's shell aliases.
+Use `cursor-agent` explicitly when Grok also provides an `agent` command; the
+shared MCP does not require changing either client's shell aliases.
 
 If Cursor's model cannot discover the tools, check **Customize > MCPs >
 remote-dev** and enable the repository source. A disabled source can still be

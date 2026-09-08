@@ -13,10 +13,10 @@ preamble / mux dir / state dir. Local gates at extraction time on macOS with
 Python 3.11:
 
 - `python3 -m compileall -q .` passes.
-- `python3 -m unittest discover -s tests` passes (see `docs/HANDOFF.md` for
-  the count at the time of extraction and the list of removed/rewritten
-  tests).
-- `python3 tools/validate_remote_dev_scaffold.py --local-only` passes:
+- `python3 -m unittest discover -s tests` passed at extraction (the
+  extraction handoff note was removed when the repo became an installable
+  package).
+- `python3 tools/validate_remote_dev_scaffold.py --local-only` passed:
   18 MCP tools, 18 CLI fallbacks, max 3 tool-specific required fields.
 
 Nothing below this line was rerun on the standalone checkout. All live

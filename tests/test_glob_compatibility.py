@@ -17,11 +17,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO = Path(__file__).resolve().parents[1]
 
-import core.search_ops as search_ops  # noqa: E402
+import remote_dev.core.search_ops as search_ops  # noqa: E402
 
 LEGACY_GLOB_SHIM = """\
 import glob as _stdlib_glob

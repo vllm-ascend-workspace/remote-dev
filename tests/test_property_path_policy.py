@@ -22,14 +22,12 @@ import unicodedata
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO = Path(__file__).resolve().parents[1]
 
-from core.errors import PathPolicyError  # noqa: E402
-from core.path_policy import assert_under_root, join_under_root, normalize_remote_path, path_fingerprint  # noqa: E402
-import core.file_ops as file_ops  # noqa: E402
-import core.patch_ops as patch_ops  # noqa: E402
+from remote_dev.core.errors import PathPolicyError  # noqa: E402
+from remote_dev.core.path_policy import assert_under_root, join_under_root, normalize_remote_path, path_fingerprint  # noqa: E402
+import remote_dev.core.file_ops as file_ops  # noqa: E402
+import remote_dev.core.patch_ops as patch_ops  # noqa: E402
 from test_property_support import MULTIBYTE, Gen, run_cases, run_remote_script, snapshot_tree  # noqa: E402
 
 SEGMENTS = (

@@ -35,7 +35,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /absolute/path/to/remote-dev/hooks/claude_remote_guard.py",
+            "command": "python3 -m remote_dev.hooks.claude_remote_guard",
             "timeout": 30
           }
         ]
@@ -45,7 +45,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /absolute/path/to/remote-dev/hooks/claude_remote_guard.py",
+            "command": "python3 -m remote_dev.hooks.claude_remote_guard",
             "timeout": 30
           }
         ]

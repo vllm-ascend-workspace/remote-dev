@@ -14,11 +14,9 @@ import sys
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO = Path(__file__).resolve().parents[1]
 
-from core.permissions import contains_raw_remote_transport, contains_secret_in_argv  # noqa: E402
+from remote_dev.core.permissions import contains_raw_remote_transport, contains_secret_in_argv  # noqa: E402
 from test_property_support import Gen, run_cases  # noqa: E402
 
 SECRET_SHAPES = ("--password={v}", "--password {v}", "password={v}", "token={v}", "api_key={v}", "api-key={v}", "apikey={v}")

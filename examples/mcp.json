@@ -2,8 +2,13 @@
   "mcpServers": {
     "remote-dev": {
       "type": "stdio",
-      "command": "python3",
-      "args": ["/absolute/path/to/remote-dev/mcp/server.py"],
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/vllm-ascend-workspace/remote-dev@main",
+        "remote-dev",
+        "server"
+      ],
       "env": {
         "REMOTE_DEV_DEFAULT_USER": "root",
         "REMOTE_DEV_DEFAULT_ROOT": "/",

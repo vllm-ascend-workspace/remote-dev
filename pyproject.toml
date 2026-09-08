@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vaws-remote-dev"
+version = "0.1.0"
+description = "Remote development substrate: SSH-backed twins of local agent tools"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "Qi Mao" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+remote-dev = "remote_dev.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/vllm-ascend-workspace/remote-dev"
+Repository = "https://github.com/vllm-ascend-workspace/remote-dev"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/remote_dev",
+  "/tests",
+  "/examples",
+  "/docs",
+  "/README.md",
+  "/LICENSE",
+  "/DESIGN.md",
+  "/CLIENT_COMPATIBILITY.md",
+  "/VALIDATION.md",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["remote_dev"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"remote_dev/schemas/artifact.schema.json" = "remote_dev/schemas/artifact.schema.json"
+"remote_dev/schemas/bash.schema.json" = "remote_dev/schemas/bash.schema.json"
+"remote_dev/schemas/edit.schema.json" = "remote_dev/schemas/edit.schema.json"
+"remote_dev/schemas/endpoint.schema.json" = "remote_dev/schemas/endpoint.schema.json"
+"remote_dev/schemas/patch.schema.json" = "remote_dev/schemas/patch.schema.json"
+"remote_dev/schemas/read.schema.json" = "remote_dev/schemas/read.schema.json"
+"remote_dev/schemas/result.schema.json" = "remote_dev/schemas/result.schema.json"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
