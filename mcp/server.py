@@ -14,6 +14,7 @@ SUBSTRATE_ROOT = Path(__file__).resolve().parents[1]
 if str(SUBSTRATE_ROOT) not in sys.path:
     sys.path.insert(0, str(SUBSTRATE_ROOT))
 
+from core import SERVICE_API_VERSION  # noqa: E402
 from mcp.tools import call_tool, list_resources, list_tools, read_resource  # noqa: E402
 
 
@@ -55,7 +56,11 @@ def handle(message: dict[str, Any], *, framed: bool = False) -> None:
                 request_id,
                 {
                     "protocolVersion": params.get("protocolVersion", "2024-11-05"),
-                    "capabilities": {"tools": {}, "resources": {}},
+                    "capabilities": {
+                        "tools": {},
+                        "resources": {},
+                        "experimental": {"remote-dev": {"service_api_version": SERVICE_API_VERSION}},
+                    },
                     "serverInfo": {"name": "remote-dev", "version": "0.1.0"},
                 },
                 framed=framed,

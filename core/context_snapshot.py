@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from . import SERVICE_API_VERSION
 from .endpoint import Endpoint
 from .result import make_result, utc_now_iso
 from .ssh_transport import run_remote_python
@@ -73,6 +74,7 @@ def write_context_snapshot(endpoint: Endpoint, summary: dict[str, Any], full_pro
         "refs": {},
         "created_at": utc_now_iso(),
         "ttl_seconds": 300,
+        "service_api_version": SERVICE_API_VERSION,
     }
     stamp = payload["created_at"].replace(":", "").replace("-", "")
     full_path = base / f"context-{stamp}.json"
