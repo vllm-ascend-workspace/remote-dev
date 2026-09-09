@@ -555,26 +555,112 @@ class LiveStreamTests(unittest.TestCase):
         self.assertIn("[remote] stage-b", buf.getvalue())
         self.assertEqual(result.stdout, "")
 
-    def test_read_stream_honours_local_deadline_without_remote_host(self) -> None:
-        proc = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        buf = io.StringIO()
-        try:
-            result = ssh_transport._read_stream(proc, timeout_ms=800, forward_prefix="", output=buf)
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait(timeout=2)
+    def test_run_stream_separate_channels_capture_stdout_stderr_and_callback(self) -> None:
+        seen: dict[str, list[str]] = {"stdout": [], "stderr": []}
+
+        def on_output(channel: str, text: str) -> None:
+            seen[channel].append(text)
+
+        local_cmd = ["bash", "-c", "printf 'machine-json\\n'; printf 'progress\\n' >&2; exit 0"]
+        with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=local_cmd):
+            result = ssh_transport.run_stream(
+                self.endpoint,
+                "unused",
+                timeout_ms=None,
+                merge_stderr=False,
+                on_output=on_output,
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.stdout, "machine-json\n")
+        self.assertEqual(result.stderr, "progress\n")
+        self.assertEqual(seen["stdout"], ["machine-json\n"])
+        self.assertEqual(seen["stderr"], ["progress\n"])
+
+    def test_run_stream_separate_channels_preserve_nonzero_status(self) -> None:
+        local_cmd = ["bash", "-c", "printf 'out\\n'; printf 'err\\n' >&2; exit 7"]
+        with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=local_cmd):
+            result = ssh_transport.run_stream(self.endpoint, "unused", merge_stderr=False)
+        self.assertEqual(result.returncode, 7)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.stdout, "out\n")
+        self.assertEqual(result.stderr, "err\n")
+
+    def test_run_stream_waits_for_exit_after_pipe_eof(self) -> None:
+        local_cmd = [
+            sys.executable,
+            "-c",
+            "import os,time;os.close(1);os.close(2);time.sleep(0.3)",
+        ]
+        with mock.patch.object(ssh_transport, "STREAM_SELECT_SLICE_SECONDS", 0.05):
+            with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=local_cmd):
+                started = time.monotonic()
+                result = ssh_transport.run_stream(
+                    self.endpoint,
+                    "unused",
+                    timeout_ms=None,
+                    merge_stderr=False,
+                )
+                elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(result.timed_out)
+        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertLess(elapsed, 2.0)
+
+        with mock.patch.object(ssh_transport, "STREAM_SELECT_SLICE_SECONDS", 0.05):
+            with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=local_cmd):
+                started = time.monotonic()
+                result = ssh_transport.run_stream(
+                    self.endpoint,
+                    "unused",
+                    timeout_ms=2000,
+                    merge_stderr=False,
+                )
+                elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(result.timed_out)
+        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertLess(elapsed, 2.0)
+
+    def test_run_stream_separate_channels_honours_deadline_on_partial_line(self) -> None:
+        local_cmd = [
+            sys.executable,
+            "-c",
+            "import sys,time;sys.stdout.write('partial');sys.stdout.flush();time.sleep(1.2)",
+        ]
+        started = time.monotonic()
+        with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=local_cmd):
+            result = ssh_transport.run_stream(
+                self.endpoint,
+                "unused",
+                timeout_ms=200,
+                merge_stderr=False,
+            )
+        elapsed = time.monotonic() - started
         self.assertTrue(result.timed_out)
         self.assertIsNone(result.returncode)
         self.assertIn("wall-clock", result.stderr)
+        self.assertEqual(result.stdout, "partial")
+        self.assertLess(elapsed, 0.8)
+
+    def test_read_stream_honours_local_deadline_without_remote_host(self) -> None:
+        local_cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
+        buf = io.StringIO()
+        started = time.monotonic()
+        with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=local_cmd):
+            result = ssh_transport.run_stream(
+                self.endpoint,
+                "unused",
+                timeout_ms=800,
+                forward_prefix="",
+                output=buf,
+            )
+        elapsed = time.monotonic() - started
+        self.assertTrue(result.timed_out)
+        self.assertIsNone(result.returncode)
+        self.assertIn("wall-clock", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertLess(elapsed, 2.0)
 
     def test_stream_remote_payload_subtracts_grace_and_skips_non_positive_timeout(self) -> None:
         wrapped = ssh_transport.stream_remote_payload("do-work", 30_000)
