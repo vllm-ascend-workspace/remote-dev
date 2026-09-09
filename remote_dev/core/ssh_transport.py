@@ -374,11 +374,12 @@ def run_stream(
 
     Not ``remote.job_*``. Jobs are detached through
     ``remote_dev.processes.control``, persist a job dir, and ``job_tail``
-    snapshots supervisor logs. An attached stream is required when an
+    snapshots supervisor logs. The supervisor owns remote-side timeout,
+    stop, and descendant drain. An attached stream is required when an
     agent must see stage progress as it happens and must tell a hang from
-    slow progress. Detach-and-tail leaves both holes: no remote-side kill
-    of the original command, and no local wall-clock kill while a pipe is
-    stalled.
+    slow progress. Detach-and-tail is not a substitute for this live
+    local wall-clock reader: a stalled pipe is still a hang until the
+    attached timeout fires.
 
     Silent-hang handling: ``timeout_ms`` is enforced two ways at once.
 

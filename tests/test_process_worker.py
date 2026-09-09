@@ -34,8 +34,6 @@ class ProcessWorkerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.worker = load_worker()
-        cls.control_job = cls.worker.control_job
-        cls.process_identity = cls.worker.process_identity
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -53,7 +51,10 @@ class ProcessWorkerTests(unittest.TestCase):
         self.temp.cleanup()
 
     def call(self, identifier, action, **args):
-        return self.control_job({"root": str(self.root), "job_id": identifier, "action": action, **args}, self.source)
+        return self.worker.control_job(
+            {"root": str(self.root), "job_id": identifier, "action": action, **args},
+            self.source,
+        )
 
     def prepare(self, letter, command, timeout=10):
         identifier = "job-" + letter * 8
@@ -101,10 +102,10 @@ class ProcessWorkerTests(unittest.TestCase):
         observed = self.call(a, "status")
         self.assertIn(daemon, [row["pid"] for row in observed["processes"]])
         self.assertNotIn(b"REMOTE_DEV_JOB_TOKEN=", Path(f"/proc/{daemon}/environ").read_bytes())
-        self.assertNotEqual(self.process_identity(daemon)["pgid"], observed["receipt"]["pgid"])
+        self.assertNotEqual(self.worker.process_identity(daemon)["pgid"], observed["receipt"]["pgid"])
         self.call(a, "stop", force=True)
         self.until(a, lambda row: row["quiet"])
-        self.assertIsNone(self.process_identity(daemon))
+        self.assertIsNone(self.worker.process_identity(daemon))
         after = self.call(b, "status")
         self.assertFalse(after["quiet"])
         self.assertEqual(before["receipt"]["pid"], after["receipt"]["pid"])

@@ -154,8 +154,18 @@ class SshTransportTests(unittest.TestCase):
             options = ssh_transport._control_master_options(with_identity.identity_file)
             expected = self._control_path(options)
             cmd = ssh_transport.ssh_base_cmd(with_identity)
-        self.assertIn(expected, cmd)
         self.assertIn("/keys/a", cmd)
+        mapped = _option_map(cmd)
+        if os.name == "nt":
+            # Native Windows ordinary connections are independent; identity
+            # still selects the key, but ControlPath is none, not a mux socket.
+            self.assertEqual(mapped["ControlMaster"], "no")
+            self.assertEqual(mapped["ControlPath"], "none")
+            self.assertEqual(mapped["ControlPersist"], "no")
+            self.assertNotIn(expected, cmd)
+        else:
+            self.assertIn(expected, cmd)
+            self.assertIn("%C-", mapped["ControlPath"])
 
     def test_ssh_base_cmd_cannot_turn_user_or_host_into_an_option(self) -> None:
         # A user or host that begins with `-` must stay an argument of `-l`
@@ -605,7 +615,11 @@ class LiveStreamTests(unittest.TestCase):
         # stream_ssh_command quotes for OpenSSH's remote-argv join. A local
         # Popen list must receive the script unquoted, so the live-forward
         # check patches the composed argv rather than ssh_base_cmd.
-        local_cmd = [sys.executable, "-c", "import sys; sys.stdout.write('stage-a\\nstage-b\\n')"]
+        local_cmd = [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'stage-a\\nstage-b\\n')",
+        ]
         with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=local_cmd):
             result = ssh_transport.run_stream(self.endpoint, "unused", timeout_ms=None, output=buf)
         self.assertEqual(result.returncode, 0)
@@ -620,7 +634,11 @@ class LiveStreamTests(unittest.TestCase):
         def on_output(channel: str, text: str) -> None:
             seen[channel].append(text)
 
-        local_cmd = [sys.executable, "-c", "import sys; sys.stdout.write('machine-json\\n'); sys.stderr.write('progress\\n')"]
+        local_cmd = [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'machine-json\\n'); sys.stderr.buffer.write(b'progress\\n')",
+        ]
         with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=local_cmd):
             result = ssh_transport.run_stream(
                 self.endpoint,
@@ -637,7 +655,11 @@ class LiveStreamTests(unittest.TestCase):
         self.assertEqual(seen["stderr"], ["progress\n"])
 
     def test_run_stream_separate_channels_preserve_nonzero_status(self) -> None:
-        local_cmd = [sys.executable, "-c", "import sys; sys.stdout.write('out\\n'); sys.stderr.write('err\\n'); raise SystemExit(7)"]
+        local_cmd = [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'out\\n'); sys.stderr.buffer.write(b'err\\n'); raise SystemExit(7)",
+        ]
         with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=local_cmd):
             result = ssh_transport.run_stream(self.endpoint, "unused", merge_stderr=False)
         self.assertEqual(result.returncode, 7)
@@ -685,7 +707,7 @@ class LiveStreamTests(unittest.TestCase):
         local_cmd = [
             sys.executable,
             "-c",
-            "import sys,time;sys.stdout.write('partial');sys.stdout.flush();time.sleep(1.2)",
+            "import sys,time;sys.stdout.buffer.write(b'partial');sys.stdout.buffer.flush();time.sleep(1.2)",
         ]
         started = time.monotonic()
         with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=local_cmd):
@@ -857,14 +879,97 @@ while True:
 def _write_fake_ssh(bindir: Path) -> Path:
     script = bindir / "ssh.py"
     script.write_text(FAKE_SSH_PY, encoding="utf-8")
+    return script
+
+
+def _rewrite_ssh_argv(args: object, fake_script: Path) -> object:
+    """Keep composed ssh argv; run it through the fake as a Python process.
+
+    Production still launches ``ssh``. Tests replace only argv[0] so Windows
+    does not have to find ``ssh.exe`` or a ``.cmd`` wrapper, while ``ssh -G``
+    parser tests keep using a real OpenSSH binary.
+    """
+    if not isinstance(args, (list, tuple)) or not args:
+        return args
+    argv = [str(item) for item in args]
+    if Path(argv[0]).name.lower() not in {"ssh", "ssh.exe"}:
+        return args
+    return [sys.executable, str(fake_script), *argv[1:]]
+
+
+class _ComposedSshSubprocess:
+    """Test-only argv hook on ``ssh_transport.subprocess``, not a PATH wrapper."""
+
+    def __init__(self, fake_script: Path) -> None:
+        self._fake_script = Path(fake_script)
+
+    def __getattr__(self, name: str):
+        return getattr(subprocess, name)
+
+    def Popen(self, args, **kwargs):  # noqa: N802 - match subprocess.Popen
+        return subprocess.Popen(_rewrite_ssh_argv(args, self._fake_script), **kwargs)
+
+    def run(self, args, **kwargs):
+        return subprocess.run(_rewrite_ssh_argv(args, self._fake_script), **kwargs)
+
+
+def _patch_composed_ssh(fake_script: Path):
+    return mock.patch.object(ssh_transport, "subprocess", _ComposedSshSubprocess(fake_script))
+
+
+def _windows_pid_alive(pid: int) -> bool:
+    """Owned-process liveness on native Windows (``os.kill(pid, 0)`` is not)."""
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    synchronize = 0x00100000
+    still_active = 259
+    wait_timeout = 258
+    wait_failed = 0xFFFFFFFF
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(process_query_limited_information | synchronize, False, pid)
+    if not handle:
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return False
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        if int(code.value) != still_active:
+            return False
+        waited = kernel32.WaitForSingleObject(handle, 0)
+        if waited == wait_failed:
+            return True
+        return waited == wait_timeout
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _process_alive(pid: int) -> bool:
+    """True while this PID is still a live process we can observe."""
+    if pid <= 0:
+        return False
     if os.name == "nt":
-        wrapper = bindir / "ssh.cmd"
-        wrapper.write_text(f'@echo off\n"{sys.executable}" "{script}" %*\n', encoding="utf-8")
-        return wrapper
-    ssh = bindir / "ssh"
-    ssh.write_text("#!" + sys.executable + "\n" + FAKE_SSH_PY, encoding="utf-8")
-    ssh.chmod(0o755)
-    return ssh
+        return _windows_pid_alive(int(pid))
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 class LocalForwardTests(unittest.TestCase):
@@ -875,10 +980,12 @@ class LocalForwardTests(unittest.TestCase):
         self.home.mkdir()
         self.bindir = Path(self.temp.name) / "bin"
         self.bindir.mkdir()
-        _write_fake_ssh(self.bindir)
+        self.fake_ssh = _write_fake_ssh(self.bindir)
+        self._ssh_patch = _patch_composed_ssh(self.fake_ssh)
+        self._ssh_patch.start()
+        self.addCleanup(self._ssh_patch.stop)
         self.endpoint = Endpoint.for_long_stream("192.0.2.10", 46000)
         self._env = {
-            "PATH": f"{self.bindir}{os.pathsep}{os.environ.get('PATH', '')}",
             "HOME": str(self.home),
         }
 
@@ -969,7 +1076,16 @@ class LocalForwardTests(unittest.TestCase):
                 sock.settimeout(1)
                 sock.connect(("127.0.0.1", fwd.local_port))
             recorded = argv_path.read_text(encoding="utf-8").split("\0")
-            self.assertIn("ssh", Path(recorded[0]).name.lower(), recorded[0])
+            composed = ssh_transport.local_forward_ssh_command(
+                self.endpoint,
+                local_host="127.0.0.1",
+                local_port=fwd.local_port,
+                remote_host="127.0.0.1",
+                remote_port=8123,
+            )
+            self.assertEqual(composed[0], "ssh")
+            self.assertEqual(Path(recorded[0]).name, "ssh.py")
+            self.assertEqual(recorded[1:], composed[1:])
             self.assertIn("-N", recorded)
             self.assertIn("ExitOnForwardFailure=yes", recorded)
         finally:
@@ -995,21 +1111,20 @@ class LocalForwardTests(unittest.TestCase):
         while time.time() < deadline and not child_pid_path.exists():
             time.sleep(0.05)
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-        os.kill(child_pid, 0)
-        parent_pid = fwd._proc.pid
+        self.assertTrue(_process_alive(child_pid), f"descendant {child_pid} was not started")
+        parent = fwd._proc
+        parent_pid = parent.pid
         result = fwd.close()
         self.assertNotEqual(result.returncode, 0)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(parent_pid, 0)
-        deadline = time.time() + 2
+        self.assertIsNotNone(parent.poll(), f"forward parent {parent_pid} still running after close()")
+        self.assertFalse(_process_alive(parent_pid), f"forward parent {parent_pid} still alive after close()")
+        deadline = time.time() + 5
         while time.time() < deadline:
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
+            if not _process_alive(child_pid):
                 break
             time.sleep(0.05)
         else:
-            self.fail(f"forward child {child_pid} still alive after close()")
+            self.fail(f"forward descendant {child_pid} still alive after close()")
 
     def test_wait_ready_times_out_and_close_reaps_hanging_ssh(self) -> None:
         with mock.patch.dict(os.environ, self._env_with(FAKE_SSH_MODE="hang")):
@@ -1032,7 +1147,7 @@ class LocalSubprocessPortabilityTests(unittest.TestCase):
         local_cmd = [
             sys.executable,
             "-c",
-            "import sys,time;sys.stdout.write('partial');sys.stdout.flush();time.sleep(1.2)",
+            "import sys,time;sys.stdout.buffer.write(b'partial');sys.stdout.buffer.flush();time.sleep(1.2)",
         ]
         started = time.monotonic()
         with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=local_cmd):
@@ -1070,7 +1185,10 @@ class InteractiveBootstrapTests(unittest.TestCase):
         self.home.mkdir()
         self.bindir = Path(self.temp.name) / "bin"
         self.bindir.mkdir()
-        _write_fake_ssh(self.bindir)
+        self.fake_ssh = _write_fake_ssh(self.bindir)
+        self._ssh_patch = _patch_composed_ssh(self.fake_ssh)
+        self._ssh_patch.start()
+        self.addCleanup(self._ssh_patch.stop)
         self.endpoint = Endpoint(host="192.0.2.10", port=22, user="ubuntu", ssh_mux=False)
 
     def test_interactive_argv_is_password_bootstrap_off_the_mux(self) -> None:
@@ -1121,7 +1239,6 @@ class InteractiveBootstrapTests(unittest.TestCase):
         argv_path = Path(self.temp.name) / "argv"
         env = {
             **os.environ,
-            "PATH": f"{self.bindir}{os.pathsep}{os.environ.get('PATH', '')}",
             "HOME": str(self.home),
             "FAKE_SSH_MODE": "interactive",
             "FAKE_SSH_RC": "7",
@@ -1131,6 +1248,10 @@ class InteractiveBootstrapTests(unittest.TestCase):
             rc = ssh_transport.run_interactive(self.endpoint, ["sh", "-c", "printf ok"])
         self.assertEqual(rc, 7)
         recorded = argv_path.read_text(encoding="utf-8").split("\0")
+        composed = ssh_transport.interactive_ssh_command(self.endpoint, ["sh", "-c", "printf ok"])
+        self.assertEqual(composed[0], "ssh")
+        self.assertEqual(Path(recorded[0]).name, "ssh.py")
+        self.assertEqual(recorded[1:], composed[1:])
         self.assertEqual(recorded[-3:], ["sh", "-c", "printf ok"])
         self.assertIn("BatchMode=no", recorded)
         self.assertIn("PubkeyAuthentication=no", recorded)
