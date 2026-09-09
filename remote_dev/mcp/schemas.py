@@ -19,7 +19,9 @@ ENDPOINT_PROPS: dict[str, Any] = {
         "description": (
             "Per-endpoint OpenSSH multiplexing. true uses the shared ControlMaster; "
             "false forces an independent connection (ControlMaster=no, ControlPath=none, "
-            "ControlPersist=no). When omitted, REMOTE_DEV_SSH_MUX is the process default. "
+            "ControlPersist=no). When omitted, REMOTE_DEV_SSH_MUX is the process default "
+            "on POSIX. Native Windows has no Client ControlMaster; omitted ssh_mux already "
+            "selects independent connections, and ssh_mux=true is a capability error. "
             "Hour-scale streams and ssh -N -L tunnels use Endpoint.for_long_stream, "
             "which sets ssh_mux=false. ControlMaster delegates -N forwards to the mux "
             "master and the client exits rc=0 immediately, tearing the tunnel down. "
@@ -42,9 +44,11 @@ ENDPOINT_PROPS: dict[str, Any] = {
 # session or machine name). Schemas keep additionalProperties open so those
 # keys pass through; the server rejects payloads no resolver claims.
 ENDPOINT_SELECTOR_DESCRIPTION = (
-    "Provide at least one endpoint selector: host and port together, an "
-    "alias, or a selector field understood by a registered endpoint "
-    "resolver. The server validates the selector before connecting."
+    "Provide at least one endpoint selector: host and port together, or an "
+    "alias from the endpoint alias files. A consumer-registered resolver may "
+    "claim additional keys; remote-dev does not interpret session, profile, "
+    "or binding identifiers itself. The server validates the selector before "
+    "connecting."
 )
 
 

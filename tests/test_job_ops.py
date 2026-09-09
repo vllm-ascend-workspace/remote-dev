@@ -1,26 +1,39 @@
 from __future__ import annotations
 
-import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-REPO = Path(__file__).resolve().parents[1]
-
-import remote_dev.core.job_ops as job_ops  # noqa: E402
-import remote_dev.core.state_store as state_store  # noqa: E402
-from remote_dev.core.endpoint import Endpoint  # noqa: E402
-from remote_dev.core.ssh_transport import RemoteCompleted  # noqa: E402
+import remote_dev.core.job_ops as job_ops
+import remote_dev.core.state_store as state_store
+from remote_dev.core.endpoint import Endpoint
+from remote_dev.core.preview import MAX_JOB_TAIL_LINES, MAX_TEXT_CHARS
 
 
-class RemoteJobStatusTests(unittest.TestCase):
+def _supervisor(**overrides):
+    row = {
+        "state": "running",
+        "quiet": False,
+        "receipt": {"pid": 42, "supervision": "subreaper"},
+        "processes": [{"pid": 42}],
+        "unknown": [],
+        "result": None,
+        "remote_dir": "/srv/app/.remote-dev/jobs/job-test123",
+        "gate_open": True,
+    }
+    row.update(overrides)
+    return row
+
+
+class RemoteJobControlTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         original_root = state_store.substrate_root
         state_store.substrate_root = lambda: Path(self.temp.name)  # type: ignore[assignment]
         self.addCleanup(setattr, state_store, "substrate_root", original_root)
-        self.endpoint = Endpoint(host="127.0.0.1", port=46000, root="/vllm-workspace")
+        self.endpoint = Endpoint(host="127.0.0.1", port=46000, root="/srv/app", cwd="/srv/app")
         self.job_id = "job-test123"
         record = {
             "schema_version": "remote-dev.job.v1",
@@ -31,102 +44,160 @@ class RemoteJobStatusTests(unittest.TestCase):
         }
         state_store.atomic_write_json(state_store.job_record_path(self.endpoint, self.job_id), record)
 
-    def _status_with_stdout(self, stdout: str) -> dict:
-        original = job_ops.run_script
-        job_ops.run_script = lambda *_args, **_kwargs: RemoteCompleted(0, stdout, "")  # type: ignore[assignment]
-        try:
-            payload = job_ops.remote_job_status(self.endpoint, job_id=self.job_id)
-        finally:
-            job_ops.run_script = original  # type: ignore[assignment]
-        return payload["result"]
+    def _status(self, supervisor) -> dict:
+        with mock.patch.object(job_ops, "control", return_value=supervisor):
+            return job_ops.remote_job_status(self.endpoint, job_id=self.job_id)["result"]
 
-    def test_corrupt_status_with_alive_pid_reports_running(self) -> None:
-        # A half-written (corrupt) status.json while the pid is alive means
-        # "not finalized yet", not failure — same as the missing-file branch.
-        result = self._status_with_stdout("{not json\n__PID_ALIVE__=1\n")
+    def test_running_supervisor_is_reported_as_running(self) -> None:
+        result = self._status(_supervisor(state="running", quiet=False))
         self.assertEqual(result["status"], "running")
-        reason = result["job"]["remote_status"]["reason"]
-        self.assertIn("not finalized", reason)
+        self.assertEqual(result["outcome"], "success")
+        self.assertFalse(result["job"]["quiet"])
+        self.assertEqual(result["job"]["remote_status"]["state"], "running")
 
-    def test_corrupt_status_with_dead_pid_reports_failed(self) -> None:
-        result = self._status_with_stdout("{not json\n__PID_ALIVE__=0\n")
-        self.assertEqual(result["status"], "failed")
-        self.assertIn("corrupt", result["job"]["remote_status"]["reason"])
-
-    def test_empty_status_with_alive_pid_reports_running(self) -> None:
-        # An empty status.json cats to nothing, so stdout carries only the
-        # pid sentinel; it must still resolve the pid and report running.
-        result = self._status_with_stdout("__PID_ALIVE__=1\n")
-        self.assertEqual(result["status"], "running")
-        self.assertTrue(result["job"]["pid_alive"])
-
-    def test_missing_status_with_alive_pid_reports_running(self) -> None:
-        result = self._status_with_stdout("__STATUS_MISSING__\n__PID_ALIVE__=1\n")
-        self.assertEqual(result["status"], "running")
-        self.assertIn("not written yet", result["job"]["remote_status"]["reason"])
-
-    def test_finalized_status_is_reported_as_written(self) -> None:
-        result = self._status_with_stdout(
-            '{"status":"succeeded","job_id":"job-test123","exit_code":0}\n__PID_ALIVE__=0\n'
-        )
+    def test_succeeded_supervisor_is_reported_as_succeeded(self) -> None:
+        result = self._status(_supervisor(state="succeeded", quiet=True, result={"state": "succeeded", "exit_code": 0}))
         self.assertEqual(result["status"], "succeeded")
+        self.assertTrue(result["job"]["quiet"])
+
+    def test_uncertain_supervisor_is_not_quiet_success_of_the_job(self) -> None:
+        result = self._status(_supervisor(state="uncertain", quiet=False, unknown=["supervisor lost"]))
+        self.assertEqual(result["status"], "uncertain")
+        self.assertEqual(result["outcome"], "success")
+        self.assertFalse(result["job"]["quiet"])
+
+    def test_tail_uses_supervisor_logs_not_shell_sentinels(self) -> None:
+        supervisor = _supervisor(stdout="worker boot ok", stderr="no errors")
+        with mock.patch.object(job_ops, "control", return_value=supervisor) as mocked:
+            payload = job_ops.remote_job_tail(self.endpoint, job_id=self.job_id)
+        mocked.assert_called_once()
+        self.assertEqual(mocked.call_args.args[2], "tail")
+        result = payload["result"]
+        self.assertEqual(result["missing_logs"], [])
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("worker boot ok", payload["text"])
+        self.assertIn("no errors", payload["text"])
+
+    def test_missing_log_files_are_reported(self) -> None:
+        supervisor = _supervisor()
+        with mock.patch.object(job_ops, "control", return_value=supervisor):
+            result = job_ops.remote_job_tail(self.endpoint, job_id=self.job_id)["result"]
+        self.assertEqual(result["missing_logs"], ["stdout", "stderr"])
+        self.assertEqual(result["status"], "log_not_found")
+        self.assertEqual(result["outcome"], "failed")
+
+    def test_stop_quiet_cancelled_is_cancelled(self) -> None:
+        supervisor = _supervisor(state="cancelled", quiet=True, result={"state": "cancelled"})
+        with mock.patch.object(job_ops, "control", return_value=supervisor):
+            result = job_ops.remote_job_stop(self.endpoint, job_id=self.job_id)["result"]
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(result["outcome"], "cancelled")
+
+    def test_stop_still_running_is_failed(self) -> None:
+        supervisor = _supervisor(state="running", quiet=False)
+        with mock.patch.object(job_ops, "STOP_DRAIN_SECONDS", 0):
+            with mock.patch.object(job_ops, "control", return_value=supervisor):
+                result = job_ops.remote_job_stop(self.endpoint, job_id=self.job_id, force=True)["result"]
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["status"], "running")
 
 
-class RemoteJobTailTests(unittest.TestCase):
+class StartRemoteJobTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         original_root = state_store.substrate_root
         state_store.substrate_root = lambda: Path(self.temp.name)  # type: ignore[assignment]
         self.addCleanup(setattr, state_store, "substrate_root", original_root)
-        self.endpoint = Endpoint(host="127.0.0.1", port=46000, root="/vllm-workspace")
-        self.job_id = "job-tail123"
-        record = {
-            "schema_version": "remote-dev.job.v1",
-            "job_id": self.job_id,
-            "target": self.endpoint.to_result_target(),
-            "remote_dir": f"{self.endpoint.root}/.remote-dev/jobs/{self.job_id}",
-            "started_at": "2026-09-01T00:00:00Z",
-        }
-        state_store.atomic_write_json(state_store.job_record_path(self.endpoint, self.job_id), record)
+        self.endpoint = Endpoint(host="1.2.3.4", port=46000, root="/srv/app", cwd="/srv/app")
 
-    def _tail_with_stdout(self, stdout: str) -> dict:
-        original = job_ops.run_script
-        job_ops.run_script = lambda *_args, **_kwargs: RemoteCompleted(0, stdout, "")  # type: ignore[assignment]
-        try:
-            payload = job_ops.remote_job_tail(self.endpoint, job_id=self.job_id)
-        finally:
-            job_ops.run_script = original  # type: ignore[assignment]
-        return payload["result"]
+    def test_start_prepare_then_go_through_control(self) -> None:
+        calls = []
 
-    def test_sentinel_text_inside_log_content_is_not_a_missing_log(self) -> None:
-        # The sentinel appears as log *content* here; only a sentinel in the
-        # first line of a section marks that log as missing (D5).
-        stdout = (
-            "__STDOUT__\n"
-            "worker boot ok\n"
-            "previous run ended with __STDOUT___MISSING before the fix\n"
-            "__STDERR__\n"
-            "no errors\n"
+        def fake_control(_endpoint, job_id, action, **params):
+            calls.append((action, params))
+            if action == "prepare":
+                return _supervisor(state="prepared", quiet=False, gate_open=False, remote_dir=f"/srv/app/.remote-dev/jobs/{job_id}")
+            if action == "go":
+                return _supervisor(state="running", remote_dir=f"/srv/app/.remote-dev/jobs/{job_id}")
+            raise AssertionError(action)
+
+        with mock.patch.object(job_ops, "control", fake_control):
+            payload = job_ops.start_remote_job(self.endpoint, command="echo ok", job_id="job-start1")
+        self.assertEqual([item[0] for item in calls], ["prepare", "go"])
+        self.assertEqual(calls[0][1]["spec"]["command"], "echo ok")
+        self.assertEqual(calls[0][1]["spec"]["cwd"], "/srv/app")
+        self.assertIn("authorization", calls[1][1])
+        self.assertEqual(payload["result"]["status"], "running")
+        self.assertEqual(payload["result"]["outcome"], "success")
+        record = state_store.read_json(Path(payload["result"]["refs"]["job_record"]))
+        self.assertEqual(record["job_id"], "job-start1")
+        self.assertEqual(record["remote_dir"], "/srv/app/.remote-dev/jobs/job-start1")
+
+    def test_start_does_not_build_a_nohup_shell_runner(self) -> None:
+        with mock.patch.object(job_ops, "control", return_value=_supervisor(state="prepared", gate_open=True)):
+            job_ops.start_remote_job(self.endpoint, command="sleep 1", job_id="job-nopath")
+        # control is the only remote path; there is no run_script/nohup helper left.
+        self.assertFalse(hasattr(job_ops, "run_script"))
+
+    def test_runtime_env_is_folded_into_the_supervisor_command(self) -> None:
+        endpoint = Endpoint(host="1.2.3.4", port=46000, root="/srv/app", cwd="/srv/app", runtime_env_file="/etc/profile.d/toolchain.sh")
+        calls = []
+
+        def fake_control(_endpoint, job_id, action, **params):
+            calls.append((action, params))
+            return _supervisor(state="prepared" if action == "prepare" else "running", gate_open=action == "go")
+
+        with mock.patch.object(job_ops, "control", fake_control):
+            payload = job_ops.start_remote_job(endpoint, command="echo ok", job_id="job-runtime-env")
+        command = calls[0][1]["spec"]["command"]
+        self.assertIn("/etc/profile.d/toolchain.sh", command)
+        self.assertIn("echo ok", command)
+        record = state_store.read_json(Path(payload["result"]["refs"]["job_record"]))
+        self.assertEqual(record["runtime_env_file"], "/etc/profile.d/toolchain.sh")
+        restored = job_ops.endpoint_from_job_record(record)
+        self.assertEqual(restored.runtime_env_file, "/etc/profile.d/toolchain.sh")
+
+    def test_missing_cwd_does_not_open_the_start_gate(self) -> None:
+        calls = []
+
+        def fake_control(_endpoint, _job_id, action, **params):
+            calls.append(action)
+            raise FileNotFoundError("command cwd does not exist")
+
+        with mock.patch.object(job_ops, "control", fake_control):
+            payload = job_ops.start_remote_job(self.endpoint, command="touch should-not-exist", cwd="/srv/app/missing", job_id="job-missing")
+        self.assertEqual(calls, ["prepare"])
+        self.assertEqual(payload["result"]["outcome"], "failed")
+        self.assertEqual(payload["result"]["status"], "cwd_not_found")
+
+    def test_duplicate_local_job_id_is_blocked_without_control(self) -> None:
+        state_store.atomic_write_json(
+            state_store.job_record_path(self.endpoint, "job-existing"),
+            {"job_id": "job-existing", "target": self.endpoint.to_result_target()},
         )
-        result = self._tail_with_stdout(stdout)
-        self.assertEqual(result["missing_logs"], [])
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["warnings"], [])
+        with mock.patch.object(job_ops, "control", side_effect=AssertionError("control must not run")):
+            payload = job_ops.start_remote_job(self.endpoint, command="echo ok", job_id="job-existing")
+        self.assertEqual(payload["result"]["outcome"], "blocked")
+        self.assertEqual(payload["result"]["status"], "job_id_exists")
 
-    def test_sentinel_as_first_section_line_marks_only_that_log_missing(self) -> None:
-        stdout = "__STDOUT__\n__STDOUT___MISSING\n__STDERR__\ntraceback line\n"
-        result = self._tail_with_stdout(stdout)
-        self.assertEqual(result["missing_logs"], ["stdout"])
-        self.assertEqual(result["status"], "ok")
-        self.assertIn("stdout.log does not exist", result["warnings"][0])
+    def test_tail_clamps_lines(self) -> None:
+        job_id = "job-tail-test"
+        state_store.atomic_write_json(
+            state_store.job_record_path(self.endpoint, job_id),
+            {"job_id": job_id, "target": self.endpoint.to_result_target(), "remote_dir": "/srv/app/.remote-dev/jobs/job-tail-test"},
+        )
+        seen = {}
 
-    def test_all_requested_logs_missing_is_log_not_found(self) -> None:
-        stdout = "__STDOUT__\n__STDOUT___MISSING\n__STDERR__\n__STDERR___MISSING\n"
-        result = self._tail_with_stdout(stdout)
-        self.assertEqual(result["missing_logs"], ["stdout", "stderr"])
-        self.assertEqual(result["status"], "log_not_found")
-        self.assertEqual(result["outcome"], "failed")
+        def fake_control(_endpoint, _job_id, action, **params):
+            seen.update(params)
+            return _supervisor(stdout="x" * (MAX_TEXT_CHARS * 2), stderr="")
+
+        with mock.patch.object(job_ops, "control", fake_control):
+            payload = job_ops.remote_job_tail(None, job_id=job_id, lines=100000)
+        self.assertEqual(seen["lines"], MAX_JOB_TAIL_LINES)
+        self.assertIn("clamped", payload["result"]["warnings"][0])
+        self.assertLessEqual(len(payload["text"]), MAX_TEXT_CHARS)
 
 
 if __name__ == "__main__":

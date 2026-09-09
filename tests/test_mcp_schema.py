@@ -16,7 +16,6 @@ import remote_dev.core.endpoint as endpoint_module  # noqa: E402
 import remote_dev.core.state_store as state_store  # noqa: E402
 import remote_dev.mcp.tools as mcp_tools  # noqa: E402
 from remote_dev.core.endpoint import Endpoint  # noqa: E402
-from remote_dev.core.ssh_transport import RemoteCompleted  # noqa: E402
 from remote_dev.mcp.schemas import ALIASES, ENDPOINT_PROPS, ENDPOINT_SELECTOR_DESCRIPTION, TOOL_SCHEMAS  # noqa: E402
 from remote_dev.mcp.tools import list_resources, list_tools, read_resource  # noqa: E402
 
@@ -202,7 +201,7 @@ class McpSchemaTests(unittest.TestCase):
 
     def test_resources_include_and_read_job_resources(self) -> None:
         original_state_root = state_store.substrate_root
-        original_run_script = mcp_tools.run_script
+        original_control = mcp_tools.control
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 state_store.substrate_root = lambda: Path(tmp)  # type: ignore[assignment]
@@ -217,7 +216,7 @@ class McpSchemaTests(unittest.TestCase):
                     "started_at": "2026-05-25T00:00:00Z",
                 }
                 state_store.atomic_write_json(state_store.job_record_path(endpoint, job_id), record)
-                mcp_tools.run_script = lambda *_args, **_kwargs: RemoteCompleted(0, "log\n", "")  # type: ignore[assignment]
+                mcp_tools.control = lambda *_args, **_kwargs: {"state": "running", "quiet": False, "stdout": "log\n", "stderr": ""}  # type: ignore[assignment]
 
                 base = f"remote://endpoint/{endpoint.endpoint_id}/job/{job_id}"
                 resources = {resource["uri"] for resource in list_resources()}
@@ -232,7 +231,7 @@ class McpSchemaTests(unittest.TestCase):
                 self.assertEqual(stdout["text"], "log\n")
         finally:
             state_store.substrate_root = original_state_root  # type: ignore[assignment]
-            mcp_tools.run_script = original_run_script  # type: ignore[assignment]
+            mcp_tools.control = original_control  # type: ignore[assignment]
 
     def test_resources_include_and_read_artifact_manifest(self) -> None:
         original_state_root = state_store.substrate_root

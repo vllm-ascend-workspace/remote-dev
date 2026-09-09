@@ -155,7 +155,7 @@ class DirectEndpointProperties(ResolverIsolation):
             self.assertEqual(endpoint.port, int(payload["port"]))
             self.assertEqual(endpoint.user, payload.get("user") or endpoint_mod.DEFAULT_USER)
             self.assertEqual(endpoint.root, payload.get("root") or endpoint_mod.DEFAULT_ROOT)
-            self.assertEqual(endpoint.effective_cwd, payload.get("cwd") or endpoint_mod.DEFAULT_CWD)
+            self.assertEqual(endpoint.effective_cwd, payload.get("cwd") or endpoint_mod.DEFAULT_CWD or endpoint.root)
             # Determinism: the same payload resolves to an identical endpoint.
             self.assertEqual(resolve_endpoint(dict(payload)), endpoint)
             self.assertEqual(resolve_endpoint(dict(payload)).endpoint_id, endpoint.endpoint_id)

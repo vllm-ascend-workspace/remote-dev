@@ -36,7 +36,7 @@ class EndpointTests(unittest.TestCase):
         endpoint = resolve_endpoint({"host": "1.2.3.4", "port": 46000})
         self.assertEqual(endpoint.user, "root")
         self.assertEqual(endpoint.root, "/")
-        self.assertEqual(endpoint.effective_cwd, "/vllm-workspace")
+        self.assertEqual(endpoint.effective_cwd, "/")
         self.assertEqual(endpoint.kind, "direct-endpoint")
         self.assertIsNone(endpoint.ssh_mux)
         self.assertFalse(endpoint.keepalive)

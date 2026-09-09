@@ -5,7 +5,7 @@
       "port": 22,
       "user": "root",
       "root": "/",
-      "cwd": "/vllm-workspace",
+      "cwd": "/srv/app",
       "runtime_env_file": "/etc/profile.d/example-toolchain.sh"
     }
   }

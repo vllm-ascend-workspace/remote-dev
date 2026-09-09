@@ -13,7 +13,7 @@ from typing import Any
 
 
 from remote_dev.cli import TOOL_NAMES, build_parser
-from remote_dev.core.endpoint import DEFAULT_CWD, has_selector, selector_fields
+from remote_dev.core.endpoint import DEFAULT_CWD, DEFAULT_ROOT, has_selector, selector_fields
 from remote_dev.mcp.schemas import ALIASES, ENDPOINT_PROPS, ENDPOINT_SELECTOR_DESCRIPTION, TOOL_SCHEMAS
 from remote_dev.mcp.tools import call_tool, list_resources, list_tools, read_resource
 
@@ -185,7 +185,7 @@ def live_endpoint_checks(args: argparse.Namespace) -> dict[str, Any]:
         return {"status": "skipped", "reason": f"no endpoint selector was provided (known selector fields: {', '.join(selector_fields())})"}
     timeout_ms = args.timeout_ms
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    scratch_root = (endpoint.get("cwd") or DEFAULT_CWD).rstrip("/")
+    scratch_root = (endpoint.get("cwd") or DEFAULT_CWD or endpoint.get("root") or DEFAULT_ROOT).rstrip("/")
     scratch = f"{scratch_root}/.remote-dev/validation/{stamp}"
     narrow_endpoint = {**endpoint, "root": scratch_root, "cwd": scratch_root}
     checks: list[dict[str, Any]] = []
