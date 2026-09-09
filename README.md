@@ -285,6 +285,28 @@ It returns `RemoteCompleted` (`returncode`, not `exit_code`) and does not
 emit `remote-dev.result.v1`. It is not `remote.job_*`: jobs are detached
 (`nohup`) and tailed from log files.
 
+Two more transport primitives close the remaining SSH-option gaps. They are
+library APIs, not MCP tools, and they do not accept extra `-o` strings.
+
+- `open_local_forward(endpoint, remote_port)` opens `ssh -N -L` on the
+  `for_long_stream` shape (`ControlMaster=no`, `ControlPath=none`,
+  `ControlPersist=no`, keepalives, `ExitOnForwardFailure=yes`). It refuses
+  a multiplexed endpoint the same way `run_stream` does. The handle exposes
+  `local_port`, `wait_ready(timeout_s)`, and `close()` (process-group kill;
+  a forward that dies is never reported as rc=0 — that silent success is
+  the recorded mux-absorbed `-N` failure).
+- `run_interactive(endpoint, remote_command)` is a one-off TTY-inherited
+  bootstrap (`BatchMode=no`, password/keyboard-interactive only,
+  `PubkeyAuthentication=no`). Combining it with multiplexing is impossible:
+  a password prompt through a ControlMaster is meaningless and hangs.
+  `interactive_ssh_command` returns the argv for wrappers such as
+  `SSH_ASKPASS`. This is first-contact bootstrap, not a general PTY
+  facility.
+
+Stdin bytes into a remote command are already `run_bytes`. Detached
+background work is `remote.bash --run-in-background` / `remote.job_*`.
+Directory trees move with `remote.artifact_push` / `artifact_pull`.
+
 ## MCP server and clients
 
 `remote-dev server` speaks JSON-RPC over stdio with `Content-Length` framing

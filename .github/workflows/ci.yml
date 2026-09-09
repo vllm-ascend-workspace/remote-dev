@@ -35,3 +35,27 @@ jobs:
         run: python3 -m pytest
       - name: Local contract gates
         run: remote-dev validate --local-only
+
+  wheel:
+    name: Wheel install (P14)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: python3 -m pip install uv
+      - name: Build wheel, install clean venv, import, --help
+        run: |
+          set -euo pipefail
+          uv build
+          wheel=$(ls -1 dist/*.whl)
+          clean=$(mktemp -d)
+          python3 -m venv "$clean/venv"
+          "$clean/venv/bin/python" -m pip install "$wheel"
+          "$clean/venv/bin/python" -c "import remote_dev; print(remote_dev.__version__)"
+          "$clean/venv/bin/remote-dev" --help

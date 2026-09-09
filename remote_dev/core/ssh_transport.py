@@ -5,9 +5,12 @@ import json
 import os
 import select
 import shlex
+import signal
+import socket
 import subprocess
 import sys
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
@@ -54,6 +57,18 @@ STREAM_MUX_REFUSAL = (
     "Use Endpoint.for_long_stream(...) or set ssh_mux=False before building "
     "the command."
 )
+
+INTERACTIVE_MUX_REFUSAL = (
+    "interactive bootstrap cannot use a multiplexed SSH connection: a "
+    "password prompt through a ControlMaster is meaningless and hangs. "
+    "It is impossible to combine BatchMode=no with multiplexing. Pass "
+    "ssh_mux=False on the endpoint (do not attach this session to a mux "
+    "master)."
+)
+
+# OpenSSH -N through a mux master exits 0 while the tunnel is gone. A dead
+# forward is never reported as success.
+FORWARD_DEAD_EXIT_CODE = 255
 
 
 @dataclass
@@ -185,7 +200,16 @@ def _keepalive_options(endpoint: Endpoint) -> list[str]:
     ]
 
 
-def ssh_base_cmd(endpoint: Endpoint) -> list[str]:
+def _ssh_cmd(endpoint: Endpoint, option_tokens: Sequence[str] = ()) -> list[str]:
+    """Compose an SSH argv. ``option_tokens`` are placed before ``--``.
+
+    ``--`` stops OpenSSH option parsing. Anything after the host is a
+    remote command, not an option: ``-N`` / ``-L`` / ``-o`` appended past
+    the destination are executed on the far side and never take effect.
+    This helper is the only place that emits ``--``, so package callers
+    cannot reintroduce that split. ``option_tokens`` is not a public
+    extra-options escape hatch; only this module passes tokens it owns.
+    """
     if _uses_shared_mux(endpoint):
         mux_options = _control_master_options(endpoint.identity_file)
     else:
@@ -202,6 +226,7 @@ def ssh_base_cmd(endpoint: Endpoint) -> list[str]:
         f"ConnectTimeout={max(1, int(endpoint.connect_timeout_ms / 1000))}",
         *mux_options,
         *_keepalive_options(endpoint),
+        *option_tokens,
     ]
     if endpoint.identity_file:
         cmd.extend(["-i", endpoint.identity_file])
@@ -210,6 +235,10 @@ def ssh_base_cmd(endpoint: Endpoint) -> list[str]:
     # `host`. `Endpoint.destination()` (`user@host`) is display-only.
     cmd.extend(["-l", endpoint.user, "-p", str(endpoint.port), "--", endpoint.host])
     return cmd
+
+
+def ssh_base_cmd(endpoint: Endpoint) -> list[str]:
+    return _ssh_cmd(endpoint)
 
 
 def stream_remote_payload(script: str, timeout_ms: int | None) -> str:
@@ -454,3 +483,333 @@ def _decode_stream(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value
+
+
+# ---------------------------------------------------------------------------
+# Local port forward (ssh -N -L) and interactive bootstrap
+# ---------------------------------------------------------------------------
+
+
+def _rewrite_forward_exit(returncode: int | None) -> int:
+    """A dead ``-N`` forward is never success. Mux-absorbed clients exit 0."""
+    if returncode is None or returncode == 0:
+        return FORWARD_DEAD_EXIT_CODE
+    return int(returncode)
+
+
+def _validate_forward_host(value: str, *, field: str) -> str:
+    host = str(value)
+    if not host or host.startswith("-"):
+        raise RemoteExecutionError(f"{field} must be a hostname, not an option: {value!r}")
+    if any(char in host for char in ("\n", "\r", "\0", " ")):
+        raise RemoteExecutionError(f"{field} contains invalid characters: {value!r}")
+    return host
+
+
+def _validate_port(value: int, *, field: str) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RemoteExecutionError(f"{field} must be an integer") from exc
+    if isinstance(value, bool) or not (1 <= port <= 65535):
+        raise RemoteExecutionError(f"{field} must be in 1..65535, got {value!r}")
+    return port
+
+
+def _find_free_local_port(host: str) -> int:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
+
+
+def _as_long_stream(endpoint: Endpoint) -> Endpoint:
+    """Normalize to the for_long_stream shape after refusing a muxed endpoint."""
+    _require_independent_stream(endpoint)
+    if endpoint.keepalive:
+        return endpoint
+    return Endpoint.for_long_stream(
+        host=endpoint.host,
+        port=endpoint.port,
+        user=endpoint.user,
+        root=endpoint.root,
+        cwd=endpoint.cwd,
+        runtime_env=endpoint.runtime_env,
+        runtime_env_file=endpoint.runtime_env_file,
+        identity_file=endpoint.identity_file,
+        connect_timeout_ms=endpoint.connect_timeout_ms,
+        kind=endpoint.kind,
+        alias=endpoint.alias,
+        source=endpoint.source,
+    )
+
+
+def local_forward_ssh_command(
+    endpoint: Endpoint,
+    *,
+    local_host: str,
+    local_port: int,
+    remote_host: str,
+    remote_port: int,
+) -> list[str]:
+    """Argv for ``ssh -N -L`` on the ``for_long_stream`` shape.
+
+    Refuses a multiplexed endpoint. Always includes ``ControlMaster=no``,
+    keepalives, ``ExitOnForwardFailure=yes``, and ``-N``. Callers cannot
+    inject extra ``-o`` strings.
+    """
+    endpoint = _as_long_stream(endpoint)
+    local_host = _validate_forward_host(local_host, field="local_host")
+    remote_host = _validate_forward_host(remote_host, field="remote_host")
+    local_port = _validate_port(local_port, field="local_port")
+    remote_port = _validate_port(remote_port, field="remote_port")
+    return _ssh_cmd(
+        endpoint,
+        (
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-N",
+            "-L",
+            f"{local_host}:{local_port}:{remote_host}:{remote_port}",
+        ),
+    )
+
+
+def _stop_process_group(proc: subprocess.Popen[Any], *, timeout_s: float = 5.0) -> int:
+    if proc.poll() is not None:
+        return _rewrite_forward_exit(proc.returncode)
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        proc.terminate()
+    try:
+        return _rewrite_forward_exit(proc.wait(timeout=timeout_s))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.kill()
+        return _rewrite_forward_exit(proc.wait(timeout=timeout_s))
+
+
+class LocalForward:
+    """Handle for one local→remote SSH port forward.
+
+    ``local_port`` is the bound loopback port. ``wait_ready`` blocks until
+    that port accepts connections. ``close`` kills the process group so no
+    child is left behind. ``poll`` and ``close`` never report rc=0 for a
+    dead forward.
+    """
+
+    def __init__(
+        self,
+        *,
+        proc: subprocess.Popen[Any],
+        local_host: str,
+        local_port: int,
+        remote_host: str,
+        remote_port: int,
+    ) -> None:
+        self.local_host = local_host
+        self.local_port = local_port
+        self.remote_host = remote_host
+        self.remote_port = remote_port
+        self._proc = proc
+        self._stderr = ""
+        self._stderr_read = False
+        self._closed = False
+
+    def _consume_stderr(self) -> str:
+        if self._stderr_read:
+            return self._stderr
+        self._stderr_read = True
+        if self._proc.stderr is None:
+            self._stderr = ""
+            return self._stderr
+        data = self._proc.stderr.read() or ""
+        self._stderr = data if isinstance(data, str) else data.decode("utf-8", errors="replace")
+        return self._stderr
+
+    def poll(self) -> int | None:
+        rc = self._proc.poll()
+        if rc is None:
+            return None
+        return _rewrite_forward_exit(rc)
+
+    def wait_ready(self, timeout_s: float = 15.0) -> None:
+        """Block until ``local_port`` accepts connections.
+
+        Raises :class:`RemoteExecutionError` if the process dies or the
+        timeout expires. A process that exits 0 is reported as
+        :data:`FORWARD_DEAD_EXIT_CODE`.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        last_error = ""
+        family = socket.AF_INET6 if ":" in self.local_host else socket.AF_INET
+        while time.monotonic() < deadline:
+            rc = self._proc.poll()
+            if rc is not None:
+                stderr = self._consume_stderr()
+                rewritten = _rewrite_forward_exit(rc)
+                detail = f"rc={rewritten}"
+                if rc != rewritten:
+                    detail += f", ssh rc={rc}"
+                raise RemoteExecutionError(
+                    f"ssh local forward exited early ({detail}): {stderr[:2000]}"
+                )
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(0.5)
+                    sock.connect((self.local_host, self.local_port))
+                return
+            except OSError as exc:
+                last_error = str(exc)
+                time.sleep(0.2)
+        raise RemoteExecutionError(
+            f"timed out waiting for ssh local forward on {self.local_host}:{self.local_port} ({last_error})"
+        )
+
+    def close(self) -> RemoteCompleted:
+        """Kill the forward process group. Never returns rc=0."""
+        if self._closed:
+            rc = self._proc.poll()
+            return RemoteCompleted(_rewrite_forward_exit(rc), "", self._stderr)
+        self._closed = True
+        rc = _stop_process_group(self._proc)
+        stderr = self._consume_stderr()
+        return RemoteCompleted(rc, "", stderr)
+
+    def __enter__(self) -> LocalForward:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+
+def open_local_forward(
+    endpoint: Endpoint,
+    remote_port: int,
+    *,
+    remote_host: str = "127.0.0.1",
+    local_host: str = "127.0.0.1",
+    local_port: int | None = None,
+    ready_timeout_s: float | None = 15.0,
+) -> LocalForward:
+    """Open a local→remote forward and return a :class:`LocalForward` handle.
+
+    Built on :meth:`Endpoint.for_long_stream`: independent connection,
+    keepalives, ``ExitOnForwardFailure=yes``, ``-N``. Refuses a multiplexed
+    endpoint the same way :func:`run_stream` does. When ``local_port`` is
+    omitted an ephemeral loopback port is chosen. When ``ready_timeout_s``
+    is not ``None``, the local port must accept connections before this
+    returns.
+    """
+    endpoint = _as_long_stream(endpoint)
+    local_host = _validate_forward_host(local_host, field="local_host")
+    remote_host = _validate_forward_host(remote_host, field="remote_host")
+    remote_port = _validate_port(remote_port, field="remote_port")
+    if local_port is None:
+        chosen_port = _find_free_local_port(local_host)
+    else:
+        chosen_port = _validate_port(local_port, field="local_port")
+    cmd = local_forward_ssh_command(
+        endpoint,
+        local_host=local_host,
+        local_port=chosen_port,
+        remote_host=remote_host,
+        remote_port=remote_port,
+    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise RemoteExecutionError(f"required local command not found: {cmd[0]}") from exc
+    handle = LocalForward(
+        proc=proc,
+        local_host=local_host,
+        local_port=chosen_port,
+        remote_host=remote_host,
+        remote_port=remote_port,
+    )
+    if ready_timeout_s is not None:
+        try:
+            handle.wait_ready(ready_timeout_s)
+        except Exception:
+            handle.close()
+            raise
+    return handle
+
+
+def interactive_ssh_command(
+    endpoint: Endpoint,
+    remote_command: Sequence[str] = (),
+) -> list[str]:
+    """Argv for a one-off interactive bootstrap SSH.
+
+    ``BatchMode=no``, password/keyboard-interactive only, never multiplexed.
+    Refuses a multiplexed endpoint. Does not accept extra ``-o`` strings.
+    This is first-contact bootstrap, not a general PTY facility.
+    """
+    if _uses_shared_mux(endpoint):
+        raise RemoteExecutionError(INTERACTIVE_MUX_REFUSAL)
+    timeout_s = max(1, int(endpoint.connect_timeout_ms / 1000))
+    cmd = [
+        "ssh",
+        "-o",
+        "BatchMode=no",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        f"ConnectTimeout={timeout_s}",
+        *_independent_ssh_connection_options(),
+        "-o",
+        "PreferredAuthentications=password,keyboard-interactive",
+        "-o",
+        "PubkeyAuthentication=no",
+        "-o",
+        "NumberOfPasswordPrompts=1",
+        "-l",
+        endpoint.user,
+        "-p",
+        str(endpoint.port),
+        "--",
+        endpoint.host,
+    ]
+    cmd.extend(str(item) for item in remote_command)
+    return cmd
+
+
+def run_interactive(
+    endpoint: Endpoint,
+    remote_command: Sequence[str] | str = (),
+    *,
+    env: Mapping[str, str] | None = None,
+) -> int:
+    """Run a one-off interactive SSH, inheriting the local TTY.
+
+    Returns the ``ssh`` returncode. ``env`` is merged into the process
+    environment for wrappers such as ``SSH_ASKPASS``; it cannot inject
+    SSH ``-o`` options. Refuses a multiplexed endpoint.
+    """
+    argv: Sequence[str]
+    if isinstance(remote_command, str):
+        argv = (remote_command,)
+    else:
+        argv = tuple(str(item) for item in remote_command)
+    cmd = interactive_ssh_command(endpoint, argv)
+    full_env = None if env is None else {**os.environ, **dict(env)}
+    try:
+        proc = subprocess.run(cmd, env=full_env)
+    except FileNotFoundError as exc:
+        raise RemoteExecutionError(f"required local command not found: {cmd[0]}") from exc
+    return int(proc.returncode)

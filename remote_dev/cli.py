@@ -187,7 +187,11 @@ def build_parser(tool: str) -> argparse.ArgumentParser:
         parser.add_argument("--pattern", required=False)
         parser.add_argument("--path")
         parser.add_argument("--limit", type=int, default=100)
-        parser.add_argument("--respect-gitignore", action="store_true")
+        parser.add_argument(
+            "--respect-gitignore",
+            action="store_true",
+            help="Omit paths ignored by .gitignore (git check-ignore, or in-process rules).",
+        )
     elif tool == "grep":
         parser.add_argument("--pattern", required=False)
         parser.add_argument("--path")

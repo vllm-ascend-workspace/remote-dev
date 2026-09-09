@@ -96,7 +96,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ["file_path", "edits"],
     ),
     "remote.bash": schema({"command": {"type": "string"}, "description": {"type": "string"}, "timeout_ms": {"type": "integer"}, "timeout": {"type": "integer"}, "run_in_background": {"type": "boolean"}, "env": {"type": "object", "additionalProperties": {"type": "string"}}}, ["command"]),
-    "remote.glob": schema({"pattern": {"type": "string"}, "path": {"type": "string"}, "limit": {"type": "integer"}, "respect_gitignore": {"type": "boolean", "description": "Currently returns a warning; exact gitignore filtering is not implemented."}}, ["pattern"]),
+    "remote.glob": schema({"pattern": {"type": "string"}, "path": {"type": "string"}, "limit": {"type": "integer"}, "respect_gitignore": {"type": "boolean", "description": "Omit paths ignored by .gitignore. Uses git check-ignore when the remote tree is a git worktree; otherwise applies .gitignore rules in-process."}}, ["pattern"]),
     "remote.grep": schema({"pattern": {"type": "string"}, "path": {"type": "string"}, "glob": {"type": "string"}, "type": {"type": "string"}, "output_mode": {"type": "string", "enum": ["files_with_matches", "content", "count"]}, "multiline": {"type": "boolean"}, "limit": {"type": "integer", "maximum": 500}}, ["pattern"]),
     "remote.ls": schema({"path": {"type": "string"}, "limit": {"type": "integer"}, "all": {"type": "boolean"}}),
     "remote.monitor": schema({"command": {"type": "string"}, "description": {"type": "string"}, "timeout_ms": {"type": "integer"}, "pattern": {"type": "string"}, "env": {"type": "object", "additionalProperties": {"type": "string"}}}, ["command"]),
