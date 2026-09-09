@@ -4,9 +4,11 @@ import io
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -612,6 +614,298 @@ class LiveStreamTests(unittest.TestCase):
                 self.assertIn("first-option-wins", message)
                 self.assertIn("ControlPath", message)
                 self.assertIn("for_long_stream", message)
+
+
+FAKE_SSH_PY = r"""
+import os
+import socket
+import sys
+import time
+
+argv_path = os.environ.get("FAKE_SSH_ARGV")
+if argv_path:
+    with open(argv_path, "w", encoding="utf-8") as fh:
+        fh.write("\0".join(sys.argv))
+
+mode = os.environ.get("FAKE_SSH_MODE", "listen")
+spec = None
+args = sys.argv[1:]
+index = 0
+while index < len(args):
+    if args[index] == "-L" and index + 1 < len(args):
+        spec = args[index + 1]
+        index += 2
+        continue
+    if args[index] == "-o" and index + 1 < len(args):
+        index += 2
+        continue
+    index += 1
+
+if mode == "exit0":
+    raise SystemExit(0)
+if mode == "exit1":
+    sys.stderr.write("forward failed\n")
+    raise SystemExit(1)
+if mode == "interactive":
+    raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
+
+if spec is None or spec.count(":") < 3:
+    sys.stderr.write("missing -L spec\n")
+    raise SystemExit(2)
+local_host, local_port_s, _remote_host, _remote_port = spec.split(":", 3)
+local_port = int(local_port_s)
+
+if mode == "child":
+    child_pid_path = os.environ["FAKE_SSH_CHILD_PID"]
+    pid = os.fork()
+    if pid == 0:
+        while True:
+            time.sleep(30)
+    with open(child_pid_path, "w", encoding="utf-8") as fh:
+        fh.write(str(pid))
+
+if mode == "hang":
+    while True:
+        time.sleep(30)
+
+family = socket.AF_INET6 if ":" in local_host else socket.AF_INET
+sock = socket.socket(family, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind((local_host, local_port))
+sock.listen(8)
+while True:
+    sock.settimeout(1.0)
+    try:
+        conn, _addr = sock.accept()
+    except socket.timeout:
+        continue
+    conn.close()
+"""
+
+
+def _write_fake_ssh(bindir: Path) -> Path:
+    script = bindir / "ssh"
+    script.write_text("#!/usr/bin/env python3\n" + FAKE_SSH_PY, encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+class LocalForwardTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name) / "home"
+        self.home.mkdir()
+        self.bindir = Path(self.temp.name) / "bin"
+        self.bindir.mkdir()
+        _write_fake_ssh(self.bindir)
+        self.endpoint = Endpoint.for_long_stream("192.0.2.10", 46000)
+        self._env = {
+            "PATH": f"{self.bindir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "HOME": str(self.home),
+        }
+
+    def _env_with(self, **extra: str) -> dict[str, str]:
+        env = {**os.environ, **self._env, **extra}
+        return env
+
+    def test_forward_argv_is_long_stream_plus_exit_on_forward_failure(self) -> None:
+        with mock.patch.object(ssh_transport, "_MUX_READY", True):
+            with mock.patch.dict(os.environ):
+                os.environ.pop(SSH_MUX_ENV, None)
+                argv = ssh_transport.local_forward_ssh_command(
+                    self.endpoint,
+                    local_host="127.0.0.1",
+                    local_port=47001,
+                    remote_host="127.0.0.1",
+                    remote_port=8000,
+                )
+        options = _option_map(argv)
+        self.assertEqual(argv[0], "ssh")
+        self.assertEqual(options["BatchMode"], "yes")
+        self.assertEqual(options["ControlMaster"], "no")
+        self.assertEqual(options["ControlPath"], "none")
+        self.assertEqual(options["ControlPersist"], "no")
+        self.assertEqual(options["ServerAliveInterval"], "30")
+        self.assertEqual(options["ServerAliveCountMax"], "10")
+        self.assertEqual(options["ExitOnForwardFailure"], "yes")
+        self.assertIn("-N", argv)
+        self.assertEqual(argv[argv.index("-L") + 1], "127.0.0.1:47001:127.0.0.1:8000")
+        self.assertEqual(argv[argv.index("-l") + 1], "root")
+        self.assertEqual(argv[argv.index("--") + 1], "192.0.2.10")
+        self.assertNotIn("ControlMaster=auto", argv)
+
+    def test_forward_upgrades_independent_endpoint_to_keepalive(self) -> None:
+        endpoint = Endpoint(host="192.0.2.10", port=46000, ssh_mux=False, keepalive=False)
+        with mock.patch.object(ssh_transport, "_MUX_READY", True):
+            argv = ssh_transport.local_forward_ssh_command(
+                endpoint,
+                local_host="127.0.0.1",
+                local_port=47002,
+                remote_host="127.0.0.1",
+                remote_port=9000,
+            )
+        options = _option_map(argv)
+        self.assertEqual(options["ControlMaster"], "no")
+        self.assertEqual(options["ServerAliveInterval"], "30")
+        self.assertEqual(options["ExitOnForwardFailure"], "yes")
+
+    def test_forward_refuses_a_muxed_endpoint(self) -> None:
+        cases = (
+            Endpoint(host="192.0.2.10", port=46000),
+            Endpoint(host="192.0.2.10", port=46000, ssh_mux=True),
+            Endpoint(host="192.0.2.10", port=46000, ssh_mux=True, keepalive=True),
+            Endpoint(host="192.0.2.10", port=46000, keepalive=True),
+        )
+        for endpoint in cases:
+            with self.subTest(ssh_mux=endpoint.ssh_mux, keepalive=endpoint.keepalive):
+                with mock.patch.object(ssh_transport, "_MUX_READY", True):
+                    with mock.patch.dict(os.environ):
+                        os.environ.pop(SSH_MUX_ENV, None)
+                        with self.assertRaises(RemoteExecutionError) as raised:
+                            ssh_transport.local_forward_ssh_command(
+                                endpoint,
+                                local_host="127.0.0.1",
+                                local_port=47003,
+                                remote_host="127.0.0.1",
+                                remote_port=8000,
+                            )
+                message = str(raised.exception)
+                self.assertIn("rc=0", message)
+                self.assertIn("first-option-wins", message)
+                self.assertIn("ControlPath", message)
+
+    def test_open_local_forward_waits_until_port_accepts(self) -> None:
+        argv_path = Path(self.temp.name) / "argv"
+        with mock.patch.dict(os.environ, self._env_with(FAKE_SSH_ARGV=str(argv_path), FAKE_SSH_MODE="listen")):
+            fwd = ssh_transport.open_local_forward(self.endpoint, 8123, ready_timeout_s=5.0)
+        try:
+            self.assertGreaterEqual(fwd.local_port, 1)
+            self.assertIsNone(fwd.poll())
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(1)
+                sock.connect(("127.0.0.1", fwd.local_port))
+            recorded = argv_path.read_text(encoding="utf-8").split("\0")
+            self.assertTrue(recorded[0] == "ssh" or recorded[0].endswith("/ssh"), recorded[0])
+            self.assertIn("-N", recorded)
+            self.assertIn("ExitOnForwardFailure=yes", recorded)
+        finally:
+            result = fwd.close()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIsNotNone(fwd.poll())
+        self.assertNotEqual(fwd.poll(), 0)
+
+    def test_dead_forward_is_never_rc_zero(self) -> None:
+        with mock.patch.dict(os.environ, self._env_with(FAKE_SSH_MODE="exit0")):
+            with self.assertRaises(RemoteExecutionError) as raised:
+                ssh_transport.open_local_forward(self.endpoint, 8123, ready_timeout_s=2.0)
+        message = str(raised.exception)
+        self.assertIn(f"rc={ssh_transport.FORWARD_DEAD_EXIT_CODE}", message)
+        self.assertIn("ssh rc=0", message)
+        self.assertNotIn("rc=0)", message.replace("ssh rc=0", ""))
+
+    def test_close_kills_child_process(self) -> None:
+        child_pid_path = Path(self.temp.name) / "child.pid"
+        with mock.patch.dict(os.environ, self._env_with(FAKE_SSH_MODE="child", FAKE_SSH_CHILD_PID=str(child_pid_path))):
+            fwd = ssh_transport.open_local_forward(self.endpoint, 8123, ready_timeout_s=5.0)
+        deadline = time.time() + 2
+        while time.time() < deadline and not child_pid_path.exists():
+            time.sleep(0.05)
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        os.kill(child_pid, 0)
+        parent_pid = fwd._proc.pid
+        result = fwd.close()
+        self.assertNotEqual(result.returncode, 0)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(parent_pid, 0)
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"forward child {child_pid} still alive after close()")
+
+    def test_wait_ready_times_out_and_close_reaps_hanging_ssh(self) -> None:
+        with mock.patch.dict(os.environ, self._env_with(FAKE_SSH_MODE="hang")):
+            with self.assertRaises(RemoteExecutionError) as raised:
+                ssh_transport.open_local_forward(self.endpoint, 8123, ready_timeout_s=0.6)
+        self.assertIn("timed out", str(raised.exception))
+
+
+class InteractiveBootstrapTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name) / "home"
+        self.home.mkdir()
+        self.bindir = Path(self.temp.name) / "bin"
+        self.bindir.mkdir()
+        _write_fake_ssh(self.bindir)
+        self.endpoint = Endpoint(host="192.0.2.10", port=22, user="ubuntu", ssh_mux=False)
+
+    def test_interactive_argv_is_password_bootstrap_off_the_mux(self) -> None:
+        argv = ssh_transport.interactive_ssh_command(
+            self.endpoint,
+            ["sh", "-c", "umask 077; mkdir -p ~/.ssh"],
+        )
+        options = _option_map(argv)
+        self.assertEqual(argv[0], "ssh")
+        self.assertEqual(options["BatchMode"], "no")
+        self.assertEqual(options["StrictHostKeyChecking"], "accept-new")
+        self.assertEqual(options["LogLevel"], "ERROR")
+        self.assertEqual(options["ConnectTimeout"], "10")
+        self.assertEqual(options["ControlMaster"], "no")
+        self.assertEqual(options["ControlPath"], "none")
+        self.assertEqual(options["ControlPersist"], "no")
+        self.assertEqual(options["PreferredAuthentications"], "password,keyboard-interactive")
+        self.assertEqual(options["PubkeyAuthentication"], "no")
+        self.assertEqual(options["NumberOfPasswordPrompts"], "1")
+        self.assertNotIn("BatchMode=yes", argv)
+        self.assertNotIn("ControlMaster=auto", argv)
+        self.assertNotIn("ServerAliveInterval", options)
+        self.assertNotIn("-i", argv)
+        self.assertEqual(argv[argv.index("-l") + 1], "ubuntu")
+        self.assertEqual(argv[argv.index("-p") + 1], "22")
+        self.assertEqual(argv[argv.index("--") + 1], "192.0.2.10")
+        self.assertEqual(argv[-3:], ["sh", "-c", "umask 077; mkdir -p ~/.ssh"])
+
+    def test_interactive_refuses_a_muxed_endpoint(self) -> None:
+        cases = (
+            Endpoint(host="192.0.2.10", port=22),
+            Endpoint(host="192.0.2.10", port=22, ssh_mux=True),
+            Endpoint(host="192.0.2.10", port=22, keepalive=True),
+        )
+        for endpoint in cases:
+            with self.subTest(ssh_mux=endpoint.ssh_mux, keepalive=endpoint.keepalive):
+                with mock.patch.object(ssh_transport, "_MUX_READY", True):
+                    with mock.patch.dict(os.environ):
+                        os.environ.pop(SSH_MUX_ENV, None)
+                        with self.assertRaises(RemoteExecutionError) as raised:
+                            ssh_transport.interactive_ssh_command(endpoint, ["true"])
+                message = str(raised.exception)
+                self.assertIn("password prompt", message)
+                self.assertIn("impossible", message.lower())
+
+    def test_run_interactive_inherits_and_returns_ssh_rc(self) -> None:
+        argv_path = Path(self.temp.name) / "argv"
+        env = {
+            **os.environ,
+            "PATH": f"{self.bindir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "HOME": str(self.home),
+            "FAKE_SSH_MODE": "interactive",
+            "FAKE_SSH_RC": "7",
+            "FAKE_SSH_ARGV": str(argv_path),
+        }
+        with mock.patch.dict(os.environ, env):
+            rc = ssh_transport.run_interactive(self.endpoint, ["sh", "-c", "printf ok"])
+        self.assertEqual(rc, 7)
+        recorded = argv_path.read_text(encoding="utf-8").split("\0")
+        self.assertEqual(recorded[-3:], ["sh", "-c", "printf ok"])
+        self.assertIn("BatchMode=no", recorded)
+        self.assertIn("PubkeyAuthentication=no", recorded)
 
 
 if __name__ == "__main__":

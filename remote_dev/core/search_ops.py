@@ -45,13 +45,165 @@ def resolve_path(raw):
         fail("path_outside_root", f"remote path is outside root: {resolved} not under {root}")
     return p, resolved
 
+def git_root(start):
+    cur = start.resolve()
+    for candidate in [cur, *cur.parents]:
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+def parse_gitignore_file(path):
+    rules = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return rules
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        negated = line.startswith("!")
+        if negated:
+            line = line[1:]
+        dir_only = line.endswith("/")
+        if dir_only:
+            line = line[:-1]
+        rules.append((line.replace("\\", "/"), negated, dir_only))
+    return rules
+
+def collect_gitignore_rules(base):
+    root = git_root(base) or base.resolve()
+    rules = []
+    seen = set()
+    candidates = [root / ".gitignore"]
+    try:
+        candidates.extend(sorted(root.rglob(".gitignore")))
+    except OSError:
+        pass
+    for gi in candidates:
+        try:
+            resolved = gi.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not gi.is_file():
+            continue
+        seen.add(resolved)
+        try:
+            rel_dir = "" if gi.parent.resolve() == root else str(gi.parent.resolve().relative_to(root)).replace("\\", "/")
+        except ValueError:
+            continue
+        for pattern, negated, dir_only in parse_gitignore_file(gi):
+            rules.append((rel_dir, pattern, negated, dir_only))
+    return root, rules
+
+def gitignore_fnmatch(pattern, path):
+    path = path.replace("\\", "/")
+    pattern = pattern.replace("\\", "/")
+    if pattern.startswith("/"):
+        pattern = pattern[1:]
+    if "**" in pattern:
+        regex_parts = []
+        i = 0
+        while i < len(pattern):
+            if pattern.startswith("**/", i):
+                regex_parts.append("(?:.*/)?")
+                i += 3
+                continue
+            if pattern.startswith("**", i):
+                regex_parts.append(".*")
+                i += 2
+                continue
+            ch = pattern[i]
+            if ch in ".^$+{}[]|()\\":
+                regex_parts.append("\\" + ch)
+            elif ch == "*":
+                regex_parts.append("[^/]*")
+            elif ch == "?":
+                regex_parts.append("[^/]")
+            else:
+                regex_parts.append(ch)
+            i += 1
+        import re
+        return re.fullmatch("".join(regex_parts), path) is not None
+    return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path.split("/")[-1], pattern)
+
+def gitignore_rule_hits(anchor, pattern, path, is_dir, dir_only):
+    path = path.replace("\\", "/")
+    if anchor:
+        prefix = anchor + "/"
+        if path != anchor and not path.startswith(prefix):
+            return False
+        candidate = "" if path == anchor else path[len(prefix):]
+        if not candidate:
+            return False
+    else:
+        candidate = path
+
+    def matches(rel, rel_is_dir):
+        if dir_only and not rel_is_dir:
+            return False
+        if "/" not in pattern.strip("/"):
+            return any(gitignore_fnmatch(pattern, part) for part in rel.split("/")) or gitignore_fnmatch(pattern, rel)
+        return gitignore_fnmatch(pattern, rel)
+
+    if matches(candidate, is_dir):
+        return True
+    if dir_only:
+        parts = candidate.split("/")
+        for index in range(1, len(parts)):
+            if matches("/".join(parts[:index]), True):
+                return True
+    return False
+
+def is_gitignored(rel_from_root, is_dir, rules):
+    ignored = False
+    path = rel_from_root.replace("\\", "/")
+    for anchor, pattern, negated, dir_only in rules:
+        if gitignore_rule_hits(anchor, pattern, path, is_dir, dir_only):
+            ignored = not negated
+    return ignored
+
+def apply_gitignore(base, matches):
+    warnings = []
+    git = shutil.which("git")
+    if git:
+        probe = subprocess.run(
+            [git, "-C", str(base), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True,
+        )
+        if probe.returncode == 0 and probe.stdout.strip() == "true":
+            rels = [item["relpath"] for item in matches]
+            chk = subprocess.run(
+                [git, "-C", str(base), "check-ignore", "-z", "--stdin"],
+                input="".join(rel + "\0" for rel in rels).encode("utf-8"),
+                capture_output=True,
+            )
+            ignored = {part.decode("utf-8", "replace") for part in chk.stdout.split(b"\0") if part}
+            return [item for item in matches if item["relpath"] not in ignored], warnings
+    root, rules = collect_gitignore_rules(base)
+    if not rules:
+        return matches, warnings
+    try:
+        base_from_root = "" if base.resolve() == root else str(base.resolve().relative_to(root)).replace("\\", "/")
+    except ValueError:
+        return matches, warnings
+    kept = []
+    for item in matches:
+        rel = item["relpath"].replace("\\", "/")
+        rel_from_root = rel if not base_from_root else (base_from_root + "/" + rel)
+        if not is_gitignored(rel_from_root, item.get("type") == "directory", rules):
+            kept.append(item)
+    return kept, warnings
+
 if op == "glob":
     base, resolved = resolve_path(payload.get("path") or payload["root"])
     if not base.is_dir():
         fail("not_directory", f"RemoteGlob path is not a directory: {base}")
     pattern = payload.get("pattern") or "*"
     limit = int(payload.get("limit") or 100)
+    respect_gitignore = bool(payload.get("respect_gitignore"))
     matches = []
+    warnings = []
     # One-shot helper: chdir so glob(pattern, recursive=True) works on Python 3.9 (no root_dir).
     os.chdir(str(base))
     for item in glob_mod.glob(pattern, recursive=True):
@@ -61,8 +213,11 @@ if op == "glob":
         except OSError:
             continue
         matches.append({"path": str(path), "relpath": item, "type": "directory" if path.is_dir() else "file", "mtime_ns": st.st_mtime_ns, "size": st.st_size})
+    if respect_gitignore:
+        matches, gi_warnings = apply_gitignore(base, matches)
+        warnings.extend(gi_warnings)
     matches.sort(key=lambda row: row["mtime_ns"], reverse=True)
-    print(json.dumps({"status": "ok", "matches": matches[:limit], "truncated": len(matches) > limit}, sort_keys=True))
+    print(json.dumps({"status": "ok", "matches": matches[:limit], "truncated": len(matches) > limit, "warnings": warnings}, sort_keys=True))
     raise SystemExit(0)
 
 if op == "grep":
@@ -229,6 +384,7 @@ def remote_glob(
     )
     matches = data.get("matches", []) if isinstance(data.get("matches"), list) else []
     status = str(data.get("status", "failed"))
+    warnings = data.get("warnings", []) if isinstance(data.get("warnings"), list) else []
     visible_matches, text_truncated = _compact_matches([str(item.get("path", item)) for item in matches])
     result = make_result(
         tool="remote.glob",
@@ -239,7 +395,7 @@ def remote_glob(
         started_at=started,
         duration_ms=_duration_ms(start),
         preview={"matches": visible_matches, "truncated": bool(data.get("truncated", False)) or text_truncated},
-        warnings=["respect_gitignore is not implemented for RemoteGlob"] if respect_gitignore else [],
+        warnings=warnings,
         extra={"matches": visible_matches, "truncated": bool(data.get("truncated", False)) or text_truncated, "error": data.get("error")},
     )
     text = compact_text("\n".join(visible_matches) + ("\n<truncated>\n" if data.get("truncated") or text_truncated else "\n"))
