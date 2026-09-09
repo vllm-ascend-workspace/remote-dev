@@ -42,6 +42,49 @@ def _option_map(cmd: list[str]) -> dict[str, str]:
     return values
 
 
+def _require_openssh() -> str:
+    path = shutil.which("ssh")
+    if path is None:
+        raise AssertionError(
+            "OpenSSH ssh is required to parse composed argv with ssh -G; "
+            "a skipped parser test is how options-after-destination shipped"
+        )
+    return path
+
+
+def _tokens_after_host(argv: list[str]) -> list[str]:
+    return list(argv[argv.index("--") + 2 :])
+
+
+def _openssh_G(
+    argv: list[str],
+    *,
+    ssh: str | None = None,
+    config_file: str = "/dev/null",
+    home: str | None = None,
+) -> tuple[dict[str, str], str]:
+    binary = ssh or _require_openssh()
+    if argv[0] != "ssh" and not argv[0].endswith("/ssh"):
+        raise AssertionError(f"composed argv must start with ssh, got {argv[0]!r}")
+    env = dict(os.environ)
+    if home is not None:
+        env["HOME"] = home
+    eval_cmd = [binary, "-G", "-F", config_file, *argv[1:]]
+    proc = subprocess.run(eval_cmd, capture_output=True, text=True, check=False, env=env)
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"ssh -G failed (rc={proc.returncode}): {(proc.stderr or proc.stdout or '')[:2000]}\n"
+            f"argv={eval_cmd!r}"
+        )
+    parsed: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        key, _, value = line.partition(" ")
+        parsed[key.lower()] = value.strip()
+    return parsed, proc.stdout
+
+
 class SshTransportTests(unittest.TestCase):
     def test_run_remote_python_quotes_multiline_code_as_one_remote_command(self) -> None:
         endpoint = Endpoint(host="1.2.3.4", port=46000)
@@ -293,8 +336,7 @@ class SshMuxIsolationTests(unittest.TestCase):
         self.assertEqual(parent_before.get(SSH_MUX_ENV), os.environ.get(SSH_MUX_ENV))
 
     def test_openssh_G_evaluates_independent_mux_options(self) -> None:
-        if shutil.which("ssh") is None:
-            self.skipTest("OpenSSH ssh is not available for -G configuration evaluation")
+        ssh = _require_openssh()
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "ssh_config"
             fake_path = str(Path(tmp) / "cm-%C")
@@ -305,30 +347,15 @@ class SshMuxIsolationTests(unittest.TestCase):
                 "  ControlPersist 120\n"
             )
             cmd = self._cmd_with_mux("0")
-            eval_cmd = [cmd[0], "-G", "-F", str(config_path), *cmd[1:]]
-            proc = subprocess.run(eval_cmd, capture_output=True, text=True, check=False)
-            if proc.returncode != 0:
-                detail = (proc.stderr or proc.stdout or "").strip()
-                self.skipTest("ssh -G configuration evaluation is unavailable" + (f": {detail}" if detail else ""))
-            parsed: dict[str, str] = {}
-            for line in proc.stdout.splitlines():
-                if not line.strip():
-                    continue
-                key, _, value = line.partition(" ")
-                parsed[key.lower()] = value.strip()
-            if "controlmaster" not in parsed or "controlpersist" not in parsed:
-                keys = ",".join(sorted(parsed)[:30])
-                sample = (proc.stdout or proc.stderr or "")[:200]
-                self.skipTest(
-                    "ssh -G did not report ControlMaster/ControlPersist "
-                    f"(keys={keys!r} sample={sample!r})"
-                )
+            parsed, stdout = _openssh_G(cmd, config_file=str(config_path), ssh=ssh)
+            self.assertIn("controlmaster", parsed, stdout[:400])
+            self.assertIn("controlpersist", parsed, stdout[:400])
             path = parsed.get("controlpath", "none")
             self.assertIn(parsed["controlmaster"].lower(), {"false", "no"})
             self.assertEqual(path.lower(), "none")
             self.assertIn(parsed["controlpersist"].lower(), {"no", "0", "false"})
             self.assertNotIn(fake_path.lower(), path.lower())
-            self.assertNotIn(fake_path, proc.stdout)
+            self.assertNotIn(fake_path, stdout)
 
     def test_unsupported_mux_values_are_configuration_errors(self) -> None:
         for value in ("", "2", "false", "true", "off", "yes", "no", "auto", "00"):
@@ -734,6 +761,11 @@ class LocalForwardTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("-l") + 1], "root")
         self.assertEqual(argv[argv.index("--") + 1], "192.0.2.10")
         self.assertNotIn("ControlMaster=auto", argv)
+        destination = argv.index("--")
+        self.assertLess(argv.index("ExitOnForwardFailure=yes"), destination)
+        self.assertLess(argv.index("-N"), destination)
+        self.assertLess(argv.index("-L"), destination)
+        self.assertEqual(argv[destination + 1 :], ["192.0.2.10"])
 
     def test_forward_upgrades_independent_endpoint_to_keepalive(self) -> None:
         endpoint = Endpoint(host="192.0.2.10", port=46000, ssh_mux=False, keepalive=False)
@@ -906,6 +938,102 @@ class InteractiveBootstrapTests(unittest.TestCase):
         self.assertEqual(recorded[-3:], ["sh", "-c", "printf ok"])
         self.assertIn("BatchMode=no", recorded)
         self.assertIn("PubkeyAuthentication=no", recorded)
+
+
+class OpensshConfigParseTests(unittest.TestCase):
+    """Real ``ssh -G`` must see options; a fake ssh on PATH cannot catch D1."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.ssh = _require_openssh()
+
+    def setUp(self) -> None:
+        self.home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.home.cleanup)
+
+    def parse(self, argv: list[str]) -> tuple[dict[str, str], str]:
+        return _openssh_G(argv, ssh=self.ssh, home=self.home.name)
+
+    def test_openssh_G_parses_forward_argv(self) -> None:
+        endpoint = Endpoint.for_long_stream("192.0.2.10", 46000)
+        argv = ssh_transport.local_forward_ssh_command(
+            endpoint,
+            local_host="127.0.0.1",
+            local_port=47001,
+            remote_host="127.0.0.1",
+            remote_port=8000,
+        )
+        self.assertEqual(_tokens_after_host(argv), [])
+        parsed, stdout = self.parse(argv)
+        self.assertEqual(parsed.get("exitonforwardfailure", "").lower(), "yes", stdout)
+        localforward = parsed.get("localforward", "")
+        self.assertIn("47001", localforward, stdout)
+        self.assertIn("8000", localforward, stdout)
+        self.assertIn("127.0.0.1", localforward, stdout)
+        self.assertEqual(parsed.get("sessiontype", "").lower(), "none", stdout)
+        self.assertIn(parsed.get("controlmaster", "").lower(), {"false", "no"}, stdout)
+        self.assertEqual(parsed.get("serveraliveinterval"), "30", stdout)
+        self.assertEqual(parsed.get("serveralivecountmax"), "10", stdout)
+
+    def test_openssh_G_parses_interactive_argv(self) -> None:
+        endpoint = Endpoint(host="192.0.2.10", port=22, user="ubuntu", ssh_mux=False)
+        argv = ssh_transport.interactive_ssh_command(endpoint, ["sh", "-c", "true"])
+        self.assertEqual(_tokens_after_host(argv), ["sh", "-c", "true"])
+        parsed, stdout = self.parse(argv)
+        self.assertEqual(parsed.get("batchmode", "").lower(), "no", stdout)
+        self.assertEqual(
+            parsed.get("preferredauthentications"),
+            "password,keyboard-interactive",
+            stdout,
+        )
+        self.assertIn(parsed.get("pubkeyauthentication", "").lower(), {"false", "no"}, stdout)
+        self.assertIn(parsed.get("controlmaster", "").lower(), {"false", "no"}, stdout)
+        self.assertEqual(parsed.get("numberofpasswordprompts"), "1", stdout)
+
+    def test_openssh_G_parses_for_long_stream_argv(self) -> None:
+        endpoint = Endpoint.for_long_stream("192.0.2.10", 46000)
+        argv = ssh_transport.ssh_base_cmd(endpoint)
+        self.assertEqual(_tokens_after_host(argv), [])
+        parsed, stdout = self.parse(argv)
+        self.assertEqual(parsed.get("batchmode", "").lower(), "yes", stdout)
+        self.assertIn(parsed.get("controlmaster", "").lower(), {"false", "no"}, stdout)
+        self.assertEqual(parsed.get("controlpath", "none").lower(), "none", stdout)
+        self.assertIn(parsed.get("controlpersist", "").lower(), {"no", "0", "false"}, stdout)
+        self.assertEqual(parsed.get("serveraliveinterval"), "30", stdout)
+        self.assertEqual(parsed.get("serveralivecountmax"), "10", stdout)
+        self.assertNotEqual(parsed.get("sessiontype", "").lower(), "none", stdout)
+        self.assertNotEqual(parsed.get("exitonforwardfailure", "").lower(), "yes", stdout)
+
+    def test_openssh_G_ssh_base_cmd_callers_do_not_smuggle_options_past_destination(self) -> None:
+        endpoint = Endpoint.for_long_stream("192.0.2.10", 46000)
+        composers = {
+            "ssh_base_cmd": ssh_transport.ssh_base_cmd(endpoint),
+            "stream_ssh_command": ssh_transport.stream_ssh_command(endpoint, "analyze", timeout_ms=120000),
+            "run_script": [*ssh_transport.ssh_base_cmd(endpoint), "bash", "-s"],
+            "run_bytes": [*ssh_transport.ssh_base_cmd(endpoint), "bash -c true"],
+            "run_remote_python": [*ssh_transport.ssh_base_cmd(endpoint), "python3 -c pass"],
+            "local_forward": ssh_transport.local_forward_ssh_command(
+                endpoint,
+                local_host="127.0.0.1",
+                local_port=47001,
+                remote_host="127.0.0.1",
+                remote_port=8000,
+            ),
+        }
+        option_flags = {"-o", "-N", "-L", "-i", "-l", "-p", "-F", "-G"}
+        for name, argv in composers.items():
+            with self.subTest(composer=name):
+                after = _tokens_after_host(argv)
+                smuggled = [token for token in after if token in option_flags or token.startswith("-o")]
+                self.assertEqual(smuggled, [], f"{name} put option tokens after the host: {argv!r}")
+                parsed, stdout = self.parse(argv)
+                self.assertIn(parsed.get("controlmaster", "").lower(), {"false", "no"}, stdout)
+                self.assertEqual(parsed.get("serveraliveinterval"), "30", stdout)
+                if name == "local_forward":
+                    self.assertEqual(parsed.get("sessiontype", "").lower(), "none", stdout)
+                    self.assertEqual(_tokens_after_host(argv), [])
+                else:
+                    self.assertNotEqual(parsed.get("sessiontype", "").lower(), "none", stdout)
 
 
 if __name__ == "__main__":

@@ -200,7 +200,16 @@ def _keepalive_options(endpoint: Endpoint) -> list[str]:
     ]
 
 
-def ssh_base_cmd(endpoint: Endpoint) -> list[str]:
+def _ssh_cmd(endpoint: Endpoint, option_tokens: Sequence[str] = ()) -> list[str]:
+    """Compose an SSH argv. ``option_tokens`` are placed before ``--``.
+
+    ``--`` stops OpenSSH option parsing. Anything after the host is a
+    remote command, not an option: ``-N`` / ``-L`` / ``-o`` appended past
+    the destination are executed on the far side and never take effect.
+    This helper is the only place that emits ``--``, so package callers
+    cannot reintroduce that split. ``option_tokens`` is not a public
+    extra-options escape hatch; only this module passes tokens it owns.
+    """
     if _uses_shared_mux(endpoint):
         mux_options = _control_master_options(endpoint.identity_file)
     else:
@@ -217,6 +226,7 @@ def ssh_base_cmd(endpoint: Endpoint) -> list[str]:
         f"ConnectTimeout={max(1, int(endpoint.connect_timeout_ms / 1000))}",
         *mux_options,
         *_keepalive_options(endpoint),
+        *option_tokens,
     ]
     if endpoint.identity_file:
         cmd.extend(["-i", endpoint.identity_file])
@@ -225,6 +235,10 @@ def ssh_base_cmd(endpoint: Endpoint) -> list[str]:
     # `host`. `Endpoint.destination()` (`user@host`) is display-only.
     cmd.extend(["-l", endpoint.user, "-p", str(endpoint.port), "--", endpoint.host])
     return cmd
+
+
+def ssh_base_cmd(endpoint: Endpoint) -> list[str]:
+    return _ssh_cmd(endpoint)
 
 
 def stream_remote_payload(script: str, timeout_ms: int | None) -> str:
@@ -550,14 +564,16 @@ def local_forward_ssh_command(
     remote_host = _validate_forward_host(remote_host, field="remote_host")
     local_port = _validate_port(local_port, field="local_port")
     remote_port = _validate_port(remote_port, field="remote_port")
-    return [
-        *ssh_base_cmd(endpoint),
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-N",
-        "-L",
-        f"{local_host}:{local_port}:{remote_host}:{remote_port}",
-    ]
+    return _ssh_cmd(
+        endpoint,
+        (
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-N",
+            "-L",
+            f"{local_host}:{local_port}:{remote_host}:{remote_port}",
+        ),
+    )
 
 
 def _stop_process_group(proc: subprocess.Popen[Any], *, timeout_s: float = 5.0) -> int:
