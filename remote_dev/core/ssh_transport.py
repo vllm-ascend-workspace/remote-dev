@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import os
@@ -10,8 +11,8 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -308,16 +309,29 @@ def run_stream(
     timeout_ms: int | None = None,
     forward_prefix: str = "[remote] ",
     output: TextIO | None = None,
+    on_output: Callable[[str, str], None] | None = None,
+    merge_stderr: bool = True,
 ) -> RemoteCompleted:
     """Run a remote command, forwarding stdout/stderr live as they arrive.
 
     This is a transport primitive. It returns :class:`RemoteCompleted` with
-    the remote exit code (or ``timed_out=True``). Live bytes are written to
-    ``output`` (default ``stderr``) and are not stuffed into
+    the remote exit code (or ``timed_out=True``). By default, live bytes are
+    written to ``output`` (default ``stderr``) and are not stuffed into
     ``RemoteCompleted.stdout``. It does **not** emit ``remote-dev.result.v1``;
     that contract is the result of one finished tool call. A later tool
     wrapper that calls this should wrap the completed invocation in
     ``make_result``.
+
+    ``on_output(channel, text)`` is a generic line callback. ``channel`` is
+    ``"stdout"`` or ``"stderr"``. This module does not parse application
+    sentinels.
+
+    Default ``merge_stderr=True`` keeps the historical merged-stream
+    behaviour: stdout and stderr are joined, forwarded with
+    ``forward_prefix``, and ``RemoteCompleted.stdout`` / ``.stderr`` stay
+    empty (except the timeout message). Pass ``merge_stderr=False`` to keep
+    the channels separate, capture both, and invoke ``on_output`` per line.
+    Separate-channel mode does not auto-forward unless ``output`` is set.
 
     Not ``remote.job_*``. Jobs are detached (``nohup``), persist a job dir,
     and ``job_tail`` snapshots log files through ``run_script``. An attached
@@ -346,71 +360,350 @@ def run_stream(
     a multiplexed endpoint: ControlMaster delegates the session to the
     mux master and the client exits rc=0, which looks like success.
     """
-    dest = sys.stderr if output is None else output
+    dest = sys.stderr if output is None and merge_stderr else output
     cmd = stream_ssh_command(endpoint, script, timeout_ms=timeout_ms)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
+        stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+        bufsize=0,
     )
-    return _read_stream(proc, timeout_ms=timeout_ms, forward_prefix=forward_prefix, output=dest)
+    return _read_attached(
+        proc,
+        timeout_ms=timeout_ms,
+        forward_prefix=forward_prefix,
+        output=dest,
+        on_output=on_output,
+        capture=not merge_stderr,
+    )
+
+
+_STREAM_READ_BYTES = 4096
+
+
+def _read_fd(fd: int) -> bytes | None:
+    """Read available bytes. ``None`` means EOF; ``b''`` means try again."""
+    try:
+        chunk = os.read(fd, _STREAM_READ_BYTES)
+    except BlockingIOError:
+        return b""
+    except OSError:
+        return None
+    return chunk if chunk else None
+
+
+@dataclass
+class _StreamChannel:
+    name: str
+    fd: int
+    decoder: Any = field(default_factory=lambda: codecs.getincrementaldecoder("utf-8")("replace"))
+    pending: str = ""
+    captured: list[str] = field(default_factory=list)
+
+
+def _emit_stream_text(
+    text: str,
+    *,
+    channel: str,
+    forward_prefix: str,
+    output: TextIO | None,
+    on_output: Callable[[str, str], None] | None,
+    captured: list[str] | None,
+) -> None:
+    if not text:
+        return
+    if on_output is not None:
+        on_output(channel, text)
+    if captured is not None:
+        captured.append(text)
+    if output is None:
+        return
+    output.write(forward_prefix + text if forward_prefix and not text.startswith(forward_prefix) else text)
+    output.flush()
+
+
+def _flush_channel_lines(
+    channel: _StreamChannel,
+    *,
+    text: str,
+    forward_prefix: str,
+    output: TextIO | None,
+    on_output: Callable[[str, str], None] | None,
+    capture: bool,
+    final: bool,
+) -> None:
+    channel.pending += text
+    while True:
+        newline = channel.pending.find("\n")
+        if newline < 0:
+            break
+        line = channel.pending[: newline + 1]
+        channel.pending = channel.pending[newline + 1 :]
+        _emit_stream_text(
+            line,
+            channel=channel.name,
+            forward_prefix=forward_prefix,
+            output=output,
+            on_output=on_output,
+            captured=channel.captured if capture else None,
+        )
+    if final and channel.pending:
+        _emit_stream_text(
+            channel.pending,
+            channel=channel.name,
+            forward_prefix=forward_prefix,
+            output=output,
+            on_output=on_output,
+            captured=channel.captured if capture else None,
+        )
+        channel.pending = ""
+
+
+def _reap_process(proc: subprocess.Popen[bytes], *, timeout_s: float | None = 2.0) -> int | None:
+    if proc.poll() is not None:
+        return proc.returncode
+    try:
+        return proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def _kill_and_reap(proc: subprocess.Popen[bytes]) -> int | None:
+    if proc.poll() is None:
+        proc.kill()
+    if proc.poll() is not None:
+        return proc.returncode
+    try:
+        return proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        return proc.poll()
+
+
+def _close_pipe(stream: Any) -> None:
+    if stream is None:
+        return
+    try:
+        stream.close()
+    except OSError:
+        pass
+
+
+def _read_attached(
+    proc: subprocess.Popen[bytes],
+    *,
+    timeout_ms: int | None,
+    forward_prefix: str,
+    output: TextIO | None,
+    on_output: Callable[[str, str], None] | None,
+    capture: bool,
+) -> RemoteCompleted:
+    """Deadline-aware reader for merged or separate SSH streams.
+
+    Uses ``select`` + ``os.read`` so a partial line cannot block past the
+    wall-clock deadline. ``capture=False`` is the historical merged mode
+    (forward live, leave ``RemoteCompleted.stdout`` empty).
+    """
+    assert proc.stdout is not None
+    channels = [_StreamChannel(name="stdout", fd=proc.stdout.fileno())]
+    if proc.stderr is not None and proc.stderr is not proc.stdout:
+        channels.append(_StreamChannel(name="stderr", fd=proc.stderr.fileno()))
+    by_fd = {channel.fd: channel for channel in channels}
+    open_fds = set(by_fd)
+    for fd in open_fds:
+        os.set_blocking(fd, False)
+    started = time.monotonic()
+    deadline = None if timeout_ms is None or timeout_ms <= 0 else started + (timeout_ms / 1000)
+    timeout_message = (
+        f"remote command exceeded {timeout_ms} ms wall-clock limit" if timeout_ms is not None else ""
+    )
+
+    def captured_stdout() -> str:
+        stdout = next(channel for channel in channels if channel.name == "stdout")
+        return "".join(stdout.captured)
+
+    def captured_stderr() -> str:
+        stderr = next((channel for channel in channels if channel.name == "stderr"), None)
+        return "" if stderr is None else "".join(stderr.captured)
+
+    def finalize_open_channels() -> None:
+        for channel in channels:
+            leftover = ""
+            try:
+                leftover = channel.decoder.decode(b"", final=True)
+            except Exception:
+                leftover = ""
+            _flush_channel_lines(
+                channel,
+                text=leftover,
+                forward_prefix=forward_prefix,
+                output=output,
+                on_output=on_output,
+                capture=capture,
+                final=True,
+            )
+
+    def timed_out_result() -> RemoteCompleted:
+        finalize_open_channels()
+        stderr = timeout_message
+        if capture:
+            extra = captured_stderr()
+            if extra:
+                if not extra.endswith("\n") and timeout_message:
+                    extra = extra + "\n"
+                stderr = extra + timeout_message
+        return RemoteCompleted(
+            None,
+            captured_stdout() if capture else "",
+            stderr,
+            timed_out=True,
+        )
+
+    def close_channel(channel: _StreamChannel) -> None:
+        stream = proc.stdout if channel.name == "stdout" else proc.stderr
+        _close_pipe(stream)
+
+    def close_pipes() -> None:
+        seen: set[int] = set()
+        for stream in (proc.stdout, proc.stderr):
+            if stream is None or id(stream) in seen:
+                continue
+            seen.add(id(stream))
+            _close_pipe(stream)
+
+    def remaining_wait() -> float | None:
+        if deadline is None:
+            return STREAM_SELECT_SLICE_SECONDS
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 0.0
+        return min(remaining, STREAM_SELECT_SLICE_SECONDS)
+
+    try:
+        while True:
+            wait = remaining_wait()
+            if wait is not None and wait <= 0:
+                _kill_and_reap(proc)
+                return timed_out_result()
+            if not open_fds:
+                # Pipes have closed. Wait until the real deadline (or forever
+                # if none). A select-slice TimeoutExpired must not kill here:
+                # grandchildren can close stdout/stderr while the child still
+                # has work left.
+                if proc.poll() is not None:
+                    returncode = proc.wait()
+                    return RemoteCompleted(
+                        returncode,
+                        captured_stdout() if capture else "",
+                        captured_stderr() if capture else "",
+                    )
+                if deadline is None:
+                    returncode = proc.wait()
+                    return RemoteCompleted(
+                        returncode,
+                        captured_stdout() if capture else "",
+                        captured_stderr() if capture else "",
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _kill_and_reap(proc)
+                    return timed_out_result()
+                try:
+                    returncode = proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    _kill_and_reap(proc)
+                    return timed_out_result()
+                return RemoteCompleted(
+                    returncode,
+                    captured_stdout() if capture else "",
+                    captured_stderr() if capture else "",
+                )
+            ready, _, _ = select.select(list(open_fds), [], [], wait)
+            if ready:
+                for fd in ready:
+                    channel = by_fd[fd]
+                    chunk = _read_fd(fd)
+                    if chunk is None:
+                        _flush_channel_lines(
+                            channel,
+                            text=channel.decoder.decode(b"", final=True),
+                            forward_prefix=forward_prefix,
+                            output=output,
+                            on_output=on_output,
+                            capture=capture,
+                            final=True,
+                        )
+                        open_fds.discard(fd)
+                        close_channel(channel)
+                        continue
+                    if not chunk:
+                        continue
+                    _flush_channel_lines(
+                        channel,
+                        text=channel.decoder.decode(chunk),
+                        forward_prefix=forward_prefix,
+                        output=output,
+                        on_output=on_output,
+                        capture=capture,
+                        final=False,
+                    )
+                continue
+            if proc.poll() is None:
+                continue
+            for fd in list(open_fds):
+                channel = by_fd[fd]
+                while True:
+                    chunk = _read_fd(fd)
+                    if not chunk:
+                        break
+                    _flush_channel_lines(
+                        channel,
+                        text=channel.decoder.decode(chunk),
+                        forward_prefix=forward_prefix,
+                        output=output,
+                        on_output=on_output,
+                        capture=capture,
+                        final=False,
+                    )
+                _flush_channel_lines(
+                    channel,
+                    text=channel.decoder.decode(b"", final=True),
+                    forward_prefix=forward_prefix,
+                    output=output,
+                    on_output=on_output,
+                    capture=capture,
+                    final=True,
+                )
+                open_fds.discard(fd)
+                close_channel(channel)
+            returncode = proc.wait()
+            return RemoteCompleted(
+                returncode,
+                captured_stdout() if capture else "",
+                captured_stderr() if capture else "",
+            )
+    finally:
+        close_pipes()
+        if proc.poll() is None:
+            _kill_and_reap(proc)
 
 
 def _read_stream(
-    proc: subprocess.Popen,
+    proc: subprocess.Popen[bytes],
     *,
     timeout_ms: int | None,
     forward_prefix: str,
     output: TextIO,
+    on_output: Callable[[str, str], None] | None = None,
 ) -> RemoteCompleted:
-    """Local reader half of silent-hang handling. ``proc.stdout`` is required."""
-    assert proc.stdout is not None
-    fd = proc.stdout.fileno()
-    started = time.monotonic()
-    deadline = None if timeout_ms is None or timeout_ms <= 0 else started + (timeout_ms / 1000)
-    timed_out = False
-    try:
-        while True:
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    proc.kill()
-                    timed_out = True
-                    return RemoteCompleted(
-                        None,
-                        "",
-                        f"remote command exceeded {timeout_ms} ms wall-clock limit",
-                        timed_out=True,
-                    )
-                wait = min(remaining, STREAM_SELECT_SLICE_SECONDS)
-            else:
-                wait = STREAM_SELECT_SLICE_SECONDS
-            ready, _, _ = select.select([fd], [], [], wait)
-            if ready:
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                output.write(forward_prefix + line if not line.startswith(forward_prefix) else line)
-                output.flush()
-            elif proc.poll() is not None:
-                remainder = proc.stdout.read()
-                if remainder:
-                    output.write(forward_prefix + remainder if not remainder.startswith(forward_prefix) else remainder)
-                    output.flush()
-                break
-        returncode = proc.wait()
-        return RemoteCompleted(returncode, "", "", timed_out=timed_out)
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+    """Merged-stream wrapper around :func:`_read_attached` for existing tests."""
+    return _read_attached(
+        proc,
+        timeout_ms=timeout_ms,
+        forward_prefix=forward_prefix,
+        output=output,
+        on_output=on_output,
+        capture=False,
+    )
 
 
 def run_bytes(
