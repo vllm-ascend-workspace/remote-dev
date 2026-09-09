@@ -91,6 +91,8 @@ remote-dev resolves endpoints from explicit fields and nothing else:
 | `runtime_env_file`   | unset                | Remote profile script (`REMOTE_DEV_RUNTIME_ENV_FILE`)|
 | `identity_file`      | unset                | SSH private key                                      |
 | `connect_timeout_ms` | `10000`              | SSH connect timeout                                  |
+| `ssh_mux`            | process default      | Per-endpoint ControlMaster; see multiplexing below   |
+| `keepalive`          | `false`              | ServerAlive probes (mechanism; not "long stream")    |
 | `alias`              | unset                | Name from the endpoint alias files                   |
 
 Resolution order in `remote_dev.core.endpoint.resolve_endpoint`:
@@ -173,9 +175,9 @@ Contract:
 - `resolve(payload) -> dict | Endpoint | None`. Return `None` to decline.
   A `dict` needs `host` and `port`; remote-dev builds the `Endpoint`, lets
   explicit caller fields (`user`, `root`, `cwd`, `runtime_env`,
-  `runtime_env_file`, `identity_file`, `connect_timeout_ms`) override the
-  resolver's values, sets `kind` to `resolver:<name>` unless provided, and
-  records `source.resolver`.
+  `runtime_env_file`, `identity_file`, `connect_timeout_ms`, `ssh_mux`,
+  `keepalive`) override the resolver's values, sets `kind` to
+  `resolver:<name>` unless provided, and records `source.resolver`.
 - `fields` declares the payload keys the resolver claims. They are added to
   `selector_fields()` so `has_selector()` and the job tools treat them as
   "an endpoint was requested". Tool schemas keep
@@ -239,18 +241,49 @@ remote-dev bash --selector session_id=abc --command 'nproc'
 | `REMOTE_DEV_ENDPOINTS_FILE`     | Alias file(s), `os.pathsep` separated, read first         |
 | `REMOTE_DEV_STATE_DIR`          | Local state directory (default `<cwd>/state`)             |
 | `REMOTE_DEV_SSH_MUX_DIR`        | OpenSSH ControlMaster dir (default `~/.ssh/remote-dev-mux`)|
-| `REMOTE_DEV_SSH_MUX`            | Process SSH multiplexing: unset or `1` uses the shared ControlMaster; `0` forces independent connections; other values error |
+| `REMOTE_DEV_SSH_MUX`            | Process-wide SSH multiplexing *default*: unset or `1` uses the shared ControlMaster; `0` forces independent connections; other values error. An endpoint's `ssh_mux` overrides this for that endpoint only. |
 | `REMOTE_DEV_SESSION_ID`         | Read-ledger scope when no client id is given              |
 
-`REMOTE_DEV_SSH_MUX` is process-scoped and is read without changing global SSH
-configuration or the shared ControlMaster socket. Leave it unset or set it to
-`1` to keep today's shared-mux path, including the per-identity `ControlPath`
-suffix. Set it to exact `0` in a CLI process that must not join the shared
-master (`ControlMaster=no`, `ControlPath=none`, `ControlPersist=no` on every
-SSH invocation from that process). Accepted values are unset, `1`, and `0`;
-any other value is a configuration error. Ordinary serving and parity calls
-keep the default shared mux; a caller that needs independent connections must
-set `0` in that process.
+`REMOTE_DEV_SSH_MUX` is the process-wide default and is read without changing
+global SSH configuration or the shared ControlMaster socket. Leave it unset or
+set it to `1` to keep today's shared-mux path, including the per-identity
+`ControlPath` suffix. Set it to exact `0` in a CLI process that must not join
+the shared master (`ControlMaster=no`, `ControlPath=none`, `ControlPersist=no`
+on every SSH invocation from that process that does not set `ssh_mux`).
+Accepted values are unset, `1`, and `0`; any other value is a configuration
+error. Ordinary serving and parity calls keep the default shared mux.
+
+A single process may do both at once. Set `ssh_mux=false` (CLI `--no-ssh-mux`)
+on the endpoints that must stay off the shared master, and leave the rest on
+the default. This is not optional for long-lived connections such as
+`ssh -N -L` tunnels: ControlMaster delegates `-N` forwards to the mux master
+and the client exits rc=0 immediately, tearing the tunnel down. OpenSSH
+first-option-wins semantics make a later `ControlMaster=no` override
+ineffective, so the independent triple has to be chosen before the command is
+built. `ControlMaster=no` alone is not enough — a client can still attach to
+an existing `ControlPath`.
+
+`keepalive=true` (CLI `--keepalive`) adds `ServerAliveInterval=30` and
+`ServerAliveCountMax=10`. That is a mechanism flag, orthogonal to mux, and
+conditional rather than always-on: a slow multi-hour stream otherwise dies
+to an idle timeout somewhere in the path, but attaching ServerAlive to short
+multiplexed commands would set TCP keepalive policy on the shared
+ControlMaster (the master owns the TCP connection; first-option-wins).
+
+Hour-scale streams and `ssh -N -L` tunnels use one named entry point:
+`Endpoint.for_long_stream(host, port, ...)`. It always sets `ssh_mux=False`
+and `keepalive=True` and cannot be half-configured (`ssh_mux=True` is
+refused). CLI `--long-stream` does the same. `run_stream` /
+`stream_ssh_command` refuse any endpoint that would still attach to a
+ControlMaster — the silent failure this project recorded is rc=0 with the
+tunnel gone, so a docstring is not a control.
+
+Live streaming is the library function `remote_dev.core.ssh_transport.run_stream`.
+It stays attached, forwards output as it arrives, and enforces a timeout on
+both sides (remote `timeout --preserve-status` plus a local `select` reader).
+It returns `RemoteCompleted` (`returncode`, not `exit_code`) and does not
+emit `remote-dev.result.v1`. It is not `remote.job_*`: jobs are detached
+(`nohup`) and tailed from log files.
 
 ## MCP server and clients
 
@@ -298,7 +331,6 @@ cleans up after itself.
 remote_dev/  installable package (core, mcp, hooks, tools, schemas)
 tests/       unittest suite collected by pytest (mocked transports, no SSH)
 examples/    client configs, alias file shape, resolver plugin
-docs/        design notes and historical validation evidence
 ```
 
 See [DESIGN.md](DESIGN.md) for the architecture and

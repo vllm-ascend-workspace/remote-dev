@@ -28,7 +28,9 @@ Layer B is the shared substrate:
 
 - endpoint identity and explicit resolution (`remote_dev.core.endpoint`)
 - resolver plugin interface for consumer-owned selectors (same module)
-- SSH transport with ControlMaster reuse (`remote_dev.core.ssh_transport`)
+- SSH transport with ControlMaster reuse, per-endpoint unmultiplexed
+  connections, optional ServerAlive keepalive, and attached live streams
+  (`remote_dev.core.ssh_transport`)
 - full-permission default root with optional explicit root/cwd path policy
   (`remote_dev.core.path_policy`, `remote_dev.core.permissions`)
 - optional read-ledger concurrency checks (`remote_dev.core.read_ledger`,

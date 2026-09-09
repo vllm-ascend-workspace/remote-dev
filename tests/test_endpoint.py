@@ -38,6 +38,43 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(endpoint.root, "/")
         self.assertEqual(endpoint.effective_cwd, "/vllm-workspace")
         self.assertEqual(endpoint.kind, "direct-endpoint")
+        self.assertIsNone(endpoint.ssh_mux)
+        self.assertFalse(endpoint.keepalive)
+        self.assertNotIn("ssh_mux", endpoint.to_result_target())
+        self.assertNotIn("keepalive", endpoint.to_result_target())
+
+    def test_direct_endpoint_accepts_ssh_mux_and_keepalive(self) -> None:
+        independent = resolve_endpoint({"host": "192.0.2.10", "port": 22, "ssh_mux": False, "keepalive": True})
+        self.assertIs(independent.ssh_mux, False)
+        self.assertTrue(independent.keepalive)
+        target = independent.to_result_target()
+        self.assertIs(target["ssh_mux"], False)
+        self.assertIs(target["keepalive"], True)
+        shared = resolve_endpoint({"host": "192.0.2.10", "port": 22, "ssh_mux": True})
+        self.assertIs(shared.ssh_mux, True)
+        self.assertFalse(shared.keepalive)
+        self.assertIs(shared.to_result_target()["ssh_mux"], True)
+        self.assertNotIn("keepalive", shared.to_result_target())
+
+    def test_direct_endpoint_rejects_non_boolean_ssh_mux_or_keepalive(self) -> None:
+        for key, value in (("ssh_mux", "0"), ("ssh_mux", 0), ("keepalive", "true"), ("keepalive", 1)):
+            with self.assertRaises(EndpointError):
+                resolve_endpoint({"host": "192.0.2.10", "port": 22, key: value})
+
+    def test_for_long_stream_sets_independent_keepalive_and_cannot_be_half_configured(self) -> None:
+        endpoint = Endpoint.for_long_stream("192.0.2.10", 46000, identity_file="/keys/a")
+        self.assertIs(endpoint.ssh_mux, False)
+        self.assertTrue(endpoint.keepalive)
+        self.assertEqual(endpoint.identity_file, "/keys/a")
+        forced = Endpoint.for_long_stream("192.0.2.10", 46000, ssh_mux=False, keepalive=False)
+        self.assertIs(forced.ssh_mux, False)
+        self.assertTrue(forced.keepalive)
+        with self.assertRaises(EndpointError) as raised:
+            Endpoint.for_long_stream("192.0.2.10", 46000, ssh_mux=True)
+        message = str(raised.exception)
+        self.assertIn("rc=0", message)
+        self.assertIn("first-option-wins", message)
+        self.assertIn("ControlPath", message)
 
     def test_direct_endpoint_rejects_non_integer_port(self) -> None:
         with self.assertRaises(EndpointError):
@@ -143,6 +180,10 @@ class ResolverPluginTests(unittest.TestCase):
         self.assertEqual(endpoint.kind, "resolver:sessions")
         self.assertEqual(endpoint.source, {"session": "s1", "resolver": "sessions"})
         self.assertEqual(seen[-1]["session_id"], "s1")
+
+        overridden = resolve_endpoint({"session_id": "s1", "ssh_mux": False, "keepalive": True})
+        self.assertIs(overridden.ssh_mux, False)
+        self.assertTrue(overridden.keepalive)
 
     def test_resolver_may_return_endpoint_instance(self) -> None:
         register_resolver(lambda payload: Endpoint(host="10.2.2.2", port=22, kind="managed") if payload.get("machine") else None, name="machines", fields=("machine",))
