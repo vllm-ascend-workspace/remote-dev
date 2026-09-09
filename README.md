@@ -92,7 +92,7 @@ remote-dev resolves endpoints from explicit fields and nothing else:
 | `identity_file`      | unset                | SSH private key                                      |
 | `connect_timeout_ms` | `10000`              | SSH connect timeout                                  |
 | `ssh_mux`            | process default      | Per-endpoint ControlMaster; see multiplexing below   |
-| `long_lived`         | `false`              | Add ServerAlive keepalive for hour-scale streams     |
+| `keepalive`          | `false`              | ServerAlive probes (mechanism; not "long stream")    |
 | `alias`              | unset                | Name from the endpoint alias files                   |
 
 Resolution order in `remote_dev.core.endpoint.resolve_endpoint`:
@@ -176,7 +176,7 @@ Contract:
   A `dict` needs `host` and `port`; remote-dev builds the `Endpoint`, lets
   explicit caller fields (`user`, `root`, `cwd`, `runtime_env`,
   `runtime_env_file`, `identity_file`, `connect_timeout_ms`, `ssh_mux`,
-  `long_lived`) override the resolver's values, sets `kind` to
+  `keepalive`) override the resolver's values, sets `kind` to
   `resolver:<name>` unless provided, and records `source.resolver`.
 - `fields` declares the payload keys the resolver claims. They are added to
   `selector_fields()` so `has_selector()` and the job tools treat them as
@@ -263,19 +263,27 @@ ineffective, so the independent triple has to be chosen before the command is
 built. `ControlMaster=no` alone is not enough — a client can still attach to
 an existing `ControlPath`.
 
-`long_lived=true` (CLI `--long-lived`) adds `ServerAliveInterval=30` and
-`ServerAliveCountMax=10`. That is conditional, not always-on: a slow
-multi-hour stream otherwise dies to an idle timeout somewhere in the path,
-but attaching ServerAlive to short multiplexed commands would set TCP
-keepalive policy on the shared ControlMaster (the master owns the TCP
-connection; first-option-wins). Hour-scale streams should set both
-`ssh_mux=false` and `long_lived=true`.
+`keepalive=true` (CLI `--keepalive`) adds `ServerAliveInterval=30` and
+`ServerAliveCountMax=10`. That is a mechanism flag, orthogonal to mux, and
+conditional rather than always-on: a slow multi-hour stream otherwise dies
+to an idle timeout somewhere in the path, but attaching ServerAlive to short
+multiplexed commands would set TCP keepalive policy on the shared
+ControlMaster (the master owns the TCP connection; first-option-wins).
+
+Hour-scale streams and `ssh -N -L` tunnels use one named entry point:
+`Endpoint.for_long_stream(host, port, ...)`. It always sets `ssh_mux=False`
+and `keepalive=True` and cannot be half-configured (`ssh_mux=True` is
+refused). CLI `--long-stream` does the same. `run_stream` /
+`stream_ssh_command` refuse any endpoint that would still attach to a
+ControlMaster — the silent failure this project recorded is rc=0 with the
+tunnel gone, so a docstring is not a control.
 
 Live streaming is the library function `remote_dev.core.ssh_transport.run_stream`.
 It stays attached, forwards output as it arrives, and enforces a timeout on
 both sides (remote `timeout --preserve-status` plus a local `select` reader).
-It returns `RemoteCompleted` and does not emit `remote-dev.result.v1`. It is
-not `remote.job_*`: jobs are detached (`nohup`) and tailed from log files.
+It returns `RemoteCompleted` (`returncode`, not `exit_code`) and does not
+emit `remote-dev.result.v1`. It is not `remote.job_*`: jobs are detached
+(`nohup`) and tailed from log files.
 
 ## MCP server and clients
 

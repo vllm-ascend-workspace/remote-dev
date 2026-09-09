@@ -2,7 +2,7 @@
 
 remote-dev resolves endpoints from explicit fields only: ``host`` + ``port``
 (plus optional ``user`` / ``root`` / ``cwd`` / ``identity_file`` /
-``ssh_mux`` / ``long_lived`` / ...), or an ``alias`` looked up in a local
+``ssh_mux`` / ``keepalive`` / ...), or an ``alias`` looked up in a local
 alias file. Anything else - managed sessions, machine inventories, worktree
 bindings, coordinator state - belongs to the consumer. A consumer injects
 that knowledge through the resolver plugin interface
@@ -47,10 +47,43 @@ class Endpoint:
     identity_file: str | None = None
     connect_timeout_ms: int = 10000
     ssh_mux: bool | None = None
-    long_lived: bool = False
+    keepalive: bool = False
     kind: str = "direct-endpoint"
     alias: str | None = None
     source: dict[str, Any] | None = None
+
+    @classmethod
+    def for_long_stream(cls, host: str, port: int, **kwargs: Any) -> Endpoint:
+        """Endpoint for hour-scale attached streams and ``ssh -N -L`` tunnels.
+
+        Always sets ``ssh_mux=False`` and ``keepalive=True``. This constructor
+        cannot be half-configured: an explicit ``ssh_mux=True`` is refused,
+        and a passed ``keepalive`` value is ignored.
+
+        ControlMaster cannot carry this use case. It delegates ``-N``
+        forwards to the mux master and the client exits rc=0 immediately,
+        tearing the tunnel down. That failure is silent — rc=0 with the
+        tunnel gone. OpenSSH first-option-wins makes a later
+        ``ControlMaster=no`` override ineffective, so the independent
+        triple (``ControlMaster=no``, ``ControlPath=none``,
+        ``ControlPersist=no``) has to be chosen here, before argv is
+        built. ``ControlMaster=no`` alone is not enough: a client can
+        still attach to an existing ``ControlPath``.
+        """
+        if kwargs.get("ssh_mux") is True:
+            raise EndpointError(
+                "Endpoint.for_long_stream refuses ssh_mux=True: ControlMaster "
+                "delegates -N forwards to the mux master and the client exits "
+                "rc=0 immediately, tearing the tunnel down. That failure is "
+                "silent — rc=0 with the tunnel gone. OpenSSH first-option-wins "
+                "makes a later ControlMaster=no override ineffective, and "
+                "ControlMaster=no alone is not enough because a client can "
+                "still attach to an existing ControlPath. This constructor "
+                "always sets ssh_mux=False and keepalive=True."
+            )
+        kwargs.pop("ssh_mux", None)
+        kwargs.pop("keepalive", None)
+        return cls(host=host, port=port, ssh_mux=False, keepalive=True, **kwargs)
 
     @property
     def effective_cwd(self) -> str:
@@ -86,8 +119,8 @@ class Endpoint:
             payload["source"] = self.source
         if self.ssh_mux is not None:
             payload["ssh_mux"] = self.ssh_mux
-        if self.long_lived:
-            payload["long_lived"] = True
+        if self.keepalive:
+            payload["keepalive"] = True
         return payload
 
 
@@ -201,7 +234,7 @@ def _direct_endpoint(payload: dict[str, Any]) -> Endpoint:
         identity_file=str(payload["identity_file"]) if payload.get("identity_file") else None,
         connect_timeout_ms=_connect_timeout_ms(payload),
         ssh_mux=_optional_bool(payload, "ssh_mux"),
-        long_lived=_bool_field(payload, "long_lived", False),
+        keepalive=_bool_field(payload, "keepalive", False),
         kind=str(payload.get("kind") or "direct-endpoint"),
         alias=str(payload["alias"]) if payload.get("alias") else None,
         source=payload.get("source") if isinstance(payload.get("source"), dict) else None,
@@ -412,7 +445,7 @@ def _endpoint_from_resolver(entry: RegisteredResolver, payload: dict[str, Any]) 
             "identity_file",
             "connect_timeout_ms",
             "ssh_mux",
-            "long_lived",
+            "keepalive",
         )
         and value is not None
     }

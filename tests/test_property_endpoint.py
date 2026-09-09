@@ -64,7 +64,7 @@ def well_formed_payload(gen: Gen) -> dict[str, Any]:
     if gen.boolean():
         payload["ssh_mux"] = gen.choice((True, False, None))
     if gen.boolean():
-        payload["long_lived"] = gen.choice((True, False, None))
+        payload["keepalive"] = gen.choice((True, False, None))
     if gen.boolean():
         payload["alias"] = gen.choice(("dev", None, ""))
     if gen.boolean():
@@ -90,7 +90,7 @@ def garbage_payload(gen: Gen) -> dict[str, Any]:
         "kind",
         "source",
         "ssh_mux",
-        "long_lived",
+        "keepalive",
         "unknown_field",
     )
     payload: dict[str, Any] = {}
@@ -112,7 +112,7 @@ def assert_well_formed(test: unittest.TestCase, endpoint: Endpoint) -> None:
     test.assertIsInstance(endpoint.connect_timeout_ms, int)
     test.assertIsInstance(endpoint.runtime_env, bool)
     test.assertIn(endpoint.ssh_mux, (True, False, None))
-    test.assertIsInstance(endpoint.long_lived, bool)
+    test.assertIsInstance(endpoint.keepalive, bool)
     test.assertTrue(endpoint.kind == "direct-endpoint" or endpoint.kind.startswith("resolver:"), endpoint.kind)
     target = endpoint.to_result_target()
     for key in ("kind", "endpoint_id", "host", "port", "user", "root", "cwd", "runtime_env"):
@@ -174,13 +174,13 @@ class DirectEndpointProperties(ResolverIsolation):
                     "runtime_env": False,
                     "identity_file": "~/.ssh/k",
                     "ssh_mux": False,
-                    "long_lived": True,
+                    "keepalive": True,
                 }
             )
             self.assertEqual(
                 a.endpoint_id,
                 b.endpoint_id,
-                "cwd/timeout/runtime_env/identity/ssh_mux/long_lived must not change endpoint identity",
+                "cwd/timeout/runtime_env/identity/ssh_mux/keepalive must not change endpoint identity",
             )
             for field, value in (("host", gen.choice([h for h in DOC_HOSTS if h != base["host"]])), ("port", (base["port"] % 65535) + 1), ("user", base["user"] + "x"), ("root", "/elsewhere")):
                 other = resolve_endpoint({**base, field: value})

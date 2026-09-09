@@ -14,12 +14,12 @@
     "connect_timeout_ms": {"type": "integer", "default": 10000},
     "ssh_mux": {
       "type": "boolean",
-      "description": "Per-endpoint OpenSSH multiplexing. true uses the shared ControlMaster; false forces an independent connection. When omitted, REMOTE_DEV_SSH_MUX is the process default."
+      "description": "Per-endpoint OpenSSH multiplexing. true uses the shared ControlMaster; false forces an independent connection. When omitted, REMOTE_DEV_SSH_MUX is the process default. Hour-scale streams use Endpoint.for_long_stream, which sets ssh_mux=false."
     },
-    "long_lived": {
+    "keepalive": {
       "type": "boolean",
       "default": false,
-      "description": "Declare a long-lived connection. Adds ServerAlive keepalive so a slow multi-hour stream does not die to an idle timeout."
+      "description": "Add ServerAliveInterval/CountMax. Mechanism flag, orthogonal to mux. Hour-scale streams use Endpoint.for_long_stream rather than this flag alone."
     }
   },
   "additionalProperties": true

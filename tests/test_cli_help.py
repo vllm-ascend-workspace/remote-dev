@@ -28,18 +28,26 @@ class CliHelpTests(unittest.TestCase):
                 self.assertEqual(help_proc.returncode, 0, help_proc.stderr)
                 self.assertIn("usage:", help_proc.stdout)
 
-    def test_cli_payload_maps_ssh_mux_and_long_lived_flags(self) -> None:
+    def test_cli_payload_maps_ssh_mux_keepalive_and_long_stream_flags(self) -> None:
         from remote_dev.cli import build_parser, endpoint_payload
 
         parser = build_parser("probe")
-        args = parser.parse_args(["--host", "192.0.2.10", "--port", "22", "--no-ssh-mux", "--long-lived"])
+        args = parser.parse_args(["--host", "192.0.2.10", "--port", "22", "--no-ssh-mux", "--keepalive"])
         payload = endpoint_payload(args)
         self.assertIs(payload["ssh_mux"], False)
-        self.assertIs(payload["long_lived"], True)
+        self.assertIs(payload["keepalive"], True)
+        stream_args = parser.parse_args(["--host", "192.0.2.10", "--port", "22", "--long-stream"])
+        stream_payload = endpoint_payload(stream_args)
+        self.assertIs(stream_payload["ssh_mux"], False)
+        self.assertIs(stream_payload["keepalive"], True)
         default_args = parser.parse_args(["--host", "192.0.2.10", "--port", "22"])
         default_payload = endpoint_payload(default_args)
         self.assertNotIn("ssh_mux", default_payload)
-        self.assertNotIn("long_lived", default_payload)
+        self.assertNotIn("keepalive", default_payload)
+        with self.assertRaises(ValueError) as raised:
+            endpoint_payload(parser.parse_args(["--host", "192.0.2.10", "--port", "22", "--ssh-mux", "--long-stream"]))
+        self.assertIn("rc=0", str(raised.exception))
+        self.assertIn("first-option-wins", str(raised.exception))
 
     def test_cli_endpoint_flags_are_explicit_only(self) -> None:
         proc = _cli("bash", "--help")
@@ -55,7 +63,8 @@ class CliHelpTests(unittest.TestCase):
             "--runtime-env-file",
             "--ssh-mux",
             "--no-ssh-mux",
-            "--long-lived",
+            "--keepalive",
+            "--long-stream",
         ):
             self.assertIn(flag, proc.stdout)
         for legacy in ("--session-id", "--session-file", "--machine"):

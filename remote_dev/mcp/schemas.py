@@ -20,19 +20,19 @@ ENDPOINT_PROPS: dict[str, Any] = {
             "Per-endpoint OpenSSH multiplexing. true uses the shared ControlMaster; "
             "false forces an independent connection (ControlMaster=no, ControlPath=none, "
             "ControlPersist=no). When omitted, REMOTE_DEV_SSH_MUX is the process default. "
-            "Pass false for long-lived connections (ssh -N -L tunnels or hour-scale streams): "
-            "ControlMaster delegates -N forwards to the mux master and the client exits rc=0 "
-            "immediately, tearing the tunnel down. OpenSSH first-option-wins makes a later "
-            "ControlMaster=no override ineffective."
+            "Hour-scale streams and ssh -N -L tunnels use Endpoint.for_long_stream, "
+            "which sets ssh_mux=false. ControlMaster delegates -N forwards to the mux "
+            "master and the client exits rc=0 immediately, tearing the tunnel down. "
+            "OpenSSH first-option-wins makes a later ControlMaster=no override ineffective."
         ),
     },
-    "long_lived": {
+    "keepalive": {
         "type": "boolean",
         "default": False,
         "description": (
-            "Declare a long-lived connection. Adds ServerAlive keepalive so a slow "
-            "multi-hour stream does not die to an idle timeout. Conditional: short "
-            "multiplexed commands must not set this, because ServerAlive on a "
+            "Add ServerAliveInterval/CountMax. Mechanism flag, orthogonal to mux: "
+            "it only adds TCP probes. Hour-scale streams use Endpoint.for_long_stream "
+            "rather than this flag alone. Conditional: attaching ServerAlive to a "
             "ControlMaster client becomes master TCP policy (first-option-wins)."
         ),
     },

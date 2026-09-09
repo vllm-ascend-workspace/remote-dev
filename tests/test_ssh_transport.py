@@ -452,49 +452,47 @@ class PerEndpointMuxTests(unittest.TestCase):
         self.assertEqual(unset_zero["ControlPersist"], "no")
 
 
-class LongLivedKeepaliveTests(unittest.TestCase):
-    """Gap 2: ServerAlive is applied only when the endpoint is long-lived."""
+class KeepaliveMechanismTests(unittest.TestCase):
+    """Gap 2: ServerAlive is the keepalive mechanism, applied only when asked."""
 
-    def _cmd(self, **fields: object) -> list[str]:
-        endpoint = Endpoint(host="192.0.2.10", port=46000, **fields)  # type: ignore[arg-type]
+    def _cmd(self, endpoint: Endpoint) -> list[str]:
         with mock.patch.object(ssh_transport, "_MUX_READY", True):
             with mock.patch.dict(os.environ):
                 os.environ.pop(SSH_MUX_ENV, None)
                 return ssh_transport.ssh_base_cmd(endpoint)
 
-    def test_long_lived_endpoint_adds_server_alive_keepalive(self) -> None:
-        # Would fail on main: ServerAlive* appears nowhere in the package.
-        cmd = self._cmd(long_lived=True, ssh_mux=False)
+    def test_keepalive_flag_adds_server_alive(self) -> None:
+        cmd = self._cmd(Endpoint(host="192.0.2.10", port=46000, ssh_mux=False, keepalive=True))
         options = _option_map(cmd)
         self.assertEqual(options["ServerAliveInterval"], "30")
         self.assertEqual(options["ServerAliveCountMax"], "10")
         self.assertEqual(options["ControlMaster"], "no")
         self.assertEqual(options["ControlPath"], "none")
         self.assertEqual(options["ControlPersist"], "no")
-        self.assertIn("ServerAliveInterval=30", cmd)
-        self.assertIn("ServerAliveCountMax=10", cmd)
 
     def test_default_endpoint_has_no_server_alive(self) -> None:
-        cmd = self._cmd()
+        cmd = self._cmd(Endpoint(host="192.0.2.10", port=46000))
         options = _option_map(cmd)
         self.assertNotIn("ServerAliveInterval", options)
         self.assertNotIn("ServerAliveCountMax", options)
         self.assertFalse(any(item.startswith("ServerAlive") for item in cmd))
 
-    def test_keepalive_is_independent_of_mux_selection(self) -> None:
-        muxed_long = _option_map(self._cmd(long_lived=True, ssh_mux=True))
-        self.assertEqual(muxed_long["ControlMaster"], "auto")
-        self.assertEqual(muxed_long["ServerAliveInterval"], "30")
-        independent_short = _option_map(self._cmd(long_lived=False, ssh_mux=False))
-        self.assertEqual(independent_short["ControlMaster"], "no")
-        self.assertNotIn("ServerAliveInterval", independent_short)
+    def test_keepalive_mechanism_can_appear_on_ssh_base_cmd_for_either_mux(self) -> None:
+        # keepalive is a TCP-probe flag and stays orthogonal on ssh_base_cmd.
+        # Attached streams still refuse the muxed combination below.
+        muxed = _option_map(self._cmd(Endpoint(host="192.0.2.10", port=46000, ssh_mux=True, keepalive=True)))
+        self.assertEqual(muxed["ControlMaster"], "auto")
+        self.assertEqual(muxed["ServerAliveInterval"], "30")
+        independent = _option_map(self._cmd(Endpoint(host="192.0.2.10", port=46000, ssh_mux=False, keepalive=False)))
+        self.assertEqual(independent["ControlMaster"], "no")
+        self.assertNotIn("ServerAliveInterval", independent)
 
 
 class LiveStreamTests(unittest.TestCase):
     """Gap 3: attached live stream with dual-sided silent-hang handling."""
 
     def setUp(self) -> None:
-        self.endpoint = Endpoint(host="192.0.2.10", port=46000, ssh_mux=False, long_lived=True)
+        self.endpoint = Endpoint.for_long_stream("192.0.2.10", 46000)
 
     def test_run_stream_wraps_remote_timeout_and_forwards_live_output(self) -> None:
         # Would fail on main: run_stream / stream_ssh_command do not exist,
@@ -575,6 +573,45 @@ class LiveStreamTests(unittest.TestCase):
             summary="stream finished",
         )
         self.assertEqual(wrapped["schema_version"], RESULT_SCHEMA_VERSION)
+
+    def test_for_long_stream_is_the_natural_spelling_and_is_independent(self) -> None:
+        endpoint = Endpoint.for_long_stream("192.0.2.10", 46000, identity_file="/keys/a")
+        self.assertIs(endpoint.ssh_mux, False)
+        self.assertTrue(endpoint.keepalive)
+        with mock.patch.object(ssh_transport, "_MUX_READY", True):
+            with mock.patch.dict(os.environ):
+                os.environ.pop(SSH_MUX_ENV, None)
+                os.environ[SSH_MUX_ENV] = "1"
+                cmd = ssh_transport.ssh_base_cmd(endpoint)
+                argv = ssh_transport.stream_ssh_command(endpoint, "analyze", timeout_ms=120000)
+        options = _option_map(cmd)
+        self.assertEqual(options["ControlMaster"], "no")
+        self.assertEqual(options["ControlPath"], "none")
+        self.assertEqual(options["ControlPersist"], "no")
+        self.assertEqual(options["ServerAliveInterval"], "30")
+        self.assertEqual(options["ServerAliveCountMax"], "10")
+        self.assertEqual(_option_map(argv)["ControlMaster"], "no")
+        self.assertIn("timeout --preserve-status 115s", argv[-1])
+
+    def test_stream_refuses_a_muxed_endpoint(self) -> None:
+        cases = (
+            Endpoint(host="192.0.2.10", port=46000),
+            Endpoint(host="192.0.2.10", port=46000, ssh_mux=True),
+            Endpoint(host="192.0.2.10", port=46000, ssh_mux=True, keepalive=True),
+            Endpoint(host="192.0.2.10", port=46000, keepalive=True),
+        )
+        for endpoint in cases:
+            with self.subTest(ssh_mux=endpoint.ssh_mux, keepalive=endpoint.keepalive):
+                with mock.patch.object(ssh_transport, "_MUX_READY", True):
+                    with mock.patch.dict(os.environ):
+                        os.environ.pop(SSH_MUX_ENV, None)
+                        with self.assertRaises(RemoteExecutionError) as raised:
+                            ssh_transport.stream_ssh_command(endpoint, "analyze")
+                message = str(raised.exception)
+                self.assertIn("rc=0", message)
+                self.assertIn("first-option-wins", message)
+                self.assertIn("ControlPath", message)
+                self.assertIn("for_long_stream", message)
 
 
 if __name__ == "__main__":

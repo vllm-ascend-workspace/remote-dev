@@ -51,11 +51,21 @@ def add_endpoint_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--long-lived",
-        dest="long_lived",
+        "--keepalive",
+        dest="keepalive",
         action="store_true",
         default=None,
-        help="Add ServerAlive keepalive. Use with --no-ssh-mux for multi-hour streams.",
+        help="Add ServerAliveInterval/CountMax. Mechanism flag; hour-scale streams should use --long-stream.",
+    )
+    parser.add_argument(
+        "--long-stream",
+        dest="long_stream",
+        action="store_true",
+        default=None,
+        help=(
+            "Independent SSH connection plus keepalive "
+            "(same as Endpoint.for_long_stream). Cannot be combined with --ssh-mux."
+        ),
     )
     parser.add_argument(
         "--selector",
@@ -91,11 +101,22 @@ def endpoint_payload(args: argparse.Namespace) -> dict[str, Any]:
         "connect_timeout_ms",
         "alias",
         "ssh_mux",
-        "long_lived",
+        "keepalive",
     ):
         value = getattr(args, key, None)
         if value is not None:
             payload[key] = value
+    if getattr(args, "long_stream", None):
+        if payload.get("ssh_mux") is True:
+            raise ValueError(
+                "--long-stream cannot be combined with --ssh-mux: ControlMaster "
+                "delegates -N forwards to the mux master and the client exits "
+                "rc=0 immediately, tearing the tunnel down. OpenSSH "
+                "first-option-wins makes a later ControlMaster=no override "
+                "ineffective. Use --long-stream alone (or Endpoint.for_long_stream)."
+            )
+        payload["ssh_mux"] = False
+        payload["keepalive"] = True
     payload.update(parse_selectors(getattr(args, "selector", None)))
     return payload
 

@@ -38,10 +38,22 @@ REMOTE_TIMEOUT_GRACE_SECONDS = 5
 # promptly, large enough that a quiet-but-alive stream is not spun on.
 STREAM_SELECT_SLICE_SECONDS = 5.0
 
-# Keepalive for endpoints that declare themselves long-lived. Conditional:
-# see ``_keepalive_options``.
+# Keepalive for endpoints that set the ``keepalive`` mechanism flag.
+# Conditional: see ``_keepalive_options``. Hour-scale streams go through
+# ``Endpoint.for_long_stream``, not this flag alone.
 SERVER_ALIVE_INTERVAL_SECONDS = 30
 SERVER_ALIVE_COUNT_MAX = 10
+
+STREAM_MUX_REFUSAL = (
+    "attached streams cannot use a multiplexed SSH connection: ControlMaster "
+    "delegates -N forwards and hour-scale sessions to the mux master and the "
+    "client exits rc=0 immediately, tearing the stream down. That failure is "
+    "silent — rc=0 with the work gone. OpenSSH first-option-wins makes a later "
+    "ControlMaster=no override ineffective, and ControlMaster=no alone is not "
+    "enough because a client can still attach to an existing ControlPath. "
+    "Use Endpoint.for_long_stream(...) or set ssh_mux=False before building "
+    "the command."
+)
 
 
 @dataclass
@@ -129,12 +141,14 @@ def _uses_shared_mux(endpoint: Endpoint) -> bool:
     first-option-wins semantics make a trailing ``ControlMaster=no``
     override ineffective.
 
-    Pass ``ssh_mux=False`` for long-lived connections (e.g. ``ssh -N -L``
-    tunnels). ControlMaster delegates ``-N`` forwards to the mux master and
-    the client exits rc=0 immediately, tearing the tunnel down. That
-    failure is silent — rc=0 with the tunnel gone. The same class of hang
-    appears on hour-scale streams: the mux master stays up after the remote
-    side has finished, and the attached client never notices.
+    Pass ``ssh_mux=False`` — or construct the endpoint with
+    :meth:`Endpoint.for_long_stream` — for ``ssh -N -L`` tunnels and
+    hour-scale attached streams. ControlMaster delegates ``-N`` forwards
+    to the mux master and the client exits rc=0 immediately, tearing the
+    tunnel down. That failure is silent — rc=0 with the tunnel gone. The
+    same class of hang appears on hour-scale streams: the mux master
+    stays up after the remote side has finished, and the attached client
+    never notices. A later ``ControlMaster=no`` cannot fix this.
     """
     if endpoint.ssh_mux is not None:
         return bool(endpoint.ssh_mux)
@@ -142,7 +156,17 @@ def _uses_shared_mux(endpoint: Endpoint) -> bool:
 
 
 def _keepalive_options(endpoint: Endpoint) -> list[str]:
-    """ServerAlive probes for endpoints that declare themselves long-lived.
+    """ServerAlive probes when the ``keepalive`` mechanism flag is set.
+
+    This flag is orthogonal to mux: it only adds TCP probes. It does not
+    mean "this is a long stream". Hour-scale streams and ``ssh -N -L``
+    tunnels use :meth:`Endpoint.for_long_stream`, which sets
+    ``ssh_mux=False`` and ``keepalive=True`` together.
+    :func:`stream_ssh_command` refuses a multiplexed endpoint, because
+    ControlMaster delegates ``-N`` forwards to the mux master and the
+    client exits rc=0 immediately, tearing the tunnel down. That failure
+    is silent; OpenSSH first-option-wins makes a later
+    ``ControlMaster=no`` override ineffective.
 
     Conditional, not always-on. A connection carrying a slow-producing
     multi-hour job otherwise dies to an idle timeout somewhere in the path.
@@ -150,11 +174,8 @@ def _keepalive_options(endpoint: Endpoint) -> list[str]:
     attaching ServerAlive to them would set TCP keepalive policy on the
     shared ControlMaster (the master owns the TCP connection, and OpenSSH
     first-option-wins makes the first client's ServerAlive the master's).
-    Keepalive therefore belongs on the endpoint that needs it — typically
-    together with ``ssh_mux=False`` so the probes apply to that connection
-    alone.
     """
-    if not endpoint.long_lived:
+    if not endpoint.keepalive:
         return []
     return [
         "-o",
@@ -205,8 +226,29 @@ def stream_remote_payload(script: str, timeout_ms: int | None) -> str:
     return f"timeout --preserve-status {margin}s bash -lc {shlex.quote(script)}"
 
 
+def _require_independent_stream(endpoint: Endpoint) -> None:
+    """Refuse a multiplexed connection for an attached stream.
+
+    The failure this guards is silent: ControlMaster delegates ``-N``
+    forwards and hour-scale sessions to the mux master, the client exits
+    rc=0, and the tunnel or stream is gone. OpenSSH first-option-wins
+    makes a later ``ControlMaster=no`` override ineffective, so the
+    independent triple has to be chosen before argv is built.
+    ``ControlMaster=no`` alone is not enough — a client can still attach
+    to an existing ``ControlPath``. A docstring is not a control for a
+    failure that announces success.
+    """
+    if _uses_shared_mux(endpoint):
+        raise RemoteExecutionError(STREAM_MUX_REFUSAL)
+
+
 def stream_ssh_command(endpoint: Endpoint, script: str, *, timeout_ms: int | None = None) -> list[str]:
-    """Argv for an attached live-stream SSH invocation."""
+    """Argv for an attached live-stream SSH invocation.
+
+    Refuses a multiplexed endpoint. Use :meth:`Endpoint.for_long_stream`
+    or pass ``ssh_mux=False``.
+    """
+    _require_independent_stream(endpoint)
     return [*ssh_base_cmd(endpoint), "bash", "-c", shlex.quote(stream_remote_payload(script, timeout_ms))]
 
 
@@ -270,10 +312,10 @@ def run_stream(
     Either alone leaves a hole: remote-only misses a dead network;
     local-only leaves an orphan process burning an NPU.
 
-    Callers that stream hour-scale jobs should pass an endpoint with
-    ``ssh_mux=False`` and ``long_lived=True``. Mux selection and keepalive
-    are endpoint properties, applied by :func:`ssh_base_cmd` before this
-    argv is built.
+    Callers that stream hour-scale jobs construct the endpoint with
+    :meth:`Endpoint.for_long_stream`. :func:`stream_ssh_command` refuses
+    a multiplexed endpoint: ControlMaster delegates the session to the
+    mux master and the client exits rc=0, which looks like success.
     """
     dest = sys.stderr if output is None else output
     cmd = stream_ssh_command(endpoint, script, timeout_ms=timeout_ms)

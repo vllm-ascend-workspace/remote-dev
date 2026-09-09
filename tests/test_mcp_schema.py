@@ -82,7 +82,8 @@ class McpSchemaTests(unittest.TestCase):
             self.assertNotIn(legacy, ENDPOINT_PROPS)
         self.assertIn("runtime_env_file", ENDPOINT_PROPS)
         self.assertIn("ssh_mux", ENDPOINT_PROPS)
-        self.assertIn("long_lived", ENDPOINT_PROPS)
+        self.assertIn("keepalive", ENDPOINT_PROPS)
+        self.assertNotIn("long_lived", ENDPOINT_PROPS)
         # Consumer selector keys still travel through the open object.
         for schema in TOOL_SCHEMAS.values():
             self.assertTrue(schema["additionalProperties"])
