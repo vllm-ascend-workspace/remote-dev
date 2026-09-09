@@ -63,7 +63,7 @@ remote-dev server
       "env": {
         "REMOTE_DEV_DEFAULT_USER": "root",
         "REMOTE_DEV_DEFAULT_ROOT": "/",
-        "REMOTE_DEV_DEFAULT_CWD": "/vllm-workspace",
+        "REMOTE_DEV_DEFAULT_CWD": "/",
         "REMOTE_DEV_RESOLVERS": "/absolute/path/to/consumer/remote_dev_plugin.py:setup"
       }
     }
@@ -86,7 +86,7 @@ remote-dev resolves endpoints from explicit fields and nothing else:
 | `port`               | required             | SSH port                                             |
 | `user`               | `root`               | SSH user (`REMOTE_DEV_DEFAULT_USER`)                 |
 | `root`               | `/`                  | Path-policy root (`REMOTE_DEV_DEFAULT_ROOT`)         |
-| `cwd`                | `/vllm-workspace`    | Default working dir (`REMOTE_DEV_DEFAULT_CWD`)       |
+| `cwd`                | same as `root`       | Default working dir (`REMOTE_DEV_DEFAULT_CWD`)       |
 | `runtime_env`        | `true`               | Source `runtime_env_file` before commands            |
 | `runtime_env_file`   | unset                | Remote profile script (`REMOTE_DEV_RUNTIME_ENV_FILE`)|
 | `identity_file`      | unset                | SSH private key                                      |
@@ -113,14 +113,13 @@ caller supplies a selector.
 ### Permission model
 
 Direct endpoints default to **full remote-path permission** (`root=/`) with
-`/vllm-workspace` as the default cwd. Path containment, symlink checks and
-cwd validation are still enforced, but against `/`. Pass a narrower `root`
-(and usually the same `cwd`) when a task requires path isolation, e.g.
-`--root /srv/app --cwd /srv/app`. This is a deliberate, documented default:
-the tools exist to replace ad-hoc `ssh` invocations that had no containment
-at all, and a consumer that wants a tighter default sets
-`REMOTE_DEV_DEFAULT_ROOT`. Hook guards (`remote_dev.hooks`) default to *allow*
-and only observe; they are the place to add policy if you need it.
+the same path as the default cwd. Path containment, symlink checks and
+cwd validation are still enforced, but against `/` unless a narrower `root`
+is set. Pass `--root /srv/app --cwd /srv/app` when a task requires path
+isolation. A consumer that wants a project default cwd sets
+`REMOTE_DEV_DEFAULT_CWD`; remote-dev does not assume a workspace tree.
+Hook guards (`remote_dev.hooks`) default to *allow* and only observe; they
+are the place to add policy if you need it.
 
 Read ledgers are optional optimistic-concurrency checks scoped by
 `client_context_id`, then `CLAUDE_SESSION_ID`, `CODEX_SESSION_ID`,
@@ -150,24 +149,24 @@ the consumer.
 # consumer/remote_dev_plugin.py
 from remote_dev.core.endpoint import EndpointError, register_resolver, resolver_setup
 
-def by_session(payload):
-    session_id = payload.get("session_id")
-    if not session_id:
+def by_lab(payload):
+    lab = payload.get("lab")
+    if not lab:
         return None                      # not ours: next resolver, please
-    record = my_registry.load(session_id)  # consumer-owned lookup
+    record = my_inventory.load(lab)      # consumer-owned lookup
     if record is None:
-        raise EndpointError(f"unknown session {session_id!r}")
+        raise EndpointError(f"unknown lab {lab!r}")
     return {
         "host": record.host, "port": record.ssh_port,
-        "cwd": record.runtime_root,
+        "cwd": record.root,
         "runtime_env_file": "/etc/profile.d/toolchain.sh",
-        "kind": "managed-session",
-        "source": {"session_id": session_id},
+        "kind": "lab-endpoint",
+        "source": {"lab": lab},
     }
 
 @resolver_setup
 def setup():
-    register_resolver(by_session, name="sessions", fields=("session_id",))
+    register_resolver(by_lab, name="labs", fields=("lab",))
 ```
 
 Contract:
@@ -212,7 +211,7 @@ The public result envelope is `remote_dev.result` (`schema_version`:
 Selector keys on the CLI travel through `--selector KEY=VALUE`:
 
 ```bash
-remote-dev bash --selector session_id=abc --command 'nproc'
+remote-dev bash --selector lab=gpu-1 --command 'nproc'
 ```
 
 ## What this repository does not hold
@@ -235,13 +234,13 @@ remote-dev bash --selector session_id=abc --command 'nproc'
 |---------------------------------|-----------------------------------------------------------|
 | `REMOTE_DEV_DEFAULT_USER`       | Default `user` (`root`)                                   |
 | `REMOTE_DEV_DEFAULT_ROOT`       | Default `root` (`/`)                                      |
-| `REMOTE_DEV_DEFAULT_CWD`        | Default `cwd` (`/vllm-workspace`)                         |
+| `REMOTE_DEV_DEFAULT_CWD`        | Default `cwd` (unset = same as `root`)                    |
 | `REMOTE_DEV_RUNTIME_ENV_FILE`   | Default `runtime_env_file` (unset = no preamble)          |
 | `REMOTE_DEV_RESOLVERS`          | Comma-separated resolver plugin specs                     |
 | `REMOTE_DEV_ENDPOINTS_FILE`     | Alias file(s), `os.pathsep` separated, read first         |
 | `REMOTE_DEV_STATE_DIR`          | Local state directory (default `<cwd>/state`)             |
 | `REMOTE_DEV_SSH_MUX_DIR`        | OpenSSH ControlMaster dir (default `~/.ssh/remote-dev-mux`)|
-| `REMOTE_DEV_SSH_MUX`            | Process-wide SSH multiplexing *default*: unset or `1` uses the shared ControlMaster; `0` forces independent connections; other values error. An endpoint's `ssh_mux` overrides this for that endpoint only. |
+| `REMOTE_DEV_SSH_MUX`            | Process-wide SSH multiplexing *default* on POSIX: unset or `1` uses the shared ControlMaster; `0` forces independent connections; other values error. Native Windows has no Client ControlMaster (Win32-OpenSSH); ordinary connections already use the independent triple and do not need this flag. `ssh_mux=True` / `REMOTE_DEV_SSH_MUX=1` on native Windows is a capability error. An endpoint's `ssh_mux` overrides the process default on POSIX. |
 | `REMOTE_DEV_SESSION_ID`         | Read-ledger scope when no client id is given              |
 
 `REMOTE_DEV_SSH_MUX` is the process-wide default and is read without changing
@@ -251,7 +250,10 @@ set it to `1` to keep today's shared-mux path, including the per-identity
 the shared master (`ControlMaster=no`, `ControlPath=none`, `ControlPersist=no`
 on every SSH invocation from that process that does not set `ssh_mux`).
 Accepted values are unset, `1`, and `0`; any other value is a configuration
-error. Ordinary serving and parity calls keep the default shared mux.
+error. Ordinary POSIX serving and parity calls keep the default shared mux.
+On native Windows the transport chooses independent connections by itself
+because Win32-OpenSSH does not implement Client ControlMaster; do not set
+`ssh_mux=true` or `REMOTE_DEV_SSH_MUX=1` there.
 
 A single process may do both at once. Set `ssh_mux=false` (CLI `--no-ssh-mux`)
 on the endpoints that must stay off the shared master, and leave the rest on
@@ -280,10 +282,20 @@ tunnel gone, so a docstring is not a control.
 
 Live streaming is the library function `remote_dev.core.ssh_transport.run_stream`.
 It stays attached, forwards output as it arrives, and enforces a timeout on
-both sides (remote `timeout --preserve-status` plus a local `select` reader).
-It returns `RemoteCompleted` (`returncode`, not `exit_code`) and does not
-emit `remote-dev.result.v1`. It is not `remote.job_*`: jobs are detached
-(`nohup`) and tailed from log files.
+both sides (remote `timeout --preserve-status` plus a local deadline-bounded
+reader: `select` on POSIX, reader threads on native Windows). It returns
+`RemoteCompleted` (`returncode`, not `exit_code`) and does not emit
+`remote-dev.result.v1`. It is not `remote.job_*`.
+
+Detached background work uses one process implementation:
+`remote_dev.processes.control(endpoint, job_id, action, **parameters)`.
+Actions are `prepare`, `go`, `status`, `tail`, and `stop`. The Linux worker
+is a child-subreaper with identity/marker checks, a start gate, descendant
+drain, and timeout/stop. Ordinary `remote.bash --run-in-background` and
+`remote.job_*` call this same boundary. Coordinator may call it directly
+with an explicit host+port mapping; remote-dev does not load coordinator
+state. The worker is Linux-only; the local transport client supports
+macOS, Linux, and native Windows.
 
 Two more transport primitives close the remaining SSH-option gaps. They are
 library APIs, not MCP tools, and they do not accept extra `-o` strings.
@@ -339,7 +351,7 @@ Live checks need a reachable SSH host:
 
 ```bash
 remote-dev validate --host <host> --port <port> --root /srv/app --cwd /srv/app
-remote-dev validate --selector session_id=<id> --skip-local
+remote-dev validate --alias lab --skip-local
 ```
 
 The validator compile-checks the installed package, reports MCP/CLI burden
@@ -350,7 +362,7 @@ cleans up after itself.
 ## Layout
 
 ```
-remote_dev/  installable package (core, mcp, hooks, tools, schemas)
+remote_dev/  installable package (core, processes, mcp, hooks, tools, schemas)
 tests/       unittest suite collected by pytest (mocked transports, no SSH)
 examples/    client configs, alias file shape, resolver plugin
 ```

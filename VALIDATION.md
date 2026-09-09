@@ -1,6 +1,41 @@
 # Remote-Dev Validation Record
 
-Last updated: 2026-09-07 (standalone extraction).
+Last updated: 2026-09-10 (v0.5.0 process-control cutover).
+
+## v0.5.0 process control and local client portability (2026-09-10)
+
+Generic remote process supervision lives in this package:
+`remote_dev.processes.control(endpoint, job_id, action, **parameters)`.
+The Linux worker (child-subreaper, identity/marker/start-time checks,
+start gate, descendant drain, timeout/stop/logs) is shipped as package
+source. Ordinary `remote.bash --run-in-background` and `remote.job_*`
+use that same path; the previous nohup/PID-only runner is gone. Default
+cwd is the endpoint root. The local SSH/stream client handles macOS,
+Linux, and native Windows subprocess pipes without claiming remote
+Windows process support.
+
+Independent acceptance on macOS, Python 3.12.13:
+
+- Built the wheel and installed it with pytest into a clean environment.
+- Full test suite against that install: **312 passed, 8 skipped** (Linux
+  worker cases), plus 152 subtests. Local contract gates passed: 18 MCP
+  tools and 18 CLI fallbacks.
+- The installed wheel controlled CPU-only jobs over SSH on a Linux host
+  with Python 3.12.3. A prepared gate stayed closed until authorized;
+  repeated preparation retained the same supervisor. Jobs survived the
+  launching local frontend's exit. Stopping a family drained its detached,
+  clean-environment child while a separate job stayed running. A background
+  descendant timed out with a drained completion receipt. All four test
+  jobs were confirmed quiet after cleanup.
+- Native Windows argument selection was tested by simulation; actual
+  Windows execution is covered separately by the CI portability job.
+
+This evidence covers the generic process substrate. It does not establish
+NPU execution, model correctness, or performance.
+
+---
+
+Previous record:
 
 ## Standalone Extraction (2026-09-07)
 

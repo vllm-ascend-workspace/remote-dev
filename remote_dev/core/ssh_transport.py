@@ -4,12 +4,14 @@ import codecs
 import hashlib
 import json
 import os
+import queue
 import select
 import shlex
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -38,8 +40,10 @@ SSH_MUX_ENV = "REMOTE_DEV_SSH_MUX"
 # deadline so the remote process can exit with a useful status first.
 REMOTE_TIMEOUT_GRACE_SECONDS = 5
 
-# Local ``select`` slice. Small enough that a wall-clock deadline is honoured
+# Local reader slice. Small enough that a wall-clock deadline is honoured
 # promptly, large enough that a quiet-but-alive stream is not spun on.
+# POSIX uses ``select`` on pipes; Windows uses reader threads (select cannot
+# wait on subprocess pipes there).
 STREAM_SELECT_SLICE_SECONDS = 5.0
 
 # Keepalive for endpoints that set the ``keepalive`` mechanism flag.
@@ -65,6 +69,17 @@ INTERACTIVE_MUX_REFUSAL = (
     "It is impossible to combine BatchMode=no with multiplexing. Pass "
     "ssh_mux=False on the endpoint (do not attach this session to a mux "
     "master)."
+)
+
+# Win32-OpenSSH documents Client ControlMaster as out of project scope.
+# https://github.com/PowerShell/Win32-OpenSSH/wiki/Project-Scope
+# https://github.com/PowerShell/Win32-OpenSSH/issues/1328
+WINDOWS_MUX_UNSUPPORTED = (
+    "OpenSSH ControlMaster is not supported on native Windows "
+    "(Win32-OpenSSH Client ControlMaster is out of project scope). "
+    "Ordinary Windows connections already use an independent SSH connection "
+    "(ControlMaster=no, ControlPath=none, ControlPersist=no); no extra "
+    "flag is required. Do not set ssh_mux=True or REMOTE_DEV_SSH_MUX=1."
 )
 
 # OpenSSH -N through a mux master exits 0 while the tunnel is gone. A dead
@@ -148,6 +163,11 @@ def _shared_mux_requested() -> bool:
     )
 
 
+def _native_windows_ssh_client() -> bool:
+    """True when this process is a native Win32 SSH client, not POSIX OpenSSH."""
+    return os.name == "nt"
+
+
 def _uses_shared_mux(endpoint: Endpoint) -> bool:
     """Choose ControlMaster reuse for one endpoint, before argv is built.
 
@@ -157,15 +177,34 @@ def _uses_shared_mux(endpoint: Endpoint) -> bool:
     first-option-wins semantics make a trailing ``ControlMaster=no``
     override ineffective.
 
+    Native Windows is different: Win32-OpenSSH does not support Client
+    ControlMaster. Ordinary Windows connections (``ssh_mux`` omitted,
+    ``REMOTE_DEV_SSH_MUX`` unset or ``0``) therefore take the independent
+    triple automatically — agents do not need a Windows-only flag.
+    ``ssh_mux=True`` or ``REMOTE_DEV_SSH_MUX=1`` is an explicit unsupported
+    request and raises rather than emitting ``ControlMaster=auto``.
+
     Pass ``ssh_mux=False`` — or construct the endpoint with
     :meth:`Endpoint.for_long_stream` — for ``ssh -N -L`` tunnels and
-    hour-scale attached streams. ControlMaster delegates ``-N`` forwards
-    to the mux master and the client exits rc=0 immediately, tearing the
-    tunnel down. That failure is silent — rc=0 with the tunnel gone. The
-    same class of hang appears on hour-scale streams: the mux master
-    stays up after the remote side has finished, and the attached client
-    never notices. A later ``ControlMaster=no`` cannot fix this.
+    hour-scale attached streams on POSIX. ControlMaster delegates ``-N``
+    forwards to the mux master and the client exits rc=0 immediately,
+    tearing the tunnel down. That failure is silent — rc=0 with the tunnel
+    gone. The same class of hang appears on hour-scale streams: the mux
+    master stays up after the remote side has finished, and the attached
+    client never notices. A later ``ControlMaster=no`` cannot fix this.
     """
+    if endpoint.ssh_mux is False:
+        return False
+    if _native_windows_ssh_client():
+        value = os.environ.get(SSH_MUX_ENV)
+        if endpoint.ssh_mux is True or value == "1":
+            raise RemoteExecutionError(WINDOWS_MUX_UNSUPPORTED)
+        if value is None or value == "0":
+            return False
+        raise RemoteExecutionError(
+            f"{SSH_MUX_ENV}={value!r} is not supported; accepted values are unset, "
+            f"'1' (shared ControlMaster), or '0' (independent connections)"
+        )
     if endpoint.ssh_mux is not None:
         return bool(endpoint.ssh_mux)
     return _shared_mux_requested()
@@ -333,12 +372,13 @@ def run_stream(
     the channels separate, capture both, and invoke ``on_output`` per line.
     Separate-channel mode does not auto-forward unless ``output`` is set.
 
-    Not ``remote.job_*``. Jobs are detached (``nohup``), persist a job dir,
-    and ``job_tail`` snapshots log files through ``run_script``. An attached
-    stream is required when an agent must see stage progress as it happens
-    and must tell a hang from slow progress. Detach-and-tail leaves both
-    holes: no remote-side kill of the original command, and no local
-    wall-clock kill while a pipe is stalled.
+    Not ``remote.job_*``. Jobs are detached through
+    ``remote_dev.processes.control``, persist a job dir, and ``job_tail``
+    snapshots supervisor logs. An attached stream is required when an
+    agent must see stage progress as it happens and must tell a hang from
+    slow progress. Detach-and-tail leaves both holes: no remote-side kill
+    of the original command, and no local wall-clock kill while a pipe is
+    stalled.
 
     Silent-hang handling: ``timeout_ms`` is enforced two ways at once.
 
@@ -348,12 +388,14 @@ def run_stream(
        producing output. A five-second grace margin lets the remote timeout
        fire first. ``--preserve-status`` keeps a successful command's real
        exit code.
-    2. Local-side kill. The local reader uses ``select.select`` with a
-       small slice so a wall-clock timeout is honoured immediately even
-       when output is sitting in a slow pipe buffer.
+    2. Local-side kill. The local reader waits with a small slice so a
+       wall-clock timeout is honoured immediately even when output is
+       sitting in a slow pipe buffer. POSIX uses ``select`` on pipes;
+       native Windows uses one reader thread per pipe because ``select``
+       cannot wait on subprocess pipes there.
 
     Either alone leaves a hole: remote-only misses a dead network;
-    local-only leaves an orphan process burning an NPU.
+    local-only leaves an orphan remote process.
 
     Callers that stream hour-scale jobs construct the endpoint with
     :meth:`Endpoint.for_long_stream`. :func:`stream_ssh_command` refuses
@@ -390,6 +432,103 @@ def _read_fd(fd: int) -> bytes | None:
     except OSError:
         return None
     return chunk if chunk else None
+
+
+def _pipe_select_supported() -> bool:
+    """``select`` on subprocess pipes is POSIX-only. Windows needs threads."""
+    return os.name != "nt"
+
+
+def _queue_get(
+    pending: "queue.Queue[tuple[int, bytes | None]]", timeout: float | None
+) -> tuple[int, bytes | None] | None:
+    try:
+        if timeout is not None and timeout <= 0:
+            return pending.get_nowait()
+        return pending.get(timeout=timeout)
+    except queue.Empty:
+        return None
+
+
+class _AttachedPipes:
+    """Deadline-friendly wait for subprocess pipe bytes.
+
+    POSIX: non-blocking fds + ``select``. Native Windows: one blocking
+    reader thread per pipe, because ``select`` cannot wait on those pipes.
+    """
+
+    def __init__(self, channels: list[_StreamChannel]) -> None:
+        self.channels = channels
+        self.use_select = _pipe_select_supported()
+        self._queue: queue.Queue[tuple[int, bytes | None]] | None = None
+        self._threads: list[threading.Thread] = []
+        if self.use_select:
+            for channel in channels:
+                os.set_blocking(channel.fd, False)
+            return
+        self._queue = queue.Queue()
+        for channel in channels:
+            thread = threading.Thread(
+                target=self._reader,
+                args=(channel,),
+                name=f"remote-dev-pipe-{channel.name}",
+                daemon=True,
+            )
+            thread.start()
+            self._threads.append(thread)
+
+    def _reader(self, channel: _StreamChannel) -> None:
+        assert self._queue is not None
+        while True:
+            chunk = _read_fd(channel.fd)
+            if chunk is None:
+                self._queue.put((channel.fd, None))
+                return
+            if chunk:
+                self._queue.put((channel.fd, chunk))
+
+    def wait(self, open_fds: set[int], timeout: float | None) -> list[tuple[int, bytes | None]]:
+        if not open_fds:
+            return []
+        if self.use_select:
+            ready, _, _ = select.select(list(open_fds), [], [], timeout)
+            return [(fd, _read_fd(fd)) for fd in ready]
+        assert self._queue is not None
+        first = _queue_get(self._queue, timeout)
+        if first is None:
+            return []
+        items = [first]
+        while True:
+            nxt = _queue_get(self._queue, 0)
+            if nxt is None:
+                break
+            items.append(nxt)
+        return [(fd, chunk) for fd, chunk in items if fd in open_fds]
+
+    def drain(self, open_fds: set[int]) -> list[tuple[int, bytes | None]]:
+        """Read remaining bytes after the child has exited."""
+        if self.use_select:
+            items: list[tuple[int, bytes | None]] = []
+            for fd in list(open_fds):
+                while True:
+                    chunk = _read_fd(fd)
+                    if not chunk:
+                        items.append((fd, None if chunk is None else b""))
+                        break
+                    items.append((fd, chunk))
+            return items
+        leftover: list[tuple[int, bytes | None]] = []
+        while True:
+            nxt = _queue_get(self._queue, 0) if self._queue is not None else None
+            if nxt is None:
+                break
+            if nxt[0] in open_fds:
+                leftover.append(nxt)
+        seen = {fd for fd, _chunk in leftover}
+        for fd in open_fds:
+            if fd not in seen:
+                leftover.append((fd, None))
+        return leftover
 
 
 @dataclass
@@ -499,9 +638,10 @@ def _read_attached(
 ) -> RemoteCompleted:
     """Deadline-aware reader for merged or separate SSH streams.
 
-    Uses ``select`` + ``os.read`` so a partial line cannot block past the
-    wall-clock deadline. ``capture=False`` is the historical merged mode
-    (forward live, leave ``RemoteCompleted.stdout`` empty).
+    Uses ``select`` + ``os.read`` on POSIX, or reader threads on native
+    Windows, so a partial line cannot block past the wall-clock deadline.
+    ``capture=False`` is the historical merged mode (forward live, leave
+    ``RemoteCompleted.stdout`` empty).
     """
     assert proc.stdout is not None
     channels = [_StreamChannel(name="stdout", fd=proc.stdout.fileno())]
@@ -509,8 +649,7 @@ def _read_attached(
         channels.append(_StreamChannel(name="stderr", fd=proc.stderr.fileno()))
     by_fd = {channel.fd: channel for channel in channels}
     open_fds = set(by_fd)
-    for fd in open_fds:
-        os.set_blocking(fd, False)
+    pipes = _AttachedPipes(channels)
     started = time.monotonic()
     deadline = None if timeout_ms is None or timeout_ms <= 0 else started + (timeout_ms / 1000)
     timeout_message = (
@@ -617,11 +756,10 @@ def _read_attached(
                     captured_stdout() if capture else "",
                     captured_stderr() if capture else "",
                 )
-            ready, _, _ = select.select(list(open_fds), [], [], wait)
+            ready = pipes.wait(open_fds, wait)
             if ready:
-                for fd in ready:
+                for fd, chunk in ready:
                     channel = by_fd[fd]
-                    chunk = _read_fd(fd)
                     if chunk is None:
                         _flush_channel_lines(
                             channel,
@@ -649,12 +787,10 @@ def _read_attached(
                 continue
             if proc.poll() is None:
                 continue
-            for fd in list(open_fds):
+            drained = pipes.drain(open_fds)
+            for fd, chunk in drained:
                 channel = by_fd[fd]
-                while True:
-                    chunk = _read_fd(fd)
-                    if not chunk:
-                        break
+                if chunk:
                     _flush_channel_lines(
                         channel,
                         text=channel.decoder.decode(chunk),
@@ -664,6 +800,20 @@ def _read_attached(
                         capture=capture,
                         final=False,
                     )
+                if not chunk:
+                    _flush_channel_lines(
+                        channel,
+                        text=channel.decoder.decode(b"", final=True),
+                        forward_prefix=forward_prefix,
+                        output=output,
+                        on_output=on_output,
+                        capture=capture,
+                        final=True,
+                    )
+                    open_fds.discard(fd)
+                    close_channel(channel)
+            for fd in list(open_fds):
+                channel = by_fd[fd]
                 _flush_channel_lines(
                     channel,
                     text=channel.decoder.decode(b"", final=True),
@@ -869,9 +1019,30 @@ def local_forward_ssh_command(
     )
 
 
+def _kill_windows_tree(pid: int, *, force: bool) -> None:
+    argv = ["taskkill", "/PID", str(pid), "/T"]
+    if force:
+        argv.append("/F")
+    try:
+        subprocess.run(argv, capture_output=True, check=False)
+    except OSError:
+        pass
+
+
 def _stop_process_group(proc: subprocess.Popen[Any], *, timeout_s: float = 5.0) -> int:
     if proc.poll() is not None:
         return _rewrite_forward_exit(proc.returncode)
+    if os.name == "nt":
+        _kill_windows_tree(proc.pid, force=False)
+        try:
+            return _rewrite_forward_exit(proc.wait(timeout=timeout_s))
+        except subprocess.TimeoutExpired:
+            _kill_windows_tree(proc.pid, force=True)
+            try:
+                return _rewrite_forward_exit(proc.wait(timeout=timeout_s))
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                return _rewrite_forward_exit(proc.wait(timeout=timeout_s))
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError, OSError):
@@ -1013,16 +1184,19 @@ def open_local_forward(
         remote_host=remote_host,
         remote_port=remote_port,
     )
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            start_new_session=True,
-        )
+        proc = subprocess.Popen(cmd, **popen_kwargs)
     except FileNotFoundError as exc:
         raise RemoteExecutionError(f"required local command not found: {cmd[0]}") from exc
     handle = LocalForward(

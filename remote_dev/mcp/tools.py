@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import shlex
 from typing import Any
 
 from remote_dev.core.artifact_ops import remote_artifact_manifest, remote_artifact_pull, remote_artifact_push
@@ -14,7 +13,6 @@ from remote_dev.core.monitor_ops import remote_monitor
 from remote_dev.core.patch_ops import remote_apply_patch
 from remote_dev.core.search_ops import remote_glob, remote_grep
 from remote_dev.core.shell_ops import remote_bash
-from remote_dev.core.ssh_transport import run_script
 from remote_dev.core.state_store import (
     artifacts_dir,
     jobs_dir,
@@ -25,6 +23,7 @@ from remote_dev.core.state_store import (
     state_root,
 )
 from remote_dev.mcp.schemas import ALIASES, TOOL_SCHEMAS
+from remote_dev.processes import control
 
 ENDPOINT_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -37,15 +36,15 @@ def list_tools() -> list[dict[str, Any]]:
         "remote.write": "Write a remote file with overwrite support and optional read-ledger concurrency checks.",
         "remote.edit": "Edit a remote file with exact string replacement and optional read-ledger concurrency checks.",
         "remote.multi_edit": "Apply multiple exact edits atomically to one remote file.",
-        "remote.bash": "Run a remote shell command with Bash-like semantics, logs, preview, and optional background job.",
+        "remote.bash": "Run a remote shell command with Bash-like semantics, logs, preview, and optional background job (same process supervisor as remote.job_*).",
         "remote.glob": "Find remote paths with ** glob semantics.",
         "remote.grep": "Search remote files with rg-compatible semantics and a grep -E (POSIX ERE) fallback.",
         "remote.ls": "List a remote directory without reading file contents.",
         "remote.monitor": "Start a background remote command for monitoring.",
         "remote.apply_patch": "Apply a Codex apply_patch payload or unified diff on a remote endpoint.",
-        "remote.job_status": "Check remote background job status.",
-        "remote.job_tail": "Tail remote background job logs.",
-        "remote.job_stop": "Stop a remote background job.",
+        "remote.job_status": "Check a remote background job through the shared process supervisor.",
+        "remote.job_tail": "Tail remote background job logs through the shared process supervisor.",
+        "remote.job_stop": "Stop a remote background job through the shared process supervisor.",
         "remote.artifact_manifest": "Build a remote artifact sha256 manifest.",
         "remote.artifact_pull": "Pull a remote artifact through SSH streaming with hash verification.",
         "remote.artifact_push": "Push a local artifact through SSH streaming with hash verification.",
@@ -131,19 +130,13 @@ def _job_record(endpoint_id: str, job_id: str) -> dict[str, Any]:
 
 def _read_job_log(record: dict[str, Any], stream: str) -> str:
     endpoint = endpoint_from_job_record(record)
-    log_path = str(record.get("remote_dir", "")).rstrip("/") + f"/{stream}.log"
-    script = (
-        f"path={shlex.quote(log_path)}\n"
-        "if [ ! -f \"$path\" ]; then exit 0; fi\n"
-        "size=$(wc -c < \"$path\" 2>/dev/null || echo 0)\n"
-        f"head -c {RESOURCE_LOG_LIMIT_BYTES} \"$path\"\n"
-        f"if [ \"$size\" -gt {RESOURCE_LOG_LIMIT_BYTES} ]; then "
-        f"printf '\\n<remote-dev resource truncated at {RESOURCE_LOG_LIMIT_BYTES} bytes>\\n'; fi\n"
-    )
-    completed = run_script(endpoint, script, timeout_ms=20000)
-    if completed.returncode != 0 or completed.timed_out:
-        return completed.stderr or completed.stdout or "failed to read remote job log"
-    return completed.stdout
+    supervisor = control(endpoint, str(record["job_id"]), "tail", lines=200)
+    text = str(supervisor.get(stream) or "")
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) > RESOURCE_LOG_LIMIT_BYTES:
+        clipped = encoded[:RESOURCE_LOG_LIMIT_BYTES].decode("utf-8", errors="replace")
+        return clipped + f"\n<remote-dev resource truncated at {RESOURCE_LOG_LIMIT_BYTES} bytes>\n"
+    return text
 
 
 def _read_artifact_manifest(endpoint_id: str, artifact_id: str) -> str:

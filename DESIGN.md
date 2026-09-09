@@ -28,16 +28,18 @@ Layer B is the shared substrate:
 
 - endpoint identity and explicit resolution (`remote_dev.core.endpoint`)
 - resolver plugin interface for consumer-owned selectors (same module)
-- SSH transport with ControlMaster reuse, per-endpoint unmultiplexed
-  connections, optional ServerAlive keepalive, attached live streams,
-  local port forwards, and one-off interactive bootstrap
-  (`remote_dev.core.ssh_transport`)
+- SSH transport with ControlMaster reuse on POSIX, automatic independent
+  connections on native Windows (Win32-OpenSSH has no Client ControlMaster),
+  per-endpoint unmultiplexed connections, optional ServerAlive keepalive,
+  attached live streams, local port forwards, and one-off interactive
+  bootstrap (`remote_dev.core.ssh_transport`)
 - full-permission default root with optional explicit root/cwd path policy
   (`remote_dev.core.path_policy`, `remote_dev.core.permissions`)
 - optional read-ledger concurrency checks (`remote_dev.core.read_ledger`,
   `remote_dev.core.state_store`)
 - compact previews plus full refs (`remote_dev.core.preview`, `remote_dev.result`)
-- background job registry (`remote_dev.core.job_ops`)
+- generic remote process supervision (`remote_dev.processes.control`)
+- background job registry on that same supervisor (`remote_dev.core.job_ops`)
 - artifact manifests and pull/push verification (`remote_dev.core.artifact_ops`)
 - Claude/Codex hook guards (`remote_dev.hooks`)
 - MCP server and resources (`remote_dev.mcp`)
@@ -53,9 +55,14 @@ The substrate depends on nothing but the Python standard library and an
 `ssh` binary. Consumers depend on the substrate. Concretely:
 
 - Endpoint resolution accepts `host`/`port`/`user`/`root`/`cwd`/... and
-  `alias`. Every other selector (session ids, machine names, worktree
-  bindings) is resolved by a plugin the consumer registers via
+  `alias`. Default cwd is the endpoint root. Every other selector is
+  resolved by a plugin the consumer registers via
   `remote_dev.core.endpoint.register_resolver` or `REMOTE_DEV_RESOLVERS`.
+  remote-dev does not interpret session, profile, or binding identifiers.
+- Generic process control is `remote_dev.processes.control`. Ordinary
+  background jobs and coordinator-managed executions share that worker.
+  The package ships the Linux supervisor; it does not require a
+  coordinator install for host+port operations.
 - Consumer facts that used to be constants are environment-configured:
   `REMOTE_DEV_RUNTIME_ENV_FILE` (remote profile script to source),
   `REMOTE_DEV_SSH_MUX_DIR` (shared ControlMaster directory),

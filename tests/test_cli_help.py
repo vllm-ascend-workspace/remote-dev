@@ -71,7 +71,7 @@ class CliHelpTests(unittest.TestCase):
             self.assertNotIn(legacy, proc.stdout)
 
     def test_cli_selector_without_resolver_is_endpoint_required(self) -> None:
-        proc = _cli("probe", "--selector", "session_id=abc")
+        proc = _cli("probe", "--selector", "lab=gpu-1")
         self.assertNotEqual(proc.returncode, 0)
         self.assertNotIn("Traceback", proc.stdout + proc.stderr)
         payload = json.loads(proc.stdout)

@@ -23,7 +23,9 @@ from .errors import EndpointError
 
 DEFAULT_USER = os.environ.get("REMOTE_DEV_DEFAULT_USER", "root")
 DEFAULT_ROOT = os.environ.get("REMOTE_DEV_DEFAULT_ROOT", "/")
-DEFAULT_CWD = os.environ.get("REMOTE_DEV_DEFAULT_CWD", "/vllm-workspace")
+# Empty means "use root". Consumers that want a project tree set
+# REMOTE_DEV_DEFAULT_CWD themselves; this package does not assume one.
+DEFAULT_CWD = os.environ.get("REMOTE_DEV_DEFAULT_CWD", "") or None
 DEFAULT_RUNTIME_ENV_FILE = os.environ.get("REMOTE_DEV_RUNTIME_ENV_FILE", "") or None
 
 # Fields remote-dev understands natively on every tool payload. Consumers may
@@ -281,7 +283,7 @@ def register_resolver(
     """Register a consumer endpoint resolver.
 
     ``fields`` names the payload keys this resolver claims (for example
-    ``("session_id", "machine")``). They are advertised as endpoint selectors
+    ``("lab",)``). They are advertised as endpoint selectors
     so tools that normally require an endpoint (``remote.job_status`` and
     friends may run without one) can tell "the caller supplied a selector"
     apart from "no target at all". Resolvers are consulted in registration

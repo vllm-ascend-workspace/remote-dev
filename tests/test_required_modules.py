@@ -19,6 +19,8 @@ class RequiredModulesTests(unittest.TestCase):
             "remote_dev.core.search_ops",
             "remote_dev.core.patch_ops",
             "remote_dev.core.job_ops",
+            "remote_dev.processes",
+            "remote_dev.processes.client",
             "remote_dev.core.monitor_ops",
             "remote_dev.core.artifact_ops",
             "remote_dev.core.context_snapshot",

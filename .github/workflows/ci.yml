@@ -14,12 +14,13 @@ concurrency:
 
 jobs:
   contracts:
-    name: Contracts (Python ${{ matrix.python }})
-    runs-on: ubuntu-latest
+    name: Contracts (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
@@ -29,12 +30,36 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install package
-        run: python3 -m pip install -e ".[test]"
+        run: python -m pip install -e ".[test]"
       - name: Unit tests
-        # Mocked transports and temporary state only; no SSH, no hardware.
-        run: python3 -m pytest
+        # Mocked transports and temporary state only; no SSH server, no hardware.
+        run: python -m pytest
       - name: Local contract gates
         run: remote-dev validate --local-only
+
+  client-portability:
+    name: Client portability (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install package
+        run: python -m pip install -e ".[test]"
+      - name: Local subprocess, stream, process-control, and standalone tests
+        # No SSH server. These prove the local macOS/Windows client path:
+        # pipe readers, process-group stop, control() JSON stdin shipping,
+        # and ordinary job wrappers. Linux worker tests skip off Linux.
+        run: python -m pytest tests/test_ssh_transport.py tests/test_process_control.py tests/test_process_worker.py tests/test_job_ops.py tests/test_remote_bash.py tests/test_endpoint.py tests/test_required_modules.py tests/test_service_api_contract.py tests/test_cli_help.py
 
   wheel:
     name: Wheel install (P14)
@@ -48,14 +73,15 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install uv
-        run: python3 -m pip install uv
-      - name: Build wheel, install clean venv, import, --help
+        run: python -m pip install uv
+      - name: Build wheel, install clean venv, import, --help, worker source
         run: |
           set -euo pipefail
           uv build
           wheel=$(ls -1 dist/*.whl)
           clean=$(mktemp -d)
-          python3 -m venv "$clean/venv"
+          python -m venv "$clean/venv"
           "$clean/venv/bin/python" -m pip install "$wheel"
           "$clean/venv/bin/python" -c "import remote_dev; print(remote_dev.__version__)"
+          "$clean/venv/bin/python" -c "from remote_dev.processes import control, worker_source; src=worker_source(); assert callable(control); assert 'PR_SET_CHILD_SUBREAPER' in src; assert 'REMOTE_DEV_JOB_TOKEN' in src; assert 'VAWS_REMOTE_JOB' not in src"
           "$clean/venv/bin/remote-dev" --help

@@ -71,7 +71,7 @@ def add_endpoint_args(parser: argparse.ArgumentParser) -> None:
         "--selector",
         action="append",
         metavar="KEY=VALUE",
-        help="Extra selector field for a registered endpoint resolver (repeatable), e.g. --selector session_id=abc.",
+        help="Extra selector field for a registered endpoint resolver (repeatable), e.g. --selector lab=gpu-1.",
     )
 
 

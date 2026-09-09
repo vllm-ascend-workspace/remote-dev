@@ -81,7 +81,7 @@ class RespectGitignoreTests(unittest.TestCase):
         env = {
             **os.environ,
             "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_AUTHOR_NAME": "remote-dev-test",
             "GIT_AUTHOR_EMAIL": "remote-dev-test@example.test",
             "GIT_COMMITTER_NAME": "remote-dev-test",
