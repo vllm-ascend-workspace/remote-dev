@@ -14,6 +14,28 @@ ENDPOINT_PROPS: dict[str, Any] = {
     "connect_timeout_ms": {"type": "integer", "default": 10000},
     "runtime_env_file": {"type": "string", "description": "Remote profile script sourced before commands when runtime_env is true."},
     "alias": {"type": "string", "description": "Name from the endpoint alias files."},
+    "ssh_mux": {
+        "type": "boolean",
+        "description": (
+            "Per-endpoint OpenSSH multiplexing. true uses the shared ControlMaster; "
+            "false forces an independent connection (ControlMaster=no, ControlPath=none, "
+            "ControlPersist=no). When omitted, REMOTE_DEV_SSH_MUX is the process default. "
+            "Pass false for long-lived connections (ssh -N -L tunnels or hour-scale streams): "
+            "ControlMaster delegates -N forwards to the mux master and the client exits rc=0 "
+            "immediately, tearing the tunnel down. OpenSSH first-option-wins makes a later "
+            "ControlMaster=no override ineffective."
+        ),
+    },
+    "long_lived": {
+        "type": "boolean",
+        "default": False,
+        "description": (
+            "Declare a long-lived connection. Adds ServerAlive keepalive so a slow "
+            "multi-hour stream does not die to an idle timeout. Conditional: short "
+            "multiplexed commands must not set this, because ServerAlive on a "
+            "ControlMaster client becomes master TCP policy (first-option-wins)."
+        ),
+    },
 }
 
 # Consumer resolvers may accept additional selector keys (for example a

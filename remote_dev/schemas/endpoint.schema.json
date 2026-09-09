@@ -11,7 +11,16 @@
     "cwd": {"type": "string"},
     "runtime_env": {"type": "boolean", "default": true},
     "identity_file": {"type": "string"},
-    "connect_timeout_ms": {"type": "integer", "default": 10000}
+    "connect_timeout_ms": {"type": "integer", "default": 10000},
+    "ssh_mux": {
+      "type": "boolean",
+      "description": "Per-endpoint OpenSSH multiplexing. true uses the shared ControlMaster; false forces an independent connection. When omitted, REMOTE_DEV_SSH_MUX is the process default."
+    },
+    "long_lived": {
+      "type": "boolean",
+      "default": false,
+      "description": "Declare a long-lived connection. Adds ServerAlive keepalive so a slow multi-hour stream does not die to an idle timeout."
+    }
   },
   "additionalProperties": true
 }

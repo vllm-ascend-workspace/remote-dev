@@ -34,6 +34,30 @@ def add_endpoint_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--connect-timeout-ms", type=int)
     parser.add_argument("--alias", help="Endpoint alias from the endpoint alias files.")
     parser.add_argument(
+        "--ssh-mux",
+        dest="ssh_mux",
+        action="store_true",
+        default=None,
+        help="Use the shared ControlMaster for this endpoint (overrides REMOTE_DEV_SSH_MUX).",
+    )
+    parser.add_argument(
+        "--no-ssh-mux",
+        dest="ssh_mux",
+        action="store_false",
+        help=(
+            "Force an independent SSH connection for this endpoint "
+            "(ControlMaster=no, ControlPath=none, ControlPersist=no). "
+            "Required for long-lived tunnels and hour-scale streams."
+        ),
+    )
+    parser.add_argument(
+        "--long-lived",
+        dest="long_lived",
+        action="store_true",
+        default=None,
+        help="Add ServerAlive keepalive. Use with --no-ssh-mux for multi-hour streams.",
+    )
+    parser.add_argument(
         "--selector",
         action="append",
         metavar="KEY=VALUE",
@@ -66,6 +90,8 @@ def endpoint_payload(args: argparse.Namespace) -> dict[str, Any]:
         "identity_file",
         "connect_timeout_ms",
         "alias",
+        "ssh_mux",
+        "long_lived",
     ):
         value = getattr(args, key, None)
         if value is not None:

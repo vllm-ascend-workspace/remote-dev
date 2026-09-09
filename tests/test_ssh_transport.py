@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -369,6 +370,211 @@ class SshMuxIsolationTests(unittest.TestCase):
                 ssh_transport.ssh_base_cmd(self.endpoint)
                 self.assertNotIn(SSH_MUX_ENV, os.environ)
         self.assertEqual(dict(os.environ), before)
+
+
+class PerEndpointMuxTests(unittest.TestCase):
+    """Gap 1: mux is an endpoint property. Shared and independent coexist."""
+
+    def setUp(self) -> None:
+        self.shared = Endpoint(host="192.0.2.10", port=46000, identity_file="/keys/a", ssh_mux=True)
+        self.independent = Endpoint(host="192.0.2.10", port=46000, identity_file="/keys/a", ssh_mux=False)
+
+    def _cmd(self, endpoint: Endpoint, env_value: str | None = None) -> list[str]:
+        with mock.patch.object(ssh_transport, "_MUX_READY", True):
+            with mock.patch.dict(os.environ):
+                if env_value is None:
+                    os.environ.pop(SSH_MUX_ENV, None)
+                else:
+                    os.environ[SSH_MUX_ENV] = env_value
+                return ssh_transport.ssh_base_cmd(endpoint)
+
+    def test_per_endpoint_mux_coexists_in_one_process_either_order(self) -> None:
+        # Would fail on main: mux is process-global, so the second call
+        # inherits the first call's REMOTE_DEV_SSH_MUX decision. Both orders
+        # must produce ControlMaster=auto on one endpoint and the full
+        # independent triple on the other.
+        observed: list[tuple[str, dict[str, str]]] = []
+        with mock.patch.object(ssh_transport, "_MUX_READY", True):
+            with mock.patch.dict(os.environ):
+                os.environ.pop(SSH_MUX_ENV, None)
+                for label, first, second in (
+                    ("shared-then-independent", self.shared, self.independent),
+                    ("independent-then-shared", self.independent, self.shared),
+                ):
+                    first_cmd = ssh_transport.ssh_base_cmd(first)
+                    second_cmd = ssh_transport.ssh_base_cmd(second)
+                    first_opts = _option_map(first_cmd)
+                    second_opts = _option_map(second_cmd)
+                    observed.append((label, first_opts, second_opts, first_cmd, second_cmd))
+                    if first is self.shared:
+                        self.assertEqual(first_opts["ControlMaster"], "auto")
+                        self.assertEqual(first_opts["ControlPersist"], "120")
+                        self.assertIn("%C-", first_opts["ControlPath"])
+                        self.assertNotEqual(first_opts["ControlPath"], "none")
+                        self.assertEqual(second_opts["ControlMaster"], "no")
+                        self.assertEqual(second_opts["ControlPath"], "none")
+                        self.assertEqual(second_opts["ControlPersist"], "no")
+                    else:
+                        self.assertEqual(first_opts["ControlMaster"], "no")
+                        self.assertEqual(first_opts["ControlPath"], "none")
+                        self.assertEqual(first_opts["ControlPersist"], "no")
+                        self.assertEqual(second_opts["ControlMaster"], "auto")
+                        self.assertEqual(second_opts["ControlPersist"], "120")
+                        self.assertIn("%C-", second_opts["ControlPath"])
+                        self.assertNotEqual(second_opts["ControlPath"], "none")
+
+        # Keep the constructed argv in the failure message so a reviewer can
+        # read the actual options rather than a description.
+        for label, first_opts, second_opts, first_cmd, second_cmd in observed:
+            self.assertNotEqual(
+                first_opts["ControlMaster"],
+                second_opts["ControlMaster"],
+                f"{label}: first={first_cmd!r} second={second_cmd!r}",
+            )
+
+    def test_explicit_ssh_mux_overrides_process_env_in_both_directions(self) -> None:
+        env_zero_shared = _option_map(self._cmd(self.shared, "0"))
+        env_one_independent = _option_map(self._cmd(self.independent, "1"))
+        self.assertEqual(env_zero_shared["ControlMaster"], "auto")
+        self.assertEqual(env_zero_shared["ControlPersist"], "120")
+        self.assertIn("%C-", env_zero_shared["ControlPath"])
+        self.assertEqual(env_one_independent["ControlMaster"], "no")
+        self.assertEqual(env_one_independent["ControlPath"], "none")
+        self.assertEqual(env_one_independent["ControlPersist"], "no")
+
+    def test_unset_ssh_mux_still_follows_process_env_default(self) -> None:
+        unset = Endpoint(host="192.0.2.10", port=46000, identity_file="/keys/a")
+        unset_default = _option_map(self._cmd(unset, None))
+        unset_zero = _option_map(self._cmd(unset, "0"))
+        self.assertEqual(unset_default["ControlMaster"], "auto")
+        self.assertEqual(unset_zero["ControlMaster"], "no")
+        self.assertEqual(unset_zero["ControlPath"], "none")
+        self.assertEqual(unset_zero["ControlPersist"], "no")
+
+
+class LongLivedKeepaliveTests(unittest.TestCase):
+    """Gap 2: ServerAlive is applied only when the endpoint is long-lived."""
+
+    def _cmd(self, **fields: object) -> list[str]:
+        endpoint = Endpoint(host="192.0.2.10", port=46000, **fields)  # type: ignore[arg-type]
+        with mock.patch.object(ssh_transport, "_MUX_READY", True):
+            with mock.patch.dict(os.environ):
+                os.environ.pop(SSH_MUX_ENV, None)
+                return ssh_transport.ssh_base_cmd(endpoint)
+
+    def test_long_lived_endpoint_adds_server_alive_keepalive(self) -> None:
+        # Would fail on main: ServerAlive* appears nowhere in the package.
+        cmd = self._cmd(long_lived=True, ssh_mux=False)
+        options = _option_map(cmd)
+        self.assertEqual(options["ServerAliveInterval"], "30")
+        self.assertEqual(options["ServerAliveCountMax"], "10")
+        self.assertEqual(options["ControlMaster"], "no")
+        self.assertEqual(options["ControlPath"], "none")
+        self.assertEqual(options["ControlPersist"], "no")
+        self.assertIn("ServerAliveInterval=30", cmd)
+        self.assertIn("ServerAliveCountMax=10", cmd)
+
+    def test_default_endpoint_has_no_server_alive(self) -> None:
+        cmd = self._cmd()
+        options = _option_map(cmd)
+        self.assertNotIn("ServerAliveInterval", options)
+        self.assertNotIn("ServerAliveCountMax", options)
+        self.assertFalse(any(item.startswith("ServerAlive") for item in cmd))
+
+    def test_keepalive_is_independent_of_mux_selection(self) -> None:
+        muxed_long = _option_map(self._cmd(long_lived=True, ssh_mux=True))
+        self.assertEqual(muxed_long["ControlMaster"], "auto")
+        self.assertEqual(muxed_long["ServerAliveInterval"], "30")
+        independent_short = _option_map(self._cmd(long_lived=False, ssh_mux=False))
+        self.assertEqual(independent_short["ControlMaster"], "no")
+        self.assertNotIn("ServerAliveInterval", independent_short)
+
+
+class LiveStreamTests(unittest.TestCase):
+    """Gap 3: attached live stream with dual-sided silent-hang handling."""
+
+    def setUp(self) -> None:
+        self.endpoint = Endpoint(host="192.0.2.10", port=46000, ssh_mux=False, long_lived=True)
+
+    def test_run_stream_wraps_remote_timeout_and_forwards_live_output(self) -> None:
+        # Would fail on main: run_stream / stream_ssh_command do not exist,
+        # and run_script only returns after the command finishes.
+        with mock.patch.object(ssh_transport, "_MUX_READY", True):
+            with mock.patch.dict(os.environ):
+                os.environ.pop(SSH_MUX_ENV, None)
+                argv = ssh_transport.stream_ssh_command(self.endpoint, "analyze", timeout_ms=120000)
+        options = _option_map(argv)
+        self.assertEqual(options["ControlMaster"], "no")
+        self.assertEqual(options["ControlPath"], "none")
+        self.assertEqual(options["ControlPersist"], "no")
+        self.assertEqual(options["ServerAliveInterval"], "30")
+        remote = argv[-1]
+        self.assertEqual(argv[-3:-1], ["bash", "-c"])
+        self.assertIn("timeout --preserve-status", remote)
+        self.assertIn("115s", remote)
+        self.assertIn("--preserve-status", remote)
+        self.assertIn("bash -lc", remote)
+
+        buf = io.StringIO()
+        # stream_ssh_command quotes for OpenSSH's remote-argv join. A local
+        # Popen list must receive the script unquoted, so the live-forward
+        # check patches the composed argv rather than ssh_base_cmd.
+        local_cmd = ["bash", "-c", "printf 'stage-a\\nstage-b\\n'"]
+        with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=local_cmd):
+            result = ssh_transport.run_stream(self.endpoint, "unused", timeout_ms=None, output=buf)
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(result.timed_out)
+        self.assertIn("[remote] stage-a", buf.getvalue())
+        self.assertIn("[remote] stage-b", buf.getvalue())
+        self.assertEqual(result.stdout, "")
+
+    def test_read_stream_honours_local_deadline_without_remote_host(self) -> None:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        buf = io.StringIO()
+        try:
+            result = ssh_transport._read_stream(proc, timeout_ms=800, forward_prefix="", output=buf)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
+        self.assertTrue(result.timed_out)
+        self.assertIsNone(result.returncode)
+        self.assertIn("wall-clock", result.stderr)
+
+    def test_stream_remote_payload_subtracts_grace_and_skips_non_positive_timeout(self) -> None:
+        wrapped = ssh_transport.stream_remote_payload("do-work", 30_000)
+        self.assertTrue(wrapped.startswith("timeout --preserve-status 25s bash -lc "))
+        self.assertIn("do-work", wrapped)
+        self.assertEqual(ssh_transport.stream_remote_payload("do-work", None), "do-work")
+        self.assertEqual(ssh_transport.stream_remote_payload("do-work", 0), "do-work")
+        one_second = ssh_transport.stream_remote_payload("do-work", 1_000)
+        self.assertIn("timeout --preserve-status 1s ", one_second)
+
+    def test_run_stream_is_not_a_result_v1_document(self) -> None:
+        from remote_dev.result import RESULT_SCHEMA_VERSION, make_result
+
+        self.assertEqual(RESULT_SCHEMA_VERSION, "remote-dev.result.v1")
+        buf = io.StringIO()
+        with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=["bash", "-c", "true"]):
+            completed = ssh_transport.run_stream(self.endpoint, "unused", output=buf)
+        self.assertIsInstance(completed, ssh_transport.RemoteCompleted)
+        self.assertNotIn("schema_version", completed.__dict__)
+        wrapped = make_result(
+            tool="remote.bash",
+            target=self.endpoint.to_result_target(),
+            outcome="success" if completed.returncode == 0 else "failed",
+            status="ok",
+            summary="stream finished",
+        )
+        self.assertEqual(wrapped["schema_version"], RESULT_SCHEMA_VERSION)
 
 
 if __name__ == "__main__":

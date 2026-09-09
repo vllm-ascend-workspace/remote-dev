@@ -28,10 +28,35 @@ class CliHelpTests(unittest.TestCase):
                 self.assertEqual(help_proc.returncode, 0, help_proc.stderr)
                 self.assertIn("usage:", help_proc.stdout)
 
+    def test_cli_payload_maps_ssh_mux_and_long_lived_flags(self) -> None:
+        from remote_dev.cli import build_parser, endpoint_payload
+
+        parser = build_parser("probe")
+        args = parser.parse_args(["--host", "192.0.2.10", "--port", "22", "--no-ssh-mux", "--long-lived"])
+        payload = endpoint_payload(args)
+        self.assertIs(payload["ssh_mux"], False)
+        self.assertIs(payload["long_lived"], True)
+        default_args = parser.parse_args(["--host", "192.0.2.10", "--port", "22"])
+        default_payload = endpoint_payload(default_args)
+        self.assertNotIn("ssh_mux", default_payload)
+        self.assertNotIn("long_lived", default_payload)
+
     def test_cli_endpoint_flags_are_explicit_only(self) -> None:
         proc = _cli("bash", "--help")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        for flag in ("--host", "--port", "--user", "--root", "--cwd", "--alias", "--selector", "--runtime-env-file"):
+        for flag in (
+            "--host",
+            "--port",
+            "--user",
+            "--root",
+            "--cwd",
+            "--alias",
+            "--selector",
+            "--runtime-env-file",
+            "--ssh-mux",
+            "--no-ssh-mux",
+            "--long-lived",
+        ):
             self.assertIn(flag, proc.stdout)
         for legacy in ("--session-id", "--session-file", "--machine"):
             self.assertNotIn(legacy, proc.stdout)

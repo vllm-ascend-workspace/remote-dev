@@ -38,6 +38,28 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(endpoint.root, "/")
         self.assertEqual(endpoint.effective_cwd, "/vllm-workspace")
         self.assertEqual(endpoint.kind, "direct-endpoint")
+        self.assertIsNone(endpoint.ssh_mux)
+        self.assertFalse(endpoint.long_lived)
+        self.assertNotIn("ssh_mux", endpoint.to_result_target())
+        self.assertNotIn("long_lived", endpoint.to_result_target())
+
+    def test_direct_endpoint_accepts_ssh_mux_and_long_lived(self) -> None:
+        independent = resolve_endpoint({"host": "192.0.2.10", "port": 22, "ssh_mux": False, "long_lived": True})
+        self.assertIs(independent.ssh_mux, False)
+        self.assertTrue(independent.long_lived)
+        target = independent.to_result_target()
+        self.assertIs(target["ssh_mux"], False)
+        self.assertIs(target["long_lived"], True)
+        shared = resolve_endpoint({"host": "192.0.2.10", "port": 22, "ssh_mux": True})
+        self.assertIs(shared.ssh_mux, True)
+        self.assertFalse(shared.long_lived)
+        self.assertIs(shared.to_result_target()["ssh_mux"], True)
+        self.assertNotIn("long_lived", shared.to_result_target())
+
+    def test_direct_endpoint_rejects_non_boolean_ssh_mux_or_long_lived(self) -> None:
+        for key, value in (("ssh_mux", "0"), ("ssh_mux", 0), ("long_lived", "true"), ("long_lived", 1)):
+            with self.assertRaises(EndpointError):
+                resolve_endpoint({"host": "192.0.2.10", "port": 22, key: value})
 
     def test_direct_endpoint_rejects_non_integer_port(self) -> None:
         with self.assertRaises(EndpointError):
@@ -143,6 +165,10 @@ class ResolverPluginTests(unittest.TestCase):
         self.assertEqual(endpoint.kind, "resolver:sessions")
         self.assertEqual(endpoint.source, {"session": "s1", "resolver": "sessions"})
         self.assertEqual(seen[-1]["session_id"], "s1")
+
+        overridden = resolve_endpoint({"session_id": "s1", "ssh_mux": False, "long_lived": True})
+        self.assertIs(overridden.ssh_mux, False)
+        self.assertTrue(overridden.long_lived)
 
     def test_resolver_may_return_endpoint_instance(self) -> None:
         register_resolver(lambda payload: Endpoint(host="10.2.2.2", port=22, kind="managed") if payload.get("machine") else None, name="machines", fields=("machine",))

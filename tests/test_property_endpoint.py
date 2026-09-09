@@ -62,6 +62,10 @@ def well_formed_payload(gen: Gen) -> dict[str, Any]:
     if gen.boolean():
         payload["connect_timeout_ms"] = gen.choice((1000, 10000, "2500", None, 0))
     if gen.boolean():
+        payload["ssh_mux"] = gen.choice((True, False, None))
+    if gen.boolean():
+        payload["long_lived"] = gen.choice((True, False, None))
+    if gen.boolean():
         payload["alias"] = gen.choice(("dev", None, ""))
     if gen.boolean():
         payload["source"] = gen.choice(({"origin": "test"}, "not-a-dict", None))
@@ -71,7 +75,24 @@ def well_formed_payload(gen: Gen) -> dict[str, Any]:
 
 
 def garbage_payload(gen: Gen) -> dict[str, Any]:
-    keys = ("host", "port", "user", "root", "cwd", "alias", "session_id", "session_file", "machine", "runtime_env", "identity_file", "kind", "source", "unknown_field")
+    keys = (
+        "host",
+        "port",
+        "user",
+        "root",
+        "cwd",
+        "alias",
+        "session_id",
+        "session_file",
+        "machine",
+        "runtime_env",
+        "identity_file",
+        "kind",
+        "source",
+        "ssh_mux",
+        "long_lived",
+        "unknown_field",
+    )
     payload: dict[str, Any] = {}
     for key in gen.subset(keys):
         payload[key] = gen.one_of(lambda: gen.choice(GARBAGE_VALUES), lambda: gen.word(0, 5), lambda: gen.integer(-5, 70000))
@@ -90,6 +111,8 @@ def assert_well_formed(test: unittest.TestCase, endpoint: Endpoint) -> None:
     test.assertTrue(endpoint.effective_cwd.startswith("/"), f"cwd must be absolute: {endpoint.effective_cwd!r}")
     test.assertIsInstance(endpoint.connect_timeout_ms, int)
     test.assertIsInstance(endpoint.runtime_env, bool)
+    test.assertIn(endpoint.ssh_mux, (True, False, None))
+    test.assertIsInstance(endpoint.long_lived, bool)
     test.assertTrue(endpoint.kind == "direct-endpoint" or endpoint.kind.startswith("resolver:"), endpoint.kind)
     target = endpoint.to_result_target()
     for key in ("kind", "endpoint_id", "host", "port", "user", "root", "cwd", "runtime_env"):
@@ -143,8 +166,22 @@ class DirectEndpointProperties(ResolverIsolation):
         def body(gen: Gen, _index: int) -> None:
             base = {"host": gen.choice(DOC_HOSTS), "port": gen.integer(1, 65535), "user": gen.word(1, 6), "root": gen.choice(("/", "/vllm-workspace"))}
             a = resolve_endpoint({**base, "cwd": "/vllm-workspace", "connect_timeout_ms": 1000, "runtime_env": True})
-            b = resolve_endpoint({**base, "cwd": "/vllm-workspace/other", "connect_timeout_ms": 9000, "runtime_env": False, "identity_file": "~/.ssh/k"})
-            self.assertEqual(a.endpoint_id, b.endpoint_id, "cwd/timeout/runtime_env/identity must not change endpoint identity")
+            b = resolve_endpoint(
+                {
+                    **base,
+                    "cwd": "/vllm-workspace/other",
+                    "connect_timeout_ms": 9000,
+                    "runtime_env": False,
+                    "identity_file": "~/.ssh/k",
+                    "ssh_mux": False,
+                    "long_lived": True,
+                }
+            )
+            self.assertEqual(
+                a.endpoint_id,
+                b.endpoint_id,
+                "cwd/timeout/runtime_env/identity/ssh_mux/long_lived must not change endpoint identity",
+            )
             for field, value in (("host", gen.choice([h for h in DOC_HOSTS if h != base["host"]])), ("port", (base["port"] % 65535) + 1), ("user", base["user"] + "x"), ("root", "/elsewhere")):
                 other = resolve_endpoint({**base, field: value})
                 self.assertNotEqual(other.endpoint_id, a.endpoint_id, f"changing {field} must change endpoint identity")

@@ -1,11 +1,12 @@
 """Endpoint identity and resolution.
 
 remote-dev resolves endpoints from explicit fields only: ``host`` + ``port``
-(plus optional ``user`` / ``root`` / ``cwd`` / ``identity_file`` / ...), or an
-``alias`` looked up in a local alias file. Anything else - managed sessions,
-machine inventories, worktree bindings, coordinator state - belongs to the
-consumer. A consumer injects that knowledge through the resolver plugin
-interface (:func:`register_resolver`); remote-dev never imports the consumer.
+(plus optional ``user`` / ``root`` / ``cwd`` / ``identity_file`` /
+``ssh_mux`` / ``long_lived`` / ...), or an ``alias`` looked up in a local
+alias file. Anything else - managed sessions, machine inventories, worktree
+bindings, coordinator state - belongs to the consumer. A consumer injects
+that knowledge through the resolver plugin interface
+(:func:`register_resolver`); remote-dev never imports the consumer.
 """
 from __future__ import annotations
 
@@ -45,6 +46,8 @@ class Endpoint:
     runtime_env_file: str | None = DEFAULT_RUNTIME_ENV_FILE
     identity_file: str | None = None
     connect_timeout_ms: int = 10000
+    ssh_mux: bool | None = None
+    long_lived: bool = False
     kind: str = "direct-endpoint"
     alias: str | None = None
     source: dict[str, Any] | None = None
@@ -81,6 +84,10 @@ class Endpoint:
             payload["alias"] = self.alias
         if self.source:
             payload["source"] = self.source
+        if self.ssh_mux is not None:
+            payload["ssh_mux"] = self.ssh_mux
+        if self.long_lived:
+            payload["long_lived"] = True
         return payload
 
 
@@ -148,6 +155,24 @@ def _connect_timeout_ms(payload: dict[str, Any]) -> int:
     return timeout
 
 
+def _optional_bool(payload: dict[str, Any], key: str) -> bool | None:
+    if key not in payload or payload[key] is None:
+        return None
+    raw = payload[key]
+    if isinstance(raw, bool):
+        return raw
+    raise EndpointError(f"endpoint {key} must be a boolean")
+
+
+def _bool_field(payload: dict[str, Any], key: str, default: bool = False) -> bool:
+    if key not in payload or payload[key] is None:
+        return default
+    raw = payload[key]
+    if isinstance(raw, bool):
+        return raw
+    raise EndpointError(f"endpoint {key} must be a boolean")
+
+
 def _direct_endpoint(payload: dict[str, Any]) -> Endpoint:
     if "host" not in payload or "port" not in payload:
         raise EndpointError("direct endpoint requires host and port")
@@ -175,6 +200,8 @@ def _direct_endpoint(payload: dict[str, Any]) -> Endpoint:
         runtime_env_file=str(runtime_env_file) if runtime_env_file else None,
         identity_file=str(payload["identity_file"]) if payload.get("identity_file") else None,
         connect_timeout_ms=_connect_timeout_ms(payload),
+        ssh_mux=_optional_bool(payload, "ssh_mux"),
+        long_lived=_bool_field(payload, "long_lived", False),
         kind=str(payload.get("kind") or "direct-endpoint"),
         alias=str(payload["alias"]) if payload.get("alias") else None,
         source=payload.get("source") if isinstance(payload.get("source"), dict) else None,
@@ -376,7 +403,17 @@ def _endpoint_from_resolver(entry: RegisteredResolver, payload: dict[str, Any]) 
     overrides = {
         key: value
         for key, value in payload.items()
-        if key in ("user", "root", "cwd", "runtime_env", "runtime_env_file", "identity_file", "connect_timeout_ms")
+        if key in (
+            "user",
+            "root",
+            "cwd",
+            "runtime_env",
+            "runtime_env_file",
+            "identity_file",
+            "connect_timeout_ms",
+            "ssh_mux",
+            "long_lived",
+        )
         and value is not None
     }
     merged = {**resolved, **overrides}
