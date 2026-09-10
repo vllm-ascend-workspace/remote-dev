@@ -205,7 +205,9 @@ class RemoteReadPaginationProperties(unittest.TestCase):
     def test_invalid_pagination_is_a_needs_input_status_not_a_crash(self) -> None:
         path = self.root / "p.txt"
         path.write_text("a\nb\n", encoding="utf-8")
-        for offset, limit in ((-3, 2), (2, -1), (-1, -1)):
+        # Negative offsets are valid (read-from-end); negative limits and a
+        # zero limit remain invalid.
+        for offset, limit in ((2, -1), (1, -3)):
             with self.subTest(offset=offset, limit=limit):
                 data = run_remote_script(
                     file_ops.REMOTE_FILE_PY,
@@ -213,6 +215,19 @@ class RemoteReadPaginationProperties(unittest.TestCase):
                 )
                 self.assertEqual(data["status"], "invalid_pagination")
                 self.assertEqual(file_ops._status_to_outcome(data["status"]), "needs_input")
+
+    def test_negative_offset_reads_from_end(self) -> None:
+        # Contract pin for the Kimi native Read habit: offset=-N starts N
+        # lines before the end of the file.
+        path = self.root / "p.txt"
+        path.write_text("a\nb\nc\nd\n", encoding="utf-8")
+        data = run_remote_script(
+            file_ops.REMOTE_FILE_PY,
+            {"op": "read", "root": str(self.root), "cwd": str(self.root), "file_path": "p.txt", "offset": -2, "limit": 10},
+        )
+        self.assertEqual(data["status"], "partial")
+        self.assertEqual(data["file"]["line_start"], 3)
+        self.assertIn("3 | c", data["file"]["content"])
 
     def test_zero_offset_and_limit_fall_back_to_documented_defaults(self) -> None:
         # Contract pin: 0 is treated as "not provided" (offset 1, limit 200),

@@ -17,7 +17,7 @@ from remote_dev.core.endpoint import Endpoint, resolve_endpoint
 from remote_dev.core.errors import RemoteExecutionError
 from remote_dev.core.ssh_transport import run_remote_python
 
-ACTIONS = frozenset({"prepare", "go", "status", "tail", "stop"})
+ACTIONS = frozenset({"prepare", "go", "status", "tail", "stop", "stdin"})
 CONTROL_TIMEOUT_MS = 45000
 WORKER_RELATIVE = Path(__file__).with_name("worker.py")
 
@@ -74,11 +74,14 @@ def control(endpoint: Endpoint | Mapping[str, Any], job_id: str, action: str, **
 
     ``endpoint`` is an :class:`~remote_dev.core.endpoint.Endpoint` or an
     ordinary connection mapping (``host`` + ``port`` plus auth/root/cwd).
-    ``action`` is ``prepare``, ``go``, ``status``, ``tail``, or ``stop``.
-    ``prepare`` takes ``spec={"command", "cwd", "env", "timeout_seconds"}``.
-    ``go`` may carry an opaque ``authorization`` value; this package does
-    not interpret resource-lease or fence semantics. Return value is the
-    structured supervisor dict (``state``, ``quiet``, ``receipt``, ...).
+    ``action`` is ``prepare``, ``go``, ``status``, ``tail``, ``stop``, or
+    ``stdin``. ``prepare`` takes ``spec={"command", "cwd", "env",
+    "timeout_seconds", "interactive"}``; an interactive spec gives the job a
+    writable stdin channel driven by the ``stdin`` action (``data`` bytes to
+    write, ``eof`` to close input). ``go`` may carry an opaque
+    ``authorization`` value; this package does not interpret resource-lease
+    or fence semantics. Return value is the structured supervisor dict
+    (``state``, ``quiet``, ``receipt``, ...).
     """
     if action not in ACTIONS:
         raise ValueError(f"unsupported job action: {action}")

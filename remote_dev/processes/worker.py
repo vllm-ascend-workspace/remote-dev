@@ -25,6 +25,10 @@ ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 JOB_TOKEN_ENV = "REMOTE_DEV_JOB_TOKEN"
 JOB_ENV_PREFIX = "REMOTE_DEV_JOB_"
 JOBS_DIRNAME = ".remote-dev"
+# In-memory cap for stdin bytes accepted from the FIFO but not yet consumed by
+# the child pipe. Past the cap the worker stops draining the FIFO so a writer
+# blocks (or a nonblocking writer gets EAGAIN) instead of growing worker RAM.
+STDIN_BUFFER_CAP = 262144
 
 
 def atomic_json(path, value):
@@ -159,14 +163,30 @@ def worker(directory):
     if (directory / "stop.json").exists() or gate["valid_until"] <= time.time():
         atomic_json(directory / "result.json", {"state": "cancelled", "reason": "activation ticket expired"})
         return
+    # Interactive sessions: callers write to the on-disk FIFO through the
+    # "stdin" control action; this proxy forwards bytes into the child's
+    # pipe so stdin EOF stays under worker control (stdin-eof.json). A plain
+    # background job keeps DEVNULL stdin.
+    interactive = bool(spec.get("interactive"))
+    fifo_fd = None
+    pipe_w = None
+    if interactive:
+        fifo_fd = os.open(directory / "stdin.pipe", os.O_RDONLY | os.O_NONBLOCK)
+        pipe_r, pipe_w = os.pipe()
+        os.set_blocking(pipe_w, False)
     with (directory / "stdout.log").open("ab") as stdout, (directory / "stderr.log").open("ab") as stderr:
         environment = {**os.environ, **spec["env"]}
         child = subprocess.Popen(["bash", "-c", spec["command"]], cwd=spec["cwd"], env=environment,
-                                 stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+                                 stdin=pipe_r if interactive else subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+        if interactive:
+            os.close(pipe_r)
         receipt = read_json(directory / "receipt.json")
         timeout_seconds = spec.get("timeout_seconds")
         deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
         stopping_at, terminal = None, None
+        pending_stdin = bytearray()
+        stdin_eof = False
+        fifo_drained = False
         while True:
             code = child.poll()
             if code is not None:
@@ -175,6 +195,36 @@ def worker(directory):
                 with contextlib.suppress(ChildProcessError):
                     while os.waitpid(-1, os.WNOHANG)[0]:
                         pass
+            if interactive:
+                # Backpressure: once the in-memory buffer hits the cap, stop
+                # draining the FIFO so writers block instead of growing RAM.
+                if fifo_fd is not None and len(pending_stdin) < STDIN_BUFFER_CAP:
+                    try:
+                        chunk = os.read(fifo_fd, 65536)
+                    except BlockingIOError:
+                        chunk = b""
+                    if chunk:
+                        pending_stdin.extend(chunk)
+                    elif stdin_eof:
+                        # b"" from a FIFO read means every writer is gone and
+                        # the kernel buffer is empty: all accepted stdin bytes
+                        # are now in pending_stdin, none stay behind in the FIFO.
+                        fifo_drained = True
+                if pending_stdin and pipe_w is not None:
+                    try:
+                        written = os.write(pipe_w, bytes(pending_stdin))
+                        del pending_stdin[:written]
+                    except BlockingIOError:
+                        pass
+                if not stdin_eof and (directory / "stdin-eof.json").exists():
+                    stdin_eof = True
+                if stdin_eof and fifo_drained and fifo_fd is not None:
+                    os.close(fifo_fd)
+                    fifo_fd = None
+                if stdin_eof and fifo_drained and not pending_stdin and pipe_w is not None:
+                    # EOF reaches the child only after every accepted byte.
+                    os.close(pipe_w)
+                    pipe_w = None
             stop = read_json(directory / "stop.json")
             timed_out = deadline is not None and time.monotonic() >= deadline
             if terminal is None and (stop or timed_out):
@@ -191,6 +241,10 @@ def worker(directory):
             if code is not None and not children:
                 break
             time.sleep(0.05)
+        if pipe_w is not None:
+            os.close(pipe_w)
+        if fifo_fd is not None:
+            os.close(fifo_fd)
         result = {"state": terminal or ("succeeded" if code == 0 else "failed"),
                   "exit_code": code, "descendants_drained": True, "finished_at": time.time()}
         atomic_json(directory / "result.json", result)
@@ -232,6 +286,8 @@ def control_job(request, source):
                 raise ValueError("jobs require timeout_seconds None or 1..86400")
             if any(not ENV_NAME_RE.fullmatch(key) or key.startswith(JOB_ENV_PREFIX) for key in spec["env"]):
                 raise ValueError("invalid or reserved environment variable")
+            if "interactive" in spec and type(spec["interactive"]) is not bool:
+                raise ValueError("jobs require interactive to be a boolean")
             intent = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
             existing = read_json(directory / "intent.json")
             if existing:
@@ -240,6 +296,14 @@ def control_job(request, source):
                 return job_status(directory)
             atomic_json(directory / "intent.json", {"digest": intent})
             atomic_json(directory / "spec.json", spec)
+            if spec.get("interactive"):
+                # The stdin channel is an on-disk FIFO owned by the job dir.
+                # The worker holds the read end and proxies bytes into the
+                # child pipe; writers use the "stdin" control action.
+                try:
+                    os.mkfifo(directory / "stdin.pipe", 0o600)
+                except FileExistsError:
+                    pass
             script = directory / "runner.py"
             script.write_text(source)
             os.chmod(script, 0o600)
@@ -289,13 +353,57 @@ def control_job(request, source):
         elif action == "tail":
             lines = min(200, max(1, int(request.get("lines", 60))))
             result = job_status(directory)
+            max_bytes = min(32768, max(1, int(request.get("max_bytes") or 32768)))
             for name in ("stdout", "stderr"):
                 path = directory / (name + ".log")
                 if path.exists():
-                    with path.open("rb") as stream:
-                        stream.seek(max(0, path.stat().st_size - 32000))
-                        result[name] = "\n".join(stream.read().decode(errors="replace").splitlines()[-lines:])
+                    offset_key = name + "_offset"
+                    if request.get(offset_key) is not None:
+                        # Incremental read for interactive sessions: return only
+                        # bytes after the caller's cursor, plus the new cursor.
+                        # Repeated polls never replay earlier output.
+                        start_offset = max(0, int(request[offset_key]))
+                        with path.open("rb") as stream:
+                            stream.seek(start_offset)
+                            chunk = stream.read(max_bytes)
+                        result[name] = chunk.decode(errors="replace")
+                        result[offset_key] = start_offset + len(chunk)
+                        result[name + "_bytes_remaining"] = max(0, path.stat().st_size - result[offset_key])
+                    else:
+                        with path.open("rb") as stream:
+                            stream.seek(max(0, path.stat().st_size - 32000))
+                            result[name] = "\n".join(stream.read().decode(errors="replace").splitlines()[-lines:])
             return result
+        elif action == "stdin":
+            status = job_status(directory)
+            data = str(request.get("data") or "")
+            if status["state"] != "running":
+                if not data:
+                    # Pure output polls (and a redundant eof) stay legal on a
+                    # terminal job, mirroring Codex write_stdin's final poll.
+                    return {"state": status["state"], "accepted": True, "written": 0,
+                            "eof": bool(request.get("eof")), "polled_terminal": True}
+                return {"state": status["state"], "accepted": False, "written": 0,
+                        "reason": f"job is {status['state']}, not running; stdin writes need a running job"}
+            fifo = directory / "stdin.pipe"
+            if not fifo.exists():
+                return {"state": status["state"], "accepted": False, "written": 0,
+                        "reason": "job has no stdin channel; restart it with interactive=true"}
+            raw = data.encode("utf-8")
+            if raw and (directory / "stdin-eof.json").exists():
+                return {"state": status["state"], "accepted": False, "written": 0,
+                        "reason": "stdin is already closed (eof); start a new interactive job for more input"}
+            written = 0
+            if raw:
+                fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                try:
+                    written = os.write(fd, raw)
+                finally:
+                    os.close(fd)
+            if request.get("eof"):
+                atomic_json(directory / "stdin-eof.json", {"at": time.time()})
+            return {"state": status["state"], "accepted": True, "written": written,
+                    "eof": bool(request.get("eof")), "stdin_buffer_full": written < len(raw)}
         elif action != "status":
             raise ValueError("unsupported job action")
         return job_status(directory)

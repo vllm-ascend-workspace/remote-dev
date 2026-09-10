@@ -100,12 +100,23 @@ if op == "read":
         if target != root and root not in target.parents:
             fail("path_outside_root", f"symlink target escapes root: {target}")
     raw = path.read_bytes()
+    if b"\x00" in raw[:8192]:
+        fail(
+            "binary_file",
+            f"remote.read returns UTF-8 text and {path} looks binary (NUL byte in the first 8192 bytes). "
+            "There is no remote image/media preview tool: inspect it with remote.bash "
+            "(file, sha256sum, xxd) or copy it back with remote.artifact_pull.",
+        )
     text = raw.decode("utf-8", errors="replace")
     lines = text.splitlines()
     offset = int(payload.get("offset") or 1)
     limit = int(payload.get("limit") or 200)
-    if offset < 1 or limit < 1:
-        fail("invalid_pagination", "offset and limit must be positive integers")
+    if limit < 1 or offset == 0:
+        fail("invalid_pagination", "limit must be a positive integer and offset must not be 0")
+    if offset < 0:
+        # Kimi native Read habit: a negative offset counts back from the end
+        # of the file, so offset=-N reads the last N lines.
+        offset = max(1, len(lines) + offset + 1)
     start = min(offset - 1, len(lines))
     end = min(start + limit, len(lines))
     max_line_chars = int(payload.get("max_line_chars") or 2000)
@@ -176,12 +187,15 @@ if op == "write":
     raw = content.encode("utf-8")
     create_dirs = bool(payload.get("create_dirs", False))
     overwrite = bool(payload.get("overwrite", False))
+    append = bool(payload.get("append", False))
+    if append and overwrite:
+        fail("invalid_flags", "append and overwrite are mutually exclusive")
     existed = path.exists() or path.is_symlink()
     if existed and path.is_symlink():
         fail("symlink_not_allowed", f"refusing to overwrite symlink: {path}")
     if existed and not path.is_file():
         fail("not_file", f"refusing to overwrite non-file path: {path}")
-    if existed and not overwrite:
+    if existed and not overwrite and not append:
         fail("file_exists", f"remote file already exists: {path}")
     before = path.read_bytes() if existed else None
     before_sha = sha256_bytes(before) if before is not None else None
@@ -193,6 +207,8 @@ if op == "write":
             path.parent.mkdir(parents=True, exist_ok=True)
         else:
             fail("parent_not_found", f"parent directory does not exist: {path.parent}")
+    if append and before is not None:
+        raw = before + raw
     atomic_write(path, raw)
     after_info = file_info(path)
     before_text = before.decode("utf-8", errors="replace") if before is not None else ""
@@ -202,6 +218,7 @@ if op == "write":
         "file": after_info,
         "before_sha256": before_sha,
         "after_sha256": after_info["sha256"],
+        "appended": append,
         "diff_preview": unified(before_text, after_text, path),
     }, sort_keys=True))
     raise SystemExit(0)
@@ -264,7 +281,7 @@ def _status_to_outcome(status: str) -> str:
         return "success"
     if status in {"read_required", "file_changed_since_read", "old_string_not_unique", "path_outside_root", "symlink_not_allowed", "file_exists"}:
         return "blocked"
-    if status in {"path_required", "invalid_pagination", "parent_not_found"}:
+    if status in {"path_required", "invalid_pagination", "parent_not_found", "invalid_flags"}:
         return "needs_input"
     return "failed"
 
@@ -374,6 +391,7 @@ def remote_write(
     file_path: str,
     content: str,
     overwrite: bool = False,
+    append: bool = False,
     create_dirs: bool = False,
     client_context_id: str | None = None,
     timeout_ms: int = 120000,
@@ -399,6 +417,7 @@ def remote_write(
             "file_path": path,
             "content": content,
             "overwrite": overwrite,
+            "append": append,
             "create_dirs": create_dirs,
             "expected_sha256": expected_sha,
         },

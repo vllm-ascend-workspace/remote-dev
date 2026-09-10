@@ -19,13 +19,14 @@ the console entry is `remote-dev`.
 | LS          | `remote.ls`          | `remote-dev ls`                          |
 | Monitor     | `remote.monitor`     | `remote-dev monitor`                     |
 | apply_patch | `remote.apply_patch` | `remote-dev apply-patch`                 |
+| write_stdin | `remote.job_stdin`   | `remote-dev job-stdin`                   |
 
-Plus background jobs (`remote.job_status` / `job_tail` / `job_stop`),
-artifacts (`remote.artifact_manifest` / `artifact_pull` / `artifact_push`),
-and endpoint facts (`remote.probe`, `remote.context_snapshot`). Eighteen
-tools in total, served by one stdio MCP server (`remote-dev server`) and
-mirrored one-to-one by CLI subcommands. `python -m remote_dev` is equivalent
-to `remote-dev`.
+Plus background jobs (`remote.job_status` / `job_tail` / `job_stop` /
+`job_stdin`), artifacts (`remote.artifact_manifest` / `artifact_pull` /
+`artifact_push`), and endpoint facts (`remote.probe`,
+`remote.context_snapshot`). Nineteen tools in total, served by one stdio MCP
+server (`remote-dev server`) and mirrored one-to-one by CLI subcommands.
+`python -m remote_dev` is equivalent to `remote-dev`.
 
 Runtime requirements: Python 3.9+ and an `ssh` client. No third-party
 packages. Nothing here needs GPU/NPU hardware; the remote host only needs
@@ -46,7 +47,8 @@ uv pip install -e .
 remote-dev server
 ```
 
-`.mcp.json` (Claude Code / Kimi / Cursor):
+`.mcp.json` (Claude Code / Cursor; Kimi Code uses `.kimi-code/mcp.json` —
+see `examples/kimi-mcp.example.json`):
 
 ```json
 {
@@ -75,6 +77,47 @@ If the package is already installed in the client environment, `command` can
 be `remote-dev` with `args: ["server"]`. More client examples live in
 `examples/`. See [CLIENT_COMPATIBILITY.md](CLIENT_COMPATIBILITY.md) for
 per-client notes.
+
+## Native-habit compatibility layer
+
+One execution kernel serves every client; the differences live in a thin,
+shared parameter layer (`remote_dev.mcp.schemas.normalize_arguments`, applied
+by both the MCP dispatcher and the CLI `--input-json` path):
+
+- Aliases: `path` for `file_path` (read/write/edit/multi_edit),
+  `line_offset`/`n_lines` for `offset`/`limit` (read), `cmd`/`workdir` for
+  `command`/`cwd` (bash/monitor), `-i`/`-A`/`-B`/`-C`/`-n`/`head_limit`
+  (grep). A canonical key always wins; unknown keys pass through. Fields with
+  aliases are enforced by the server, not the wire schema's `required` list,
+  so alias-only calls pass provider-side validation.
+- `remote.read` accepts a negative `offset` to read from the end of the file
+  (`offset=-100` reads the last 100 lines). Binary files (NUL byte in the
+  first 8192 bytes) fail with an actionable `binary_file` status — there is
+  no remote image/media preview; use `remote.bash` or `remote.artifact_pull`.
+- `remote.write` gains `append` (Kimi `mode=append`): extends the file
+  atomically, creates it when missing, and is mutually exclusive with
+  `overwrite`.
+- `remote.grep` gains `case_insensitive`, `context_lines`/`before_context`/
+  `after_context`, a `line_numbers` toggle, `offset` pagination, and
+  `include_ignored` (rg `--no-ignore --hidden`; the grep fallback only lifts
+  its hidden/.git excludes and says so). `output_mode` distinguishes `count`
+  (matching lines per file, `rg -c`) from `count_matches` (total matches per
+  file, `rg --count-matches`; the grep fallback counts `-o` matches per
+  file). They differ whenever one line holds several matches.
+- Codex exec habits: `remote.bash run_in_background=true` accepts
+  `yield_time_ms` (poll briefly, then return state plus fresh output) and
+  `interactive=true` (keep stdin writable). `remote.job_stdin` writes `chars`
+  to a running interactive job, closes input with `eof`, and returns only
+  *new* output: a per-stream byte cursor in the local job record advances
+  past exactly the bytes returned, so repeated polls never replay output and
+  a capped call loses nothing. `max_output_tokens` caps returned output at
+  4 characters per token per stream (an approximation, documented on the
+  schema); full output stays reachable via `remote.job_tail` and refs. A
+  large write that exceeds the remote buffer reports how many bytes were
+  accepted (`stdin_buffer_full`) instead of pretending success. These are
+  pipe sessions, not PTYs: `tty=true` returns an explicit
+  `unsupported_capability` error, and control bytes such as `\x03` are bytes,
+  not signals. Cancellation stays with `remote.job_stop`.
 
 ## The endpoint-explicit contract
 

@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "remote-dev": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/vllm-ascend-workspace/remote-dev@main",
+        "remote-dev",
+        "server"
+      ],
+      "env": {
+        "REMOTE_DEV_DEFAULT_USER": "root",
+        "REMOTE_DEV_DEFAULT_ROOT": "/",
+        "REMOTE_DEV_DEFAULT_CWD": "/",
+        "REMOTE_DEV_STATE_DIR": "/absolute/path/to/consumer/.remote-dev-state",
+        "REMOTE_DEV_ENDPOINTS_FILE": "/absolute/path/to/consumer/endpoints.json",
+        "REMOTE_DEV_RESOLVERS": "/absolute/path/to/consumer/remote_dev_plugin.py:setup"
+      },
+      "startupTimeoutMs": 30000,
+      "toolTimeoutMs": 600000
+    }
+  }
+}

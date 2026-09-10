@@ -1,6 +1,48 @@
 # Remote-Dev Validation Record
 
-Last updated: 2026-09-10 (v0.5.0 process-control cutover).
+Last updated: 2026-09-10 (client-parity batch).
+
+## Client-parity batch (2026-09-10, this checkout)
+
+Nineteen `remote_*` tools (new: `remote_job_stdin`), a shared client-native
+alias layer (`path`, `line_offset`/`n_lines`, `cmd`/`workdir`, grep
+`-i`/`-A`/`-B`/`-C`/`-n`/`head_limit`), read-from-end via negative offset,
+write append mode, grep `count` vs `count_matches` distinction, and
+interactive pipe sessions (writable stdin FIFO→pipe proxy, eof, incremental
+output cursors, `yield_time_ms`, `max_output_tokens` budgets, explicit
+no-PTY capability boundary).
+
+Local gates on macOS (Apple Silicon), Python 3.11.13:
+
+- `python3 -m pytest` — **357 passed, 9 skipped** (Linux-only worker cases,
+  including the new interactive stdin roundtrip which runs on Linux CI),
+  plus 153 subtests.
+- `python3 -m remote_dev validate --local-only` — **ok**: 19 MCP tools, 19
+  CLI subcommands, max 2 tool-specific required fields (aliased fields are
+  server-enforced so providers cannot reject alias-only calls).
+- Real MCP stdio chain (framed JSON-RPC): tools/list advertises the portable
+  names with the new schemas; an alias-only `remote_read` call
+  (`path`/`line_offset`/`n_lines`) passes normalization and dispatch;
+  `remote_bash tty=true` returns `unsupported_capability` without
+  connecting; a missing `file_path` returns an actionable server-side error.
+- The remote executor scripts (`REMOTE_FILE_PY`, `REMOTE_SEARCH_PY`) were
+  executed for real through local `python3 -c` subprocesses (negative offset,
+  binary detection, append, grep flags, count vs count_matches on a
+  two-matches-one-line input, hidden-dir handling, grep fallback with masked
+  PATH). The worker's `stdin` control action and incremental tail were
+  exercised against real FIFOs and log files locally.
+- Kimi 0.42.0 native semantics were confirmed against the installed client:
+  `count_matches` maps to `rg --count-matches` (not `rg -c`), and negative
+  `line_offset` reads from the end of the file.
+
+Not run: live SSH endpoint checks (no disposable endpoint in this
+environment — the live section of `remote-dev validate` now covers the
+interactive session roundtrip and tty boundary), native Windows, and the
+per-client E2E model sessions. Those remain recorded as unverified here.
+
+---
+
+Previous record:
 
 ## v0.5.0 process control and local client portability (2026-09-10)
 

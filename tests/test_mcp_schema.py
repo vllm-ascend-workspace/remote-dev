@@ -39,6 +39,7 @@ class McpSchemaTests(unittest.TestCase):
             "remote.job_status",
             "remote.job_tail",
             "remote.job_stop",
+            "remote.job_stdin",
             "remote.artifact_manifest",
             "remote.artifact_pull",
             "remote.artifact_push",
@@ -69,12 +70,24 @@ class McpSchemaTests(unittest.TestCase):
         text = json.dumps(example)
         self.assertNotRegex(text, r"\b(?!0\.)(?:\d{1,3}\.){3}\d{1,3}\b")
 
+    def test_kimi_example_uses_kimi_entry_shape(self) -> None:
+        example = json.loads((REPO / "examples" / "kimi-mcp.example.json").read_text())["mcpServers"]["remote-dev"]
+        # Kimi Code reads .kimi-code/mcp.json; entries use startupTimeoutMs /
+        # toolTimeoutMs and no transport "type" field.
+        self.assertNotIn("type", example)
+        self.assertEqual(example["command"], "uvx")
+        self.assertEqual(example["args"][-2:], ["remote-dev", "server"])
+        self.assertIn("startupTimeoutMs", example)
+        self.assertIn("toolTimeoutMs", example)
+        text = json.dumps(example)
+        self.assertNotRegex(text, r"\b(?!0\.)(?:\d{1,3}\.){3}\d{1,3}\b")
+
     def test_only_remote_tools_are_advertised(self) -> None:
         # Coordinator/task facades (formerly vaws.*) are not remote-development
         # semantics and live in the consumer, not in this server.
         for name in TOOL_SCHEMAS:
             self.assertTrue(name.startswith("remote."), name)
-        self.assertEqual(len(TOOL_SCHEMAS), 18)
+        self.assertEqual(len(TOOL_SCHEMAS), 19)
 
     def test_endpoint_props_carry_no_consumer_selectors(self) -> None:
         for legacy in ("session_id", "session_file", "machine"):
@@ -92,7 +105,7 @@ class McpSchemaTests(unittest.TestCase):
         self.assertIn("remote.bash", TOOL_SCHEMAS)
 
     def test_normal_tools_describe_endpoint_selector_requirement(self) -> None:
-        job_tools = {"remote.job_status", "remote.job_tail", "remote.job_stop"}
+        job_tools = {"remote.job_status", "remote.job_tail", "remote.job_stop", "remote.job_stdin"}
         for name, schema in TOOL_SCHEMAS.items():
             if name in job_tools:
                 self.assertNotIn(ENDPOINT_SELECTOR_DESCRIPTION, schema.get("description", ""))

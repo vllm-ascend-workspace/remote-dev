@@ -56,10 +56,10 @@ class ProcessWorkerTests(unittest.TestCase):
             self.source,
         )
 
-    def prepare(self, letter, command, timeout=10):
+    def prepare(self, letter, command, timeout=10, **spec_extra):
         identifier = "job-" + letter * 8
         self.identifiers.append(identifier)
-        status = self.call(identifier, "prepare", spec={"cwd": str(self.root), "command": command, "env": {}, "timeout_seconds": timeout})
+        status = self.call(identifier, "prepare", spec={"cwd": str(self.root), "command": command, "env": {}, "timeout_seconds": timeout, **spec_extra})
         return identifier, status
 
     def go(self, identifier):
@@ -166,6 +166,40 @@ class ProcessWorkerTests(unittest.TestCase):
         remote_dir = Path(status["remote_dir"])
         self.assertEqual(remote_dir, self.root / ".remote-dev" / "jobs" / identifier)
         self.assertFalse((self.root / ".vaws-runtime").exists())
+
+    def test_interactive_stdin_pipe_roundtrip(self):
+        # Real FIFO->pipe proxy: bytes written through the "stdin" action reach
+        # the child, output is read incrementally, and eof lets the job finish.
+        identifier, status = self.prepare(
+            "i", "while read -r line; do printf 'got:%s\\n' \"$line\"; done", timeout=10, interactive=True)
+        self.assertEqual(status["state"], "prepared")
+        directory = self.root / ".remote-dev/jobs" / identifier
+        self.assertTrue((directory / "stdin.pipe").exists())
+        self.go(identifier)
+        reply = self.call(identifier, "stdin", data="hello\n")
+        self.assertTrue(reply["accepted"])
+        self.assertEqual(reply["written"], 6)
+        seen = {"offset": 0, "text": ""}
+
+        def echoed(_row):
+            row = self.call(identifier, "tail", stdout_offset=seen["offset"], max_bytes=4096)
+            seen["offset"] = row.get("stdout_offset", seen["offset"])
+            seen["text"] += row.get("stdout", "")
+            return "got:hello" in seen["text"]
+
+        self.until(identifier, echoed)
+        # Incremental cursor: a re-read at the same offset returns nothing new.
+        row = self.call(identifier, "tail", stdout_offset=seen["offset"], max_bytes=4096)
+        self.assertEqual(row.get("stdout", ""), "")
+        reply = self.call(identifier, "stdin", data="", eof=True)
+        self.assertTrue(reply["accepted"])
+        self.assertEqual(self.until(identifier, lambda row: row["quiet"])["state"], "succeeded")
+        # Data writes after eof are refused; output polls still work.
+        reply = self.call(identifier, "stdin", data="late\n")
+        self.assertFalse(reply["accepted"])
+        reply = self.call(identifier, "stdin", data="")
+        self.assertTrue(reply["accepted"])
+        self.assertTrue(reply["polled_terminal"])
 
 
 @unittest.skipIf(sys.platform == "win32", "Linux worker is not a native Windows module")
