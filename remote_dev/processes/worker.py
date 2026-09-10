@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -184,27 +185,35 @@ def worker(directory):
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(36, 1, 0, 0, 0) != 0:  # Linux PR_SET_CHILD_SUBREAPER
         raise OSError(ctypes.get_errno(), "cannot supervise orphan descendants")
-    atomic_json(directory / "supervisor-ready.json", {"pid": os.getpid()})
     spec = read_json(directory / "spec.json")
+    # Interactive sessions: callers write to the on-disk FIFO through the
+    # "stdin" control action; this proxy forwards bytes into the child's
+    # pipe so stdin EOF stays under worker control (stdin-eof.json). A plain
+    # background job keeps DEVNULL stdin. The reader is attached before the
+    # readiness marker: prepare only returns after supervisor-ready.json, so a
+    # stdin write after prepare/go always finds a reader (opening a FIFO
+    # O_WRONLY|O_NONBLOCK without a reader fails with ENXIO).
+    interactive = bool(spec.get("interactive"))
+    fifo_fd = None
+    if interactive:
+        fifo_fd = os.open(directory / "stdin.pipe", os.O_RDONLY | os.O_NONBLOCK)
+    atomic_json(directory / "supervisor-ready.json", {"pid": os.getpid()})
     deadline = time.time() + 120
     while not (directory / "go.json").exists():
         if (directory / "stop.json").exists() or time.time() >= deadline:
+            if fifo_fd is not None:
+                os.close(fifo_fd)
             atomic_json(directory / "result.json", {"state": "cancelled", "reason": "start gate not opened"})
             return
         time.sleep(0.1)
     gate = read_json(directory / "go.json")
     if (directory / "stop.json").exists() or gate["valid_until"] <= time.time():
+        if fifo_fd is not None:
+            os.close(fifo_fd)
         atomic_json(directory / "result.json", {"state": "cancelled", "reason": "activation ticket expired"})
         return
-    # Interactive sessions: callers write to the on-disk FIFO through the
-    # "stdin" control action; this proxy forwards bytes into the child's
-    # pipe so stdin EOF stays under worker control (stdin-eof.json). A plain
-    # background job keeps DEVNULL stdin.
-    interactive = bool(spec.get("interactive"))
-    fifo_fd = None
     pipe_w = None
     if interactive:
-        fifo_fd = os.open(directory / "stdin.pipe", os.O_RDONLY | os.O_NONBLOCK)
         pipe_r, pipe_w = os.pipe()
         os.set_blocking(pipe_w, False)
     with (directory / "stdout.log").open("ab") as stdout, (directory / "stderr.log").open("ab") as stderr:
@@ -453,7 +462,18 @@ def control_job(request, source):
                 # raises EAGAIN. The accepted prefix maps to an exact character
                 # count (written_chars) for retrying the remainder — a byte
                 # count cannot slice a Python/JSON string at character level.
-                fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                try:
+                    fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError as exc:
+                    if exc.errno != errno.ENXIO:
+                        raise
+                    # No reader is attached (supervisor still starting, or a
+                    # job dir prepared by an older worker): a truthful
+                    # retryable refusal — no bytes are accepted or dropped and
+                    # EOF is not armed.
+                    return {"state": status["state"], "accepted": False, "written": 0,
+                            "written_chars": 0, "retryable": True,
+                            "reason": "stdin channel is not ready yet; the supervisor has not attached its reader — retry"}
                 try:
                     while written < len(raw):
                         chunk = raw[written:written + STDIN_WRITE_CHUNK]

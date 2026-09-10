@@ -616,6 +616,34 @@ class WorkerStdinActionTests(unittest.TestCase):
         finally:
             os.close(reader)
 
+    def test_stdin_write_without_fifo_reader_is_retryable_not_crash(self) -> None:
+        """Readiness race: a running interactive job whose FIFO has no reader
+        yet must return a truthful retryable refusal — no crash, no accepted
+        or dropped bytes, and eof is not armed. Attaching the reader makes the
+        identical retry succeed."""
+        import remote_dev.processes.worker as worker_mod
+
+        (self.job_dir).mkdir(parents=True)
+        os.mkfifo(self.job_dir / "stdin.pipe", 0o600)
+        request = {"root": str(self.tree), "job_id": "job-stdin-local", "action": "stdin"}
+        with mock.patch.object(worker_mod, "job_status", return_value={"state": "running", "quiet": False}):
+            reply = self._control({**request, "data": "hello\n", "eof": True})
+            self.assertFalse(reply["accepted"])
+            self.assertEqual(reply["written"], 0)
+            self.assertTrue(reply["retryable"])
+            self.assertIn("not ready", reply["reason"])
+            self.assertFalse((self.job_dir / "stdin-eof.json").exists())
+            reader = os.open(self.job_dir / "stdin.pipe", os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                retry = self._control({**request, "data": "hello\n", "eof": True})
+                self.assertTrue(retry["accepted"])
+                self.assertEqual(retry["written"], 6)
+                self.assertTrue(retry["eof"])
+                self.assertEqual(os.read(reader, 64), b"hello\n")
+            finally:
+                os.close(reader)
+            self.assertTrue((self.job_dir / "stdin-eof.json").exists())
+
     def test_tail_offset_mode_is_incremental(self) -> None:
         import remote_dev.processes.worker as worker_mod
 
