@@ -543,6 +543,79 @@ class WorkerStdinActionTests(unittest.TestCase):
         finally:
             os.close(reader)
 
+    def test_stdin_partial_write_defers_eof_and_accepts_retry(self) -> None:
+        """Backpressure and EOF together: a partially accepted write with
+        eof=true must not close stdin; the exact remainder stays retryable."""
+        import remote_dev.processes.worker as worker_mod
+
+        (self.job_dir).mkdir(parents=True)
+        os.mkfifo(self.job_dir / "stdin.pipe", 0o600)
+        reader = os.open(self.job_dir / "stdin.pipe", os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            big = "x" * (1024 * 1024)
+            request = {"root": str(self.tree), "job_id": "job-stdin-local", "action": "stdin"}
+            drained = bytearray()
+            with mock.patch.object(worker_mod, "job_status", return_value={"state": "running", "quiet": False}):
+                first = self._control({**request, "data": big, "eof": True})
+                self.assertTrue(first["accepted"])
+                self.assertLess(first["written"], len(big))
+                self.assertTrue(first["stdin_buffer_full"])
+                # EOF is deferred until every byte of this operation has been
+                # accepted: no marker file, and the channel stays open.
+                self.assertFalse(first["eof"])
+                self.assertTrue(first["eof_deferred"])
+                self.assertFalse((self.job_dir / "stdin-eof.json").exists())
+                drained += os.read(reader, 2 * 1024 * 1024)
+                remainder = big[first["written_chars"]:]
+                row = first
+                for _ in range(1000):
+                    if not remainder:
+                        break
+                    row = self._control({**request, "data": remainder, "eof": True})
+                    self.assertTrue(row["accepted"])
+                    self.assertGreater(row["written"], 0)
+                    drained += os.read(reader, 2 * 1024 * 1024)
+                    remainder = remainder[row["written_chars"]:]
+                else:
+                    self.fail("stdin retry loop did not finish")
+                self.assertFalse(row["stdin_buffer_full"])
+                self.assertTrue(row["eof"])
+            self.assertEqual(bytes(drained), big.encode())
+            self.assertTrue((self.job_dir / "stdin-eof.json").exists())
+        finally:
+            os.close(reader)
+
+    def test_stdin_unicode_write_reports_character_accounting(self) -> None:
+        """written_chars is the exact character count of the accepted byte
+        prefix; slicing the original string there never splits a character."""
+        import remote_dev.processes.worker as worker_mod
+
+        (self.job_dir).mkdir(parents=True)
+        os.mkfifo(self.job_dir / "stdin.pipe", 0o600)
+        reader = os.open(self.job_dir / "stdin.pipe", os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            data = "中文日志\n" * 5000  # 15 bytes per repetition
+            request = {"root": str(self.tree), "job_id": "job-stdin-local", "action": "stdin"}
+            pending = data
+            drained = bytearray()
+            with mock.patch.object(worker_mod, "job_status", return_value={"state": "running", "quiet": False}):
+                for _ in range(1000):
+                    row = self._control({**request, "data": pending, "eof": True})
+                    self.assertTrue(row["accepted"])
+                    self.assertGreater(row["written"], 0)
+                    accepted = pending[: row["written_chars"]]
+                    self.assertEqual(len(accepted.encode("utf-8")), row["written"])
+                    drained += os.read(reader, 2 * 1024 * 1024)
+                    pending = pending[row["written_chars"]:]
+                    if not row["stdin_buffer_full"]:
+                        break
+                else:
+                    self.fail("stdin retry loop did not finish")
+                self.assertTrue(row["eof"])
+            self.assertEqual(bytes(drained), data.encode("utf-8"))
+        finally:
+            os.close(reader)
+
     def test_tail_offset_mode_is_incremental(self) -> None:
         import remote_dev.processes.worker as worker_mod
 
@@ -559,6 +632,77 @@ class WorkerStdinActionTests(unittest.TestCase):
         self.assertEqual(row["stdout"], "second\n")
         row = self._control({**request, "stdout_offset": row["stdout_offset"], "max_bytes": 4096})
         self.assertEqual(row["stdout"], "")
+
+    def test_tail_incremental_preserves_split_utf8_characters(self) -> None:
+        """A character split by the byte budget is held back for the next page
+        instead of corrupting into U+FFFD; paged reads reassemble exactly."""
+        import remote_dev.processes.worker as worker_mod
+
+        (self.job_dir).mkdir(parents=True)
+        original = "中文日志" * 100
+        (self.job_dir / "stdout.log").write_text(original, encoding="utf-8")
+        request = {"root": str(self.tree), "job_id": "job-stdin-local", "action": "tail"}
+        with mock.patch.object(worker_mod, "job_status", return_value={"state": "running", "quiet": False}):
+            combined = ""
+            cursor = 0
+            for _ in range(20):
+                row = self._control({**request, "stdout_offset": cursor, "max_bytes": 256})
+                combined += row["stdout"]
+                cursor = row["stdout_offset"]
+                if row["stdout_bytes_remaining"] == 0:
+                    break
+            else:
+                self.fail("paged incremental read did not finish")
+        self.assertEqual(combined, original)
+        self.assertNotIn("\ufffd", combined)
+        self.assertEqual(cursor, len(original.encode("utf-8")))
+
+    def test_tail_incremental_flushes_invalid_bytes_without_stalling(self) -> None:
+        """Genuinely invalid bytes are not an incomplete sequence: they surface
+        as U+FFFD and the cursor still advances past them."""
+        import remote_dev.processes.worker as worker_mod
+
+        (self.job_dir).mkdir(parents=True)
+        log = self.job_dir / "stdout.log"
+        log.write_bytes("ok\n".encode() + b"\xff\xfe" + "end\n".encode())
+        request = {"root": str(self.tree), "job_id": "job-stdin-local", "action": "tail"}
+        with mock.patch.object(worker_mod, "job_status", return_value={"state": "running", "quiet": False}):
+            row = self._control({**request, "stdout_offset": 0, "max_bytes": 4})
+            self.assertEqual(row["stdout"], "ok\n\ufffd")
+            self.assertEqual(row["stdout_offset"], 4)
+            row = self._control({**request, "stdout_offset": row["stdout_offset"], "max_bytes": 256})
+            self.assertEqual(row["stdout"], "\ufffdend\n")
+            self.assertEqual(row["stdout_bytes_remaining"], 0)
+
+    def test_tail_incremental_flushes_unfinished_tail_on_terminal_job(self) -> None:
+        """A terminal job at end of file can never complete a trailing partial
+        sequence, so it flushes as U+FFFD instead of staying held back."""
+        import remote_dev.processes.worker as worker_mod
+
+        (self.job_dir).mkdir(parents=True)
+        (self.job_dir / "stdout.log").write_bytes("tail\n".encode() + "中".encode("utf-8")[:2])
+        request = {"root": str(self.tree), "job_id": "job-stdin-local", "action": "tail"}
+        with mock.patch.object(worker_mod, "job_status", return_value={"state": "succeeded", "quiet": True}):
+            row = self._control({**request, "stdout_offset": 0, "max_bytes": 256})
+        self.assertEqual(row["stdout"], "tail\n\ufffd")
+        self.assertEqual(row["stdout_offset"], 7)
+        self.assertEqual(row["stdout_bytes_remaining"], 0)
+
+    def test_tail_incremental_tiny_budget_still_advances(self) -> None:
+        """A budget smaller than one UTF-8 character must still move the cursor
+        (progress guarantee); the partial bytes flush as U+FFFD."""
+        import remote_dev.processes.worker as worker_mod
+
+        (self.job_dir).mkdir(parents=True)
+        (self.job_dir / "stdout.log").write_bytes("中".encode("utf-8"))  # 3 bytes
+        request = {"root": str(self.tree), "job_id": "job-stdin-local", "action": "tail"}
+        with mock.patch.object(worker_mod, "job_status", return_value={"state": "running", "quiet": False}):
+            row = self._control({**request, "stdout_offset": 0, "max_bytes": 2})
+            self.assertEqual(row["stdout"], "\ufffd")
+            self.assertEqual(row["stdout_offset"], 2)
+            row = self._control({**request, "stdout_offset": row["stdout_offset"], "max_bytes": 2})
+            self.assertEqual(row["stdout_offset"], 3)
+            self.assertEqual(row["stdout_bytes_remaining"], 0)
 
 
 class SessionSemanticsTests(unittest.TestCase):
@@ -604,6 +748,50 @@ class SessionSemanticsTests(unittest.TestCase):
             third = job_ops.remote_job_stdin(None, job_id="job-poll")
             self.assertIn("line-2", third["text"])
             self.assertNotIn("line-1", third["text"])
+
+    def test_initial_yield_initializes_cursors_and_poll_continues(self) -> None:
+        """The initial yield uses the same incremental cursor path as
+        job_stdin polls: it returns the first bytes up to the budget, persists
+        stdin_cursors, and the follow-up poll delivers the skipped remainder
+        without replaying the yielded prefix."""
+        content = "first-output-" + "y" * 600 + "\n"
+
+        def fake_control(_endpoint, _job_id, action, **params):
+            if action == "prepare":
+                return {"state": "prepared", "quiet": False, "gate_open": False, "remote_dir": "/srv/.remote-dev/jobs/job-yield-cursor"}
+            if action == "go":
+                return {"state": "running", "quiet": False, "gate_open": True, "remote_dir": "/srv/.remote-dev/jobs/job-yield-cursor"}
+            if action == "stdin":
+                return {"state": "running", "accepted": True, "written": 0}
+            if action == "tail":
+                start = params.get("stdout_offset")
+                self.assertIsNotNone(start, "initial yield must use the incremental offset tail, not the last-lines tail")
+                budget = params["max_bytes"]
+                chunk = content[start:start + budget]
+                return {"state": "running", "quiet": False, "stdout": chunk, "stderr": "",
+                        "stdout_offset": start + len(chunk),
+                        "stdout_bytes_remaining": len(content) - start - len(chunk),
+                        "stderr_offset": 0, "stderr_bytes_remaining": 0}
+            return {"state": "running", "quiet": False, "remote_dir": "/srv/.remote-dev/jobs/job-yield-cursor"}
+
+        with mock.patch.object(job_ops, "control", fake_control):
+            started_payload = job_ops.start_remote_job(
+                self.endpoint,
+                command="generate",
+                job_id="job-yield-cursor",
+                interactive=True,
+                yield_time_ms=100,
+                max_output_tokens=64,  # 256-byte budget per stream
+            )
+            yield_info = started_payload["result"]["job"]["yield"]
+            self.assertEqual(yield_info["stdout"], content[:256])
+            self.assertEqual(yield_info["stdout_bytes_remaining"], len(content) - 256)
+            record = state_store.read_json(Path(started_payload["result"]["refs"]["job_record"]))
+            self.assertEqual(record["stdin_cursors"], {"stdout_offset": 256, "stderr_offset": 0})
+            self.assertTrue(any("more byte(s) pending" in warning for warning in started_payload["result"]["warnings"]))
+            poll = job_ops.remote_job_stdin(None, job_id="job-yield-cursor")
+        self.assertEqual(poll["result"]["new_output"]["stdout"], content[256:])
+        self.assertNotIn("first-output", poll["text"])
 
     def test_max_output_tokens_bounds_incremental_read_and_reports_remainder(self) -> None:
         self._write_record("job-budget")

@@ -167,8 +167,10 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "description": (
                     "Background only: after starting, keep polling up to this many "
                     "milliseconds for output or completion before returning, then include "
-                    "the current stdout/stderr tail (Codex exec_command yield habit). "
-                    "0 or omitted returns immediately after the start handshake."
+                    "fresh stdout/stderr from the start up to the max_output_tokens budget "
+                    "(Codex exec_command yield habit). Later remote.job_stdin polls continue "
+                    "exactly where this yield stopped. 0 or omitted returns immediately "
+                    "after the start handshake."
                 ),
             },
             "max_output_tokens": {
@@ -233,8 +235,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "remote.job_stdin": schema(
         {
             "job_id": {"type": "string"},
-            "chars": {"type": "string", "description": "Bytes to write to the job's stdin (Codex write_stdin habit). Omit or pass an empty string to only poll output."},
-            "eof": {"type": "boolean", "description": "Close the job's stdin after writing chars. Programs waiting for end-of-input then finish."},
+            "chars": {"type": "string", "description": "Bytes to write to the job's stdin (Codex write_stdin habit). Omit or pass an empty string to only poll output. When stdin_buffer_full is reported, resend only the unwritten remainder: slice the original string at the returned written_chars character count (a byte count cannot slice a Unicode string)."},
+            "eof": {"type": "boolean", "description": "Close the job's stdin after writing chars. Programs waiting for end-of-input then finish. If the write was only partially accepted (stdin_buffer_full), the close is deferred: resend the unwritten remainder with eof=true."},
             "yield_time_ms": {"type": "integer", "description": "After writing, keep polling up to this many milliseconds for output or completion before returning new output."},
             "max_output_tokens": {"type": "integer", "description": "Cap the new output returned by this call, counted as 4 characters per token, applied per stream. Skipped bytes are not lost: the read cursor only advances past what was returned."},
             "lines": {"type": "integer", "maximum": 500, "description": "Tail lines per stream when this call falls back to snapshot output (first poll). Incremental reads are byte-based."},

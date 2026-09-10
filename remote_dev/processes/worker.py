@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -29,6 +30,38 @@ JOBS_DIRNAME = ".remote-dev"
 # the child pipe. Past the cap the worker stops draining the FIFO so a writer
 # blocks (or a nonblocking writer gets EAGAIN) instead of growing worker RAM.
 STDIN_BUFFER_CAP = 262144
+# A nonblocking pipe write of at most PIPE_BUF bytes is all-or-nothing
+# (POSIX), which keeps every accepted stdin prefix on an exact byte count the
+# caller can map back to characters.
+STDIN_WRITE_CHUNK = getattr(select, "PIPE_BUF", 512)
+# States in which a job may still append to its logs.
+LIVE_JOB_STATES = frozenset({"prepared", "running", "uncertain"})
+
+
+def _utf8_incomplete_tail(chunk):
+    """Bytes at the end of chunk that start but do not finish a UTF-8 sequence (0-3).
+
+    Only genuinely incomplete prefixes count; bytes that cannot extend into a
+    valid sequence return 0 so they flush as U+FFFD instead of stalling a read
+    cursor or a stdin write forever.
+    """
+    size = len(chunk)
+    for back in range(1, min(4, size) + 1):
+        byte = chunk[size - back]
+        if byte & 0xC0 == 0x80:
+            continue  # continuation byte, keep scanning for the lead byte
+        if byte < 0x80:
+            return 0  # ASCII: the chunk ends on a complete character
+        if 0xC2 <= byte <= 0xDF:
+            needed = 2
+        elif 0xE0 <= byte <= 0xEF:
+            needed = 3
+        elif 0xF0 <= byte <= 0xF4:
+            needed = 4
+        else:
+            return 0  # invalid lead byte: not an incomplete sequence
+        return back if back < needed else 0
+    return 0
 
 
 def atomic_json(path, value):
@@ -354,6 +387,7 @@ def control_job(request, source):
             lines = min(200, max(1, int(request.get("lines", 60))))
             result = job_status(directory)
             max_bytes = min(32768, max(1, int(request.get("max_bytes") or 32768)))
+            live = result.get("state") in LIVE_JOB_STATES
             for name in ("stdout", "stderr"):
                 path = directory / (name + ".log")
                 if path.exists():
@@ -363,12 +397,30 @@ def control_job(request, source):
                         # bytes after the caller's cursor, plus the new cursor.
                         # Repeated polls never replay earlier output.
                         start_offset = max(0, int(request[offset_key]))
+                        size = path.stat().st_size
                         with path.open("rb") as stream:
                             stream.seek(start_offset)
                             chunk = stream.read(max_bytes)
-                        result[name] = chunk.decode(errors="replace")
+                        hold = _utf8_incomplete_tail(chunk)
+                        if hold == len(chunk):
+                            # Progress guarantee: a page must always advance the
+                            # cursor, even for budgets smaller than one UTF-8
+                            # character; the partial bytes flush as U+FFFD.
+                            hold = 0
+                        elif not live and start_offset + len(chunk) >= size:
+                            # Terminal job at end of file: no later write can
+                            # complete the sequence, so flush the tail now.
+                            hold = 0
+                        if hold:
+                            # Hold back a UTF-8 character split by the byte
+                            # budget; the next poll re-reads and completes it
+                            # instead of corrupting the stream into U+FFFD. The
+                            # cursor advances past returned bytes only, so the
+                            # held bytes stay counted in bytes_remaining.
+                            chunk = chunk[:-hold]
+                        result[name] = chunk.decode("utf-8", errors="replace")
                         result[offset_key] = start_offset + len(chunk)
-                        result[name + "_bytes_remaining"] = max(0, path.stat().st_size - result[offset_key])
+                        result[name + "_bytes_remaining"] = max(0, size - result[offset_key])
                     else:
                         with path.open("rb") as stream:
                             stream.seek(max(0, path.stat().st_size - 32000))
@@ -395,15 +447,38 @@ def control_job(request, source):
                         "reason": "stdin is already closed (eof); start a new interactive job for more input"}
             written = 0
             if raw:
+                # Bounded partial acceptance: every write is at most
+                # STDIN_WRITE_CHUNK (<= PIPE_BUF) and ends on a UTF-8 character
+                # boundary, so a nonblocking write either lands completely or
+                # raises EAGAIN. The accepted prefix maps to an exact character
+                # count (written_chars) for retrying the remainder — a byte
+                # count cannot slice a Python/JSON string at character level.
                 fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
                 try:
-                    written = os.write(fd, raw)
+                    while written < len(raw):
+                        chunk = raw[written:written + STDIN_WRITE_CHUNK]
+                        complete = len(chunk) - _utf8_incomplete_tail(chunk)
+                        if complete <= 0:
+                            break  # unreachable for encoded UTF-8; never spin
+                        try:
+                            written += os.write(fd, chunk[:complete])
+                        except BlockingIOError:
+                            break
                 finally:
                     os.close(fd)
-            if request.get("eof"):
+            buffer_full = written < len(raw)
+            eof_requested = bool(request.get("eof"))
+            # EOF applies only once every byte of this operation has been
+            # accepted into the FIFO. A partial write defers EOF explicitly so
+            # the exact unwritten remainder can be retried with eof=true;
+            # closing early would make that remainder unsendable.
+            eof_applied = eof_requested and not buffer_full
+            if eof_applied:
                 atomic_json(directory / "stdin-eof.json", {"at": time.time()})
             return {"state": status["state"], "accepted": True, "written": written,
-                    "eof": bool(request.get("eof")), "stdin_buffer_full": written < len(raw)}
+                    "written_chars": len(raw[:written].decode("utf-8")),
+                    "eof": eof_applied, "eof_deferred": eof_requested and buffer_full,
+                    "stdin_buffer_full": buffer_full}
         elif action != "status":
             raise ValueError("unsupported job action")
         return job_status(directory)

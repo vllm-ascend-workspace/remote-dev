@@ -1,6 +1,6 @@
 # Remote-Dev Validation Record
 
-Last updated: 2026-09-10 (client-parity batch).
+Last updated: 2026-09-11 (session-semantics review batch).
 
 ## Client-parity batch (2026-09-10, this checkout)
 
@@ -39,6 +39,51 @@ Not run: live SSH endpoint checks (no disposable endpoint in this
 environment — the live section of `remote-dev validate` now covers the
 interactive session roundtrip and tty boundary), native Windows, and the
 per-client E2E model sessions. Those remain recorded as unverified here.
+
+## Session-semantics review batch (2026-09-11, this checkout)
+
+Fixes for the independent acceptance review of the client-parity batch:
+
+- Partially accepted stdin writes combined with `eof=true` no longer close
+  stdin: worker writes are chunked at `PIPE_BUF` on UTF-8 character
+  boundaries (all-or-nothing nonblocking writes), and the EOF marker is only
+  published once every byte of the operation has been accepted. The response
+  reports `written`/`written_chars`/`stdin_buffer_full`/`eof_deferred` so the
+  exact remainder is retryable; `written_chars` is the character-level slice
+  point because byte counts cannot slice Python/JSON Unicode strings.
+- Incremental tail reads hold back a UTF-8 character split by the byte budget
+  for the next poll instead of decoding it into permanent U+FFFD. Genuinely
+  invalid bytes still flush as replacements (the cursor always advances),
+  and a terminal job at end of file flushes an unfinished trailing sequence.
+- `remote.bash` initial yield now uses the same incremental cursor path as
+  `remote.job_stdin` polls: it returns the first bytes up to the budget and
+  persists `stdin_cursors`, so the first follow-up poll continues where the
+  yield stopped instead of replaying from offset 0, and bytes the yield
+  skipped are delivered by later polls instead of being dropped by a
+  last-lines tail.
+
+Local gates on macOS (Apple Silicon), Python 3.11.13:
+
+- `python3 -m pytest` — **364 passed, 9 skipped** (7 new regression tests:
+  deferred-EOF retry over a real 1 MiB FIFO roundtrip, Unicode
+  `written_chars` accounting, split-UTF-8 paged reads, invalid-byte flush,
+  terminal tail flush, tiny-budget progress, initial-yield→poll
+  continuation).
+- `python3 .vaws-local/kimi-handoff/review-repro.py kimi1` (reviewer's repro
+  against this checkout) — UTF-8 pagination now reassembles exactly
+  (`combined_matches_original: true`, 0 replacement characters), and the 1
+  MiB + `eof=true` write reports `eof: false` (deferred) with the remainder
+  retry accepted.
+- `python3 -m remote_dev validate --local-only` — **ok** (19 tools / 19 CLI
+  subcommands).
+- Real MCP stdio chain re-run: 19 tools listed; `remote_job_stdin` schema
+  documents the `written_chars` retry contract and deferred `eof`;
+  `remote_bash` yield description documents the first-bytes/continuation
+  semantics.
+
+Not run (unchanged from the previous batch): live SSH endpoint checks, Linux
+worker roundtrip on a real Linux host, native Windows, per-client E2E model
+sessions.
 
 ---
 

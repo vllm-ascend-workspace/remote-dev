@@ -1,6 +1,9 @@
 # Remote-dev client compatibility
 
-Updated 2026-09-10 for the client-parity batch: nineteen `remote_*` tools
+Updated 2026-09-11 for the session-semantics review batch: deferred EOF on
+partially accepted stdin writes, character-exact retry accounting
+(`written_chars`), UTF-8-safe incremental paging, and initial-yield cursor
+continuation. Originally written 2026-09-10 for the client-parity batch: nineteen `remote_*` tools
 (`remote_job_stdin` is new), a shared alias layer for client-native parameter
 names, wider grep coverage, write append, read-from-end, and interactive
 pipe sessions with writable stdin. One server and one schema set serve every
@@ -114,7 +117,15 @@ interactive calls should use the client's confirmation flow.
   run_in_background=true interactive=true yield_time_ms=...` starts a pipe
   session and yields initial output; `remote_job_stdin` writes `chars` (empty
   = poll), closes input with `eof`, and returns only new output (per-stream
-  byte cursors, no replay across polls). `max_output_tokens` is honored as a
+  byte cursors, no replay across polls). The initial yield shares that cursor
+  path: it returns the first bytes up to the budget and later polls continue
+  exactly where it stopped, so skipped bytes are never lost. Incremental reads
+  hold back a UTF-8 character split by the byte budget for the next poll
+  (invalid bytes still flush as U+FFFD so the cursor always advances). A write
+  accepted partially reports `stdin_buffer_full` with `written`/`written_chars`
+  counts — retry the exact remainder sliced at `written_chars`; an `eof` on a
+  partial write is deferred until the remainder is accepted. `max_output_tokens`
+  is honored as a
   4-characters-per-token budget per stream with an explicit remainder
   warning, never accepted and ignored. `tty=true` is an explicit
   `unsupported_capability` error: remote-dev sessions are pipes, not PTYs,

@@ -110,11 +110,19 @@ by both the MCP dispatcher and the CLI `--input-json` path):
   to a running interactive job, closes input with `eof`, and returns only
   *new* output: a per-stream byte cursor in the local job record advances
   past exactly the bytes returned, so repeated polls never replay output and
-  a capped call loses nothing. `max_output_tokens` caps returned output at
+  a capped call loses nothing. The initial yield uses the same cursor path —
+  it returns the first bytes up to the budget and follow-up polls continue
+  where it stopped. Paged reads hold back a UTF-8 character split by the byte
+  budget for the next poll instead of corrupting it into U+FFFD; genuinely
+  invalid bytes still surface as replacements so the cursor never stalls.
+  `max_output_tokens` caps returned output at
   4 characters per token per stream (an approximation, documented on the
   schema); full output stays reachable via `remote.job_tail` and refs. A
   large write that exceeds the remote buffer reports how many bytes were
-  accepted (`stdin_buffer_full`) instead of pretending success. These are
+  accepted (`stdin_buffer_full`, plus `written_chars` so Unicode input is
+  sliced at the right character boundary) instead of pretending success, and
+  an `eof` on a partially accepted write is deferred until the exact
+  remainder is retried and accepted — stdin never closes early. These are
   pipe sessions, not PTYs: `tty=true` returns an explicit
   `unsupported_capability` error, and control bytes such as `\x03` are bytes,
   not signals. Cancellation stays with `remote.job_stop`.

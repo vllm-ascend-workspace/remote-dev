@@ -21,7 +21,6 @@ ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 RESERVED_ENV_PREFIX = "REMOTE_DEV_JOB_"
 STOP_DRAIN_SECONDS = 2.0
 MAX_YIELD_MS = 30000
-YIELD_TAIL_LINES = 40
 MAX_INCREMENTAL_READ_BYTES = 32768
 
 
@@ -272,21 +271,34 @@ def start_remote_job(
                 if row.get("quiet"):
                     break
                 time.sleep(0.1)
-            tail_row = control(endpoint, job_id, "tail", lines=YIELD_TAIL_LINES)
             budget = _output_budget_bytes(max_output_tokens)
-
-            def _cap(text: str) -> str:
-                if len(text) <= budget:
-                    return text
-                return text[-budget:] + f"\n<remote-dev output capped at {budget} chars; full log via remote.job_tail>\n"
-
+            # Same incremental cursor path as job_stdin polls: the initial
+            # yield returns the first bytes up to the budget (not just the
+            # last lines) and persists the cursors where it stopped, so a
+            # follow-up job_stdin poll neither replays this output nor drops
+            # the earlier unreturned bytes.
+            tail_row = control(endpoint, job_id, "tail", stdout_offset=0, stderr_offset=0, max_bytes=budget)
+            record["stdin_cursors"] = {
+                "stdout_offset": int(tail_row.get("stdout_offset") or 0),
+                "stderr_offset": int(tail_row.get("stderr_offset") or 0),
+            }
+            atomic_write_json(local_record, record)
             yield_info = {
                 "yield_time_ms": yield_ms,
                 "state": job_state,
-                "stdout": _cap(str(tail_row.get("stdout") or "")),
-                "stderr": _cap(str(tail_row.get("stderr") or "")),
+                "stdout": str(tail_row.get("stdout") or ""),
+                "stderr": str(tail_row.get("stderr") or ""),
                 "max_bytes_per_stream": budget,
+                "stdout_bytes_remaining": int(tail_row.get("stdout_bytes_remaining") or 0),
+                "stderr_bytes_remaining": int(tail_row.get("stderr_bytes_remaining") or 0),
             }
+            for stream_name in ("stdout", "stderr"):
+                remaining = int(tail_row.get(f"{stream_name}_bytes_remaining") or 0)
+                if remaining:
+                    warnings.append(
+                        f"{stream_name}: {remaining} more byte(s) pending beyond the initial yield budget; "
+                        "continue with remote.job_stdin (interactive) or remote.job_tail"
+                    )
         except (RemoteExecutionError, ValueError, RuntimeError, OSError) as exc:
             warnings.append(f"yield polling failed; the job is still running under the supervisor: {str(exc)[-500:]}")
     result = make_result(
@@ -497,8 +509,15 @@ def remote_job_stdin(
         return {"text": result["summary"] + "\n" + reason + "\n", "result": result}
     if reply.get("stdin_buffer_full"):
         warnings.append(
-            f"remote stdin buffer is full; {reply.get('written', 0)} bytes accepted — "
-            "retry the unwritten remainder after the job drains it"
+            f"remote stdin buffer is full; {reply.get('written', 0)} bytes "
+            f"({reply.get('written_chars', 0)} chars) accepted — retry the exact unwritten "
+            "remainder after the job drains it, slicing the original chars at written_chars "
+            "(a byte count cannot slice a Unicode string)"
+        )
+    if reply.get("eof_deferred"):
+        warnings.append(
+            "eof was deferred: stdin closes only once every byte of this call is accepted; "
+            "resend the unwritten remainder with eof=true"
         )
     state = str(reply.get("state") or "running")
     if yield_ms > 0:
@@ -549,7 +568,7 @@ def remote_job_stdin(
     for name, body in (("STDOUT", new_stdout), ("STDERR", new_stderr)):
         sections.append(f"__{name}__\n{body}".rstrip() + ("\n" if body else ""))
     text = compact_text("".join(sections), limit=MAX_TEXT_CHARS)
-    header = f"Remote job {job_id}: wrote {reply.get('written', 0)} bytes" + (", stdin closed (eof)" if eof else "") + f"; state {state}"
+    header = f"Remote job {job_id}: wrote {reply.get('written', 0)} bytes" + (", stdin closed (eof)" if reply.get("eof") else "") + f"; state {state}"
     if exit_code is not None:
         header += f"; exit code {exit_code}"
     result = make_result(
