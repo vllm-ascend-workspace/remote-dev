@@ -58,8 +58,36 @@ def remote_bash(
     run_in_background: bool = False,
     runtime_env: bool | None = None,
     env: dict[str, str] | None = None,
+    interactive: bool = False,
+    yield_time_ms: int | None = None,
+    max_output_tokens: int | None = None,
+    tty: bool = False,
 ) -> dict[str, Any]:
     env = env or {}
+    if tty:
+        # Capability boundary, stated instead of silently ignored: remote
+        # execution uses pipes, not a PTY. Interactive terminal programs
+        # (top, less, password prompts) need `ssh -t` outside this tool;
+        # run_interactive is the one-off first-contact bootstrap, not a PTY
+        # session facility.
+        error = (
+            "remote-dev does not allocate PTYs: remote commands run with pipe "
+            "stdin/stdout/stderr. Control bytes such as \\x03 are delivered as "
+            "bytes, not signals. For a writable pipe session use "
+            "run_in_background=true interactive=true plus remote.job_stdin; "
+            "cancel with remote.job_stop. For genuine terminal needs, use "
+            "ssh -t directly outside remote-dev."
+        )
+        result = make_result(
+            tool="remote.bash",
+            target=endpoint.to_result_target(),
+            outcome="failed",
+            status="unsupported_capability",
+            summary="RemoteBash cannot honor tty=true (no PTY support).",
+            preview={"stderr": error},
+            extra={"error": error, "capability": "pty"},
+        )
+        return {"text": result["summary"] + "\n" + error + "\n", "result": result}
     runtime_enabled = endpoint.runtime_env if runtime_env is None else runtime_env
     try:
         cwd = assert_under_root(cwd or endpoint.effective_cwd, endpoint.root)
@@ -92,6 +120,9 @@ def remote_bash(
             timeout_ms=timeout_ms,
             runtime_env=runtime_enabled,
             description=description,
+            interactive=interactive,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
         )
 
     invocation_id = new_invocation_id()
@@ -171,7 +202,12 @@ def remote_bash(
         },
     )
     atomic_write_json(result_path, result)
-    return {"text": _format_bash_text(endpoint, cwd, result), "result": result}
+    text = _format_bash_text(endpoint, cwd, result)
+    if max_output_tokens is not None:
+        budget = max(256, int(max_output_tokens) * 4)
+        if len(text) > budget:
+            text = text[:budget] + "\n<remote-dev output capped by max_output_tokens; full output via the refs log files>\n"
+    return {"text": text, "result": result}
 
 
 def _preview_text(item: Any) -> str:

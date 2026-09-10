@@ -17,6 +17,7 @@
       "mcp__remote-dev__remote_job_status",
       "mcp__remote-dev__remote_job_tail",
       "mcp__remote-dev__remote_job_stop",
+      "mcp__remote-dev__remote_job_stdin",
       "mcp__remote-dev__remote_context_snapshot",
       "mcp__remote-dev__remote_probe"
     ],

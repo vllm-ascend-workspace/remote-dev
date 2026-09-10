@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import errno
 import fcntl
 import hashlib
 import json
 import os
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -25,6 +27,42 @@ ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 JOB_TOKEN_ENV = "REMOTE_DEV_JOB_TOKEN"
 JOB_ENV_PREFIX = "REMOTE_DEV_JOB_"
 JOBS_DIRNAME = ".remote-dev"
+# In-memory cap for stdin bytes accepted from the FIFO but not yet consumed by
+# the child pipe. Past the cap the worker stops draining the FIFO so a writer
+# blocks (or a nonblocking writer gets EAGAIN) instead of growing worker RAM.
+STDIN_BUFFER_CAP = 262144
+# A nonblocking pipe write of at most PIPE_BUF bytes is all-or-nothing
+# (POSIX), which keeps every accepted stdin prefix on an exact byte count the
+# caller can map back to characters.
+STDIN_WRITE_CHUNK = getattr(select, "PIPE_BUF", 512)
+# States in which a job may still append to its logs.
+LIVE_JOB_STATES = frozenset({"prepared", "running", "uncertain"})
+
+
+def _utf8_incomplete_tail(chunk):
+    """Bytes at the end of chunk that start but do not finish a UTF-8 sequence (0-3).
+
+    Only genuinely incomplete prefixes count; bytes that cannot extend into a
+    valid sequence return 0 so they flush as U+FFFD instead of stalling a read
+    cursor or a stdin write forever.
+    """
+    size = len(chunk)
+    for back in range(1, min(4, size) + 1):
+        byte = chunk[size - back]
+        if byte & 0xC0 == 0x80:
+            continue  # continuation byte, keep scanning for the lead byte
+        if byte < 0x80:
+            return 0  # ASCII: the chunk ends on a complete character
+        if 0xC2 <= byte <= 0xDF:
+            needed = 2
+        elif 0xE0 <= byte <= 0xEF:
+            needed = 3
+        elif 0xF0 <= byte <= 0xF4:
+            needed = 4
+        else:
+            return 0  # invalid lead byte: not an incomplete sequence
+        return back if back < needed else 0
+    return 0
 
 
 def atomic_json(path, value):
@@ -147,26 +185,50 @@ def worker(directory):
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(36, 1, 0, 0, 0) != 0:  # Linux PR_SET_CHILD_SUBREAPER
         raise OSError(ctypes.get_errno(), "cannot supervise orphan descendants")
-    atomic_json(directory / "supervisor-ready.json", {"pid": os.getpid()})
     spec = read_json(directory / "spec.json")
+    # Interactive sessions: callers write to the on-disk FIFO through the
+    # "stdin" control action; this proxy forwards bytes into the child's
+    # pipe so stdin EOF stays under worker control (stdin-eof.json). A plain
+    # background job keeps DEVNULL stdin. The reader is attached before the
+    # readiness marker: prepare only returns after supervisor-ready.json, so a
+    # stdin write after prepare/go always finds a reader (opening a FIFO
+    # O_WRONLY|O_NONBLOCK without a reader fails with ENXIO).
+    interactive = bool(spec.get("interactive"))
+    fifo_fd = None
+    if interactive:
+        fifo_fd = os.open(directory / "stdin.pipe", os.O_RDONLY | os.O_NONBLOCK)
+    atomic_json(directory / "supervisor-ready.json", {"pid": os.getpid()})
     deadline = time.time() + 120
     while not (directory / "go.json").exists():
         if (directory / "stop.json").exists() or time.time() >= deadline:
+            if fifo_fd is not None:
+                os.close(fifo_fd)
             atomic_json(directory / "result.json", {"state": "cancelled", "reason": "start gate not opened"})
             return
         time.sleep(0.1)
     gate = read_json(directory / "go.json")
     if (directory / "stop.json").exists() or gate["valid_until"] <= time.time():
+        if fifo_fd is not None:
+            os.close(fifo_fd)
         atomic_json(directory / "result.json", {"state": "cancelled", "reason": "activation ticket expired"})
         return
+    pipe_w = None
+    if interactive:
+        pipe_r, pipe_w = os.pipe()
+        os.set_blocking(pipe_w, False)
     with (directory / "stdout.log").open("ab") as stdout, (directory / "stderr.log").open("ab") as stderr:
         environment = {**os.environ, **spec["env"]}
         child = subprocess.Popen(["bash", "-c", spec["command"]], cwd=spec["cwd"], env=environment,
-                                 stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+                                 stdin=pipe_r if interactive else subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+        if interactive:
+            os.close(pipe_r)
         receipt = read_json(directory / "receipt.json")
         timeout_seconds = spec.get("timeout_seconds")
         deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
         stopping_at, terminal = None, None
+        pending_stdin = bytearray()
+        stdin_eof = False
+        fifo_drained = False
         while True:
             code = child.poll()
             if code is not None:
@@ -175,6 +237,36 @@ def worker(directory):
                 with contextlib.suppress(ChildProcessError):
                     while os.waitpid(-1, os.WNOHANG)[0]:
                         pass
+            if interactive:
+                # Backpressure: once the in-memory buffer hits the cap, stop
+                # draining the FIFO so writers block instead of growing RAM.
+                if fifo_fd is not None and len(pending_stdin) < STDIN_BUFFER_CAP:
+                    try:
+                        chunk = os.read(fifo_fd, 65536)
+                    except BlockingIOError:
+                        chunk = b""
+                    if chunk:
+                        pending_stdin.extend(chunk)
+                    elif stdin_eof:
+                        # b"" from a FIFO read means every writer is gone and
+                        # the kernel buffer is empty: all accepted stdin bytes
+                        # are now in pending_stdin, none stay behind in the FIFO.
+                        fifo_drained = True
+                if pending_stdin and pipe_w is not None:
+                    try:
+                        written = os.write(pipe_w, bytes(pending_stdin))
+                        del pending_stdin[:written]
+                    except BlockingIOError:
+                        pass
+                if not stdin_eof and (directory / "stdin-eof.json").exists():
+                    stdin_eof = True
+                if stdin_eof and fifo_drained and fifo_fd is not None:
+                    os.close(fifo_fd)
+                    fifo_fd = None
+                if stdin_eof and fifo_drained and not pending_stdin and pipe_w is not None:
+                    # EOF reaches the child only after every accepted byte.
+                    os.close(pipe_w)
+                    pipe_w = None
             stop = read_json(directory / "stop.json")
             timed_out = deadline is not None and time.monotonic() >= deadline
             if terminal is None and (stop or timed_out):
@@ -191,6 +283,10 @@ def worker(directory):
             if code is not None and not children:
                 break
             time.sleep(0.05)
+        if pipe_w is not None:
+            os.close(pipe_w)
+        if fifo_fd is not None:
+            os.close(fifo_fd)
         result = {"state": terminal or ("succeeded" if code == 0 else "failed"),
                   "exit_code": code, "descendants_drained": True, "finished_at": time.time()}
         atomic_json(directory / "result.json", result)
@@ -232,6 +328,8 @@ def control_job(request, source):
                 raise ValueError("jobs require timeout_seconds None or 1..86400")
             if any(not ENV_NAME_RE.fullmatch(key) or key.startswith(JOB_ENV_PREFIX) for key in spec["env"]):
                 raise ValueError("invalid or reserved environment variable")
+            if "interactive" in spec and type(spec["interactive"]) is not bool:
+                raise ValueError("jobs require interactive to be a boolean")
             intent = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
             existing = read_json(directory / "intent.json")
             if existing:
@@ -240,6 +338,14 @@ def control_job(request, source):
                 return job_status(directory)
             atomic_json(directory / "intent.json", {"digest": intent})
             atomic_json(directory / "spec.json", spec)
+            if spec.get("interactive"):
+                # The stdin channel is an on-disk FIFO owned by the job dir.
+                # The worker holds the read end and proxies bytes into the
+                # child pipe; writers use the "stdin" control action.
+                try:
+                    os.mkfifo(directory / "stdin.pipe", 0o600)
+                except FileExistsError:
+                    pass
             script = directory / "runner.py"
             script.write_text(source)
             os.chmod(script, 0o600)
@@ -289,13 +395,110 @@ def control_job(request, source):
         elif action == "tail":
             lines = min(200, max(1, int(request.get("lines", 60))))
             result = job_status(directory)
+            max_bytes = min(32768, max(1, int(request.get("max_bytes") or 32768)))
+            live = result.get("state") in LIVE_JOB_STATES
             for name in ("stdout", "stderr"):
                 path = directory / (name + ".log")
                 if path.exists():
-                    with path.open("rb") as stream:
-                        stream.seek(max(0, path.stat().st_size - 32000))
-                        result[name] = "\n".join(stream.read().decode(errors="replace").splitlines()[-lines:])
+                    offset_key = name + "_offset"
+                    if request.get(offset_key) is not None:
+                        # Incremental read for interactive sessions: return only
+                        # bytes after the caller's cursor, plus the new cursor.
+                        # Repeated polls never replay earlier output.
+                        start_offset = max(0, int(request[offset_key]))
+                        size = path.stat().st_size
+                        with path.open("rb") as stream:
+                            stream.seek(start_offset)
+                            chunk = stream.read(max_bytes)
+                        hold = _utf8_incomplete_tail(chunk)
+                        if hold == len(chunk):
+                            # Progress guarantee: a page must always advance the
+                            # cursor, even for budgets smaller than one UTF-8
+                            # character; the partial bytes flush as U+FFFD.
+                            hold = 0
+                        elif not live and start_offset + len(chunk) >= size:
+                            # Terminal job at end of file: no later write can
+                            # complete the sequence, so flush the tail now.
+                            hold = 0
+                        if hold:
+                            # Hold back a UTF-8 character split by the byte
+                            # budget; the next poll re-reads and completes it
+                            # instead of corrupting the stream into U+FFFD. The
+                            # cursor advances past returned bytes only, so the
+                            # held bytes stay counted in bytes_remaining.
+                            chunk = chunk[:-hold]
+                        result[name] = chunk.decode("utf-8", errors="replace")
+                        result[offset_key] = start_offset + len(chunk)
+                        result[name + "_bytes_remaining"] = max(0, size - result[offset_key])
+                    else:
+                        with path.open("rb") as stream:
+                            stream.seek(max(0, path.stat().st_size - 32000))
+                            result[name] = "\n".join(stream.read().decode(errors="replace").splitlines()[-lines:])
             return result
+        elif action == "stdin":
+            status = job_status(directory)
+            data = str(request.get("data") or "")
+            if status["state"] != "running":
+                if not data:
+                    # Pure output polls (and a redundant eof) stay legal on a
+                    # terminal job, mirroring Codex write_stdin's final poll.
+                    return {"state": status["state"], "accepted": True, "written": 0,
+                            "eof": bool(request.get("eof")), "polled_terminal": True}
+                return {"state": status["state"], "accepted": False, "written": 0,
+                        "reason": f"job is {status['state']}, not running; stdin writes need a running job"}
+            fifo = directory / "stdin.pipe"
+            if not fifo.exists():
+                return {"state": status["state"], "accepted": False, "written": 0,
+                        "reason": "job has no stdin channel; restart it with interactive=true"}
+            raw = data.encode("utf-8")
+            if raw and (directory / "stdin-eof.json").exists():
+                return {"state": status["state"], "accepted": False, "written": 0,
+                        "reason": "stdin is already closed (eof); start a new interactive job for more input"}
+            written = 0
+            if raw:
+                # Bounded partial acceptance: every write is at most
+                # STDIN_WRITE_CHUNK (<= PIPE_BUF) and ends on a UTF-8 character
+                # boundary, so a nonblocking write either lands completely or
+                # raises EAGAIN. The accepted prefix maps to an exact character
+                # count (written_chars) for retrying the remainder — a byte
+                # count cannot slice a Python/JSON string at character level.
+                try:
+                    fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError as exc:
+                    if exc.errno != errno.ENXIO:
+                        raise
+                    # No reader is attached (supervisor still starting, or a
+                    # job dir prepared by an older worker): a truthful
+                    # retryable refusal — no bytes are accepted or dropped and
+                    # EOF is not armed.
+                    return {"state": status["state"], "accepted": False, "written": 0,
+                            "written_chars": 0, "retryable": True,
+                            "reason": "stdin channel is not ready yet; the supervisor has not attached its reader — retry"}
+                try:
+                    while written < len(raw):
+                        chunk = raw[written:written + STDIN_WRITE_CHUNK]
+                        complete = len(chunk) - _utf8_incomplete_tail(chunk)
+                        if complete <= 0:
+                            break  # unreachable for encoded UTF-8; never spin
+                        try:
+                            written += os.write(fd, chunk[:complete])
+                        except BlockingIOError:
+                            break
+                finally:
+                    os.close(fd)
+            buffer_full = written < len(raw)
+            eof_requested = bool(request.get("eof"))
+            # EOF applies only once every byte of this operation has been
+            # accepted into the FIFO. A partial write defers EOF explicitly so
+            # the exact unwritten remainder can be retried with eof=true;
+            # closing early would make that remainder unsendable.
+            eof_applied = eof_requested and not buffer_full
+            if eof_applied:
+                atomic_json(directory / "stdin-eof.json", {"at": time.time()})
+            return {"state": status["state"], "accepted": True, "written": written,
+                    "written_chars": len(raw[:written].decode("utf-8")),
+                    "eof": eof_applied, "eof_deferred": eof_requested and buffer_full,
+                    "stdin_buffer_full": buffer_full}
         elif action != "status":
             raise ValueError("unsupported job action")
         return job_status(directory)

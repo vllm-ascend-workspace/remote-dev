@@ -1,16 +1,23 @@
 # Remote-dev client compatibility
 
-Updated 2026-09-07 for the standalone repository. One server and one schema
-set serve every client; model credentials and provider settings are separate
-and are not changed by this setup.
+Updated 2026-09-11 for the session-semantics review batch: deferred EOF on
+partially accepted stdin writes, character-exact retry accounting
+(`written_chars`), UTF-8-safe incremental paging, and initial-yield cursor
+continuation. Originally written 2026-09-10 for the client-parity batch: nineteen `remote_*` tools
+(`remote_job_stdin` is new), a shared alias layer for client-native parameter
+names, wider grep coverage, write append, read-from-end, and interactive
+pipe sessions with writable stdin. One server and one schema set serve every
+client; model credentials and provider settings are separate and are not
+changed by this setup.
 
 > Evidence below dated 2026-08-27 was gathered while remote-dev lived at
 > `.remote-dev/` inside the vllm-ascend-workspace scaffold. Paths in that
 > section refer to that layout. The tool names, schemas, framing and dispatch
 > rules it exercised are unchanged here; the four `vaws_*` task tools it
-> mentions have since been removed (18 `remote_*` tools remain), and the
-> scaffold-specific selectors (`session_id`, `session_file`, `machine`) are
-> now consumer resolver fields rather than built-in schema properties.
+> mentions have since been removed, and the scaffold-specific selectors
+> (`session_id`, `session_file`, `machine`) are now consumer resolver fields
+> rather than built-in schema properties. Its "18 tools" counts predate the
+> 2026-09-10 batch, which added `remote_job_stdin` (19 tools).
 
 ## Configuration
 
@@ -19,11 +26,17 @@ model. Starting points live in `examples/`:
 
 | Client | Project configuration | Example | Server identifier |
 | --- | --- | --- | --- |
-| Kimi Code | `.mcp.json` | `examples/mcp.json` | `remote-dev` |
+| Kimi Code | `.kimi-code/mcp.json` | `examples/kimi-mcp.example.json` | `remote-dev` |
 | Claude Code, including DeepSeek V4 | `.mcp.json` | `examples/mcp.json` | `remote-dev` |
 | Cursor IDE / Cursor Agent | `.cursor/mcp.json` | `examples/mcp.json` | `remote-dev` |
 | Codex | `.codex/config.toml` | `examples/codex-config.example.toml` | `remote_dev` |
 | Grok Build | `.grok/config.toml` | `examples/grok-config.example.toml` | `remote-dev` |
+
+Kimi Code reads project MCP servers from `.kimi-code/mcp.json` (user level:
+`~/.kimi-code/mcp.json`), not `.mcp.json`; its entry shape uses
+`startupTimeoutMs` / `toolTimeoutMs` and no `type` field. Trusting the folder
+enables the project-level servers; servers added mid-session only join new
+sessions.
 
 All entries launch `remote-dev server` from the installed `vaws-remote-dev`
 package (or `uvx --from git+https://github.com/vllm-ascend-workspace/remote-dev@<ref>
@@ -72,7 +85,8 @@ interactive calls should use the client's confirmation flow.
 - Advertised tool names use `remote_read`, `remote_apply_patch`, etc. Grok 1.0.5
   can complete the MCP handshake and list dotted names in doctor, yet fail to
   register them in a model session. An isolated naming-only comparison confirmed
-  that underscore names expose all 18 tools to `search_tool`.
+  that underscore names expose all tools to `search_tool` (18 at the time; 19
+  since 2026-09-10).
 - The dispatcher still accepts legacy `remote.read` and `remote.apply_patch`
   names. Result envelopes retain canonical dotted tool names. Kimi/Claude
   namespaced names remain `mcp__remote-dev__remote_read`; Grok discovers
@@ -85,6 +99,37 @@ interactive calls should use the client's confirmation flow.
   field claimed by a registered resolver plugin; supply non-empty `patch` or
   legacy `command` for patches. `patch` takes
   precedence. Missing endpoint/payload is rejected before remote execution.
+  Fields that have client-native aliases (`file_path`, `command`) are also
+  enforced server-side rather than through the wire schema's `required` list,
+  so a provider cannot reject an alias-only call before normalization runs.
+- Client-native habit mapping (one shared alias layer, not five
+  implementations): `path` → `file_path`; `line_offset`/`n_lines` →
+  `offset`/`limit` (a negative offset reads from the end of the file, Kimi
+  style); `cmd`/`workdir` → `command`/`cwd`; grep accepts `-i`, `-A`, `-B`,
+  `-C`, `-n`, `head_limit`, `offset`, `include_ignored`, and both `count`
+  (matching lines per file, Claude style) and `count_matches` (total matches
+  per file, Kimi style — `rg --count-matches`, with a per-file `-o` counting
+  fallback; the two modes differ whenever one line holds several matches).
+- `remote_write append=true` appends atomically (Kimi `mode=append`);
+  `remote_read` on a binary file returns an actionable `binary_file` status —
+  there is no remote image/media preview tool.
+- Codex exec habits map to the shared supervisor: `remote_bash
+  run_in_background=true interactive=true yield_time_ms=...` starts a pipe
+  session and yields initial output; `remote_job_stdin` writes `chars` (empty
+  = poll), closes input with `eof`, and returns only new output (per-stream
+  byte cursors, no replay across polls). The initial yield shares that cursor
+  path: it returns the first bytes up to the budget and later polls continue
+  exactly where it stopped, so skipped bytes are never lost. Incremental reads
+  hold back a UTF-8 character split by the byte budget for the next poll
+  (invalid bytes still flush as U+FFFD so the cursor always advances). A write
+  accepted partially reports `stdin_buffer_full` with `written`/`written_chars`
+  counts — retry the exact remainder sliced at `written_chars`; an `eof` on a
+  partial write is deferred until the remainder is accepted. `max_output_tokens`
+  is honored as a
+  4-characters-per-token budget per stream with an explicit remainder
+  warning, never accepted and ignored. `tty=true` is an explicit
+  `unsupported_capability` error: remote-dev sessions are pipes, not PTYs,
+  and control bytes are delivered as bytes, not signals.
 - `remote_multi_edit.edits` exposes typed item fields; omitted `new_string`
   retains the existing empty-string deletion behavior.
 - Path containment, symlink checks, read ledgers, patch atomicity, and SSH

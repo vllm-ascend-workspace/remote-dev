@@ -228,17 +228,37 @@ if op == "grep":
     if not pattern:
         fail("pattern_required", "RemoteGrep requires pattern")
     limit = int(payload.get("limit") or 100)
+    offset = int(payload.get("offset") or 0)
+    if offset < 0:
+        fail("invalid_pagination", "offset must be >= 0")
     max_line_chars = int(payload.get("max_line_chars") or 2000)
     output_mode = payload.get("output_mode") or "files_with_matches"
     glob_pattern = payload.get("glob")
     type_name = payload.get("type")
     multiline = bool(payload.get("multiline", False))
+    case_insensitive = bool(payload.get("case_insensitive", False))
+    before_context = int(payload.get("before_context") or 0)
+    after_context = int(payload.get("after_context") or 0)
+    context_lines = int(payload.get("context_lines") or 0)
+    include_ignored = bool(payload.get("include_ignored", False))
+    line_numbers = payload.get("line_numbers")
+    line_numbers = True if line_numbers is None else bool(line_numbers)
+    if output_mode != "content" and (before_context or after_context or context_lines):
+        warnings_context = "context line options only apply to output_mode=content; ignoring them"
+    else:
+        warnings_context = ""
     warnings = []
+    if warnings_context:
+        warnings.append(warnings_context)
     rg_path = shutil.which("rg")
     if rg_path:
         cmd = [rg_path, "--color", "never"]
         if multiline:
             cmd.append("-U")
+        if case_insensitive:
+            cmd.append("-i")
+        if include_ignored:
+            cmd.extend(["--no-ignore", "--hidden"])
         if glob_pattern:
             cmd.extend(["--glob", glob_pattern])
         if type_name:
@@ -247,13 +267,26 @@ if op == "grep":
             cmd.append("-l")
         elif output_mode == "count":
             cmd.append("-c")
+        elif output_mode == "count_matches":
+            # Kimi native Grep habit: per-file total match counts, which
+            # differ from -c (matching *lines*) whenever one line holds
+            # several matches.
+            cmd.extend(["--count-matches", "--with-filename"])
         else:
-            cmd.append("-n")
+            cmd.append("-n" if line_numbers else "--no-line-number")
+            if context_lines:
+                cmd.extend(["-C", str(context_lines)])
+            if before_context:
+                cmd.extend(["-B", str(before_context)])
+            if after_context:
+                cmd.extend(["-A", str(after_context)])
         cmd.extend([pattern, str(base)])
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if proc.returncode not in (0, 1):
             fail("failed", proc.stderr[-4000:])
         lines = proc.stdout.splitlines()
+        if offset:
+            lines = lines[offset:]
         truncated_line_count = 0
         if output_mode == "content":
             capped = []
@@ -263,11 +296,16 @@ if op == "grep":
                     truncated_line_count += 1
                 capped.append(line)
             lines = capped
+        total_matches = None
+        if output_mode == "count_matches":
+            total_matches = sum(int(line.rsplit(":", 1)[1]) for line in lines if line.rsplit(":", 1)[-1].isdigit())
         print(json.dumps({
             "status": "ok",
             "engine": "rg",
             "output_mode": output_mode,
+            "offset": offset,
             "matches": lines[:limit],
+            "total_matches": total_matches,
             "truncated": len(lines) > limit,
             "warnings": warnings + ([f"{truncated_line_count} line(s) truncated to {max_line_chars} chars"] if truncated_line_count else []),
         }, sort_keys=True))
@@ -289,27 +327,66 @@ if op == "grep":
         fail("grep_unavailable", "neither rg nor grep found on the remote host")
     warnings.append("rg not found; used grep -E fallback (POSIX ERE semantics)")
     cmd = [grep_path, "-r", "-E", "-I"]
+    if case_insensitive:
+        cmd.append("-i")
     # Align with rg defaults, which skip .git and hidden directories while
     # descending. grep applies --exclude-dir to the base operand itself, so
     # skip a pattern that matches the explicitly requested base (rg searches
-    # an explicitly named hidden or .git path).
-    for exclude_dir in (".git", ".*"):
-        if fnmatch.fnmatch(base.name, exclude_dir):
-            continue
-        cmd.append(f"--exclude-dir={exclude_dir}")
+    # an explicitly named hidden or .git path). grep cannot evaluate
+    # .gitignore rules at all: include_ignored only lifts these default
+    # directory excludes, which is an approximation and is reported as such.
+    if include_ignored:
+        warnings.append("grep fallback cannot evaluate .gitignore; include_ignored only re-enables hidden and .git directories")
+    else:
+        for exclude_dir in (".git", ".*"):
+            if fnmatch.fnmatch(base.name, exclude_dir):
+                continue
+            cmd.append(f"--exclude-dir={exclude_dir}")
     if glob_pattern:
         cmd.append(f"--include={glob_pattern}")
+    if output_mode == "count_matches":
+        # POSIX grep has no per-file match count. Find candidate files first,
+        # then count -o matches per file. Never degrade to line counts: with
+        # several matches on one line that would silently change semantics.
+        list_proc = subprocess.run([*cmd, "-l", "--", pattern, str(base)], capture_output=True, text=True, check=False)
+        if list_proc.returncode not in (0, 1):
+            fail("failed", list_proc.stderr[-4000:])
+        counts = []
+        total_matches = 0
+        count_cmd = [grep_path, "-o", "-E"]
+        if case_insensitive:
+            count_cmd.append("-i")
+        for candidate in list_proc.stdout.splitlines():
+            sub = subprocess.run([*count_cmd, "--", pattern, candidate], capture_output=True, text=True, check=False)
+            if sub.returncode not in (0, 1):
+                fail("failed", sub.stderr[-4000:])
+            amount = len(sub.stdout.splitlines())
+            counts.append(f"{candidate}:{amount}")
+            total_matches += amount
+        if offset:
+            counts = counts[offset:]
+        print(json.dumps({"status": "ok", "engine": "grep", "output_mode": output_mode, "offset": offset, "matches": counts[:limit], "total_matches": total_matches, "truncated": len(counts) > limit, "warnings": warnings}, sort_keys=True))
+        raise SystemExit(0)
     if output_mode == "files_with_matches":
         cmd.append("-l")
     elif output_mode == "count":
         cmd.append("-c")
     else:
-        cmd.append("-n")
+        if line_numbers:
+            cmd.append("-n")
+        if context_lines:
+            cmd.append(f"-C{context_lines}")
+        if before_context:
+            cmd.append(f"-B{before_context}")
+        if after_context:
+            cmd.append(f"-A{after_context}")
     cmd.extend(["--", pattern, str(base)])
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode not in (0, 1):
         fail("failed", proc.stderr[-4000:])
     lines = proc.stdout.splitlines()
+    if offset:
+        lines = lines[offset:]
     if output_mode == "count":
         # Match rg -c behavior: only report files with at least one match.
         lines = [line for line in lines if not line.endswith(":0")]
@@ -324,7 +401,7 @@ if op == "grep":
         lines = capped
         if truncated_line_count:
             warnings.append(f"{truncated_line_count} line(s) truncated to {max_line_chars} chars")
-    print(json.dumps({"status": "ok", "engine": "grep", "output_mode": output_mode, "matches": lines[:limit], "truncated": len(lines) > limit, "warnings": warnings}, sort_keys=True))
+    print(json.dumps({"status": "ok", "engine": "grep", "output_mode": output_mode, "offset": offset, "matches": lines[:limit], "total_matches": None, "truncated": len(lines) > limit, "warnings": warnings}, sort_keys=True))
     raise SystemExit(0)
 
 fail("unsupported_op", f"unsupported search op: {op}")
@@ -411,17 +488,30 @@ def remote_grep(
     type: str | None = None,
     output_mode: str = "files_with_matches",
     multiline: bool = False,
+    case_insensitive: bool = False,
+    before_context: int = 0,
+    after_context: int = 0,
+    context_lines: int = 0,
+    line_numbers: bool | None = None,
+    include_ignored: bool = False,
+    offset: int = 0,
     limit: int = 100,
     timeout_ms: int = 120000,
 ) -> dict[str, Any]:
     started = utc_now_iso()
     start = time.monotonic()
-    local_warnings = []
+    if output_mode not in {"files_with_matches", "content", "count", "count_matches"}:
+        local_warnings = [f"unknown output_mode {output_mode!r}; using files_with_matches"]
+        output_mode = "files_with_matches"
+    else:
+        local_warnings = []
     if limit > MAX_GREP_MATCHES:
         local_warnings.append(f"limit clamped from {limit} to {MAX_GREP_MATCHES}")
         limit = MAX_GREP_MATCHES
     if limit < 1:
         limit = 1
+    if offset < 0:
+        offset = 0
     raw_path = path or endpoint.effective_cwd
     try:
         base = join_under_root(endpoint.root, endpoint.effective_cwd, raw_path)
@@ -440,6 +530,13 @@ def remote_grep(
             "type": type,
             "output_mode": output_mode,
             "multiline": multiline,
+            "case_insensitive": case_insensitive,
+            "before_context": before_context,
+            "after_context": after_context,
+            "context_lines": context_lines,
+            "line_numbers": line_numbers,
+            "include_ignored": include_ignored,
+            "offset": offset,
             "limit": limit,
             "max_line_chars": MAX_LINE_CHARS,
         },
@@ -459,7 +556,7 @@ def remote_grep(
         duration_ms=_duration_ms(start),
         preview={"matches": visible_matches, "truncated": bool(data.get("truncated", False)) or text_truncated},
         warnings=warnings,
-        extra={"matches": visible_matches, "engine": data.get("engine"), "output_mode": output_mode, "truncated": bool(data.get("truncated", False)) or text_truncated, "error": data.get("error")},
+        extra={"matches": visible_matches, "engine": data.get("engine"), "output_mode": output_mode, "offset": offset, "total_matches": data.get("total_matches"), "truncated": bool(data.get("truncated", False)) or text_truncated, "error": data.get("error")},
     )
     text = compact_text("\n".join(visible_matches) + ("\n<truncated>\n" if data.get("truncated") or text_truncated else "\n"))
     return {"text": text, "result": result}

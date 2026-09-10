@@ -8,7 +8,7 @@ from remote_dev.core.artifact_ops import remote_artifact_manifest, remote_artifa
 from remote_dev.core.context_snapshot import remote_context_snapshot, remote_probe
 from remote_dev.core.endpoint import has_selector, resolve_endpoint
 from remote_dev.core.file_ops import remote_edit, remote_ls, remote_multi_edit, remote_read, remote_write
-from remote_dev.core.job_ops import endpoint_from_job_record, require_job_id, remote_job_status, remote_job_stop, remote_job_tail
+from remote_dev.core.job_ops import endpoint_from_job_record, remote_job_stdin, require_job_id, remote_job_status, remote_job_stop, remote_job_tail
 from remote_dev.core.monitor_ops import remote_monitor
 from remote_dev.core.patch_ops import remote_apply_patch
 from remote_dev.core.search_ops import remote_glob, remote_grep
@@ -22,7 +22,7 @@ from remote_dev.core.state_store import (
     read_text_if_exists,
     state_root,
 )
-from remote_dev.mcp.schemas import ALIASES, TOOL_SCHEMAS
+from remote_dev.mcp.schemas import ALIASES, TOOL_SCHEMAS, normalize_arguments
 from remote_dev.processes import control
 
 ENDPOINT_ID_RE = re.compile(r"^[0-9a-f]{16}$")
@@ -45,6 +45,7 @@ def list_tools() -> list[dict[str, Any]]:
         "remote.job_status": "Check a remote background job through the shared process supervisor.",
         "remote.job_tail": "Tail remote background job logs through the shared process supervisor.",
         "remote.job_stop": "Stop a remote background job through the shared process supervisor.",
+        "remote.job_stdin": "Write to a running interactive remote job's stdin (Codex write_stdin habit), with optional EOF and output polling.",
         "remote.artifact_manifest": "Build a remote artifact sha256 manifest.",
         "remote.artifact_pull": "Pull a remote artifact through SSH streaming with hash verification.",
         "remote.artifact_push": "Push a local artifact through SSH streaming with hash verification.",
@@ -195,41 +196,87 @@ def canonical_name(name: str) -> str:
     return ALIASES.get(name, name)
 
 
+def _require(args: dict[str, Any], key: str, tool: str, alias_hint: str = "") -> Any:
+    """Server-side required-field check.
+
+    Fields with client-native aliases stay out of the wire schema's
+    ``required`` list so provider-side validation cannot reject an alias-only
+    call before ``normalize_arguments`` runs; the requirement is enforced here
+    instead, with an actionable message.
+    """
+    value = args.get(key)
+    if value is None or (isinstance(value, str) and not value):
+        hint = f" (alias: {alias_hint})" if alias_hint else ""
+        raise ValueError(f"{tool} requires {key}{hint}")
+    return value
+
+
 def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     args = arguments or {}
     name = canonical_name(name)
     if name not in TOOL_SCHEMAS:
         raise KeyError(f"unknown remote-dev tool: {name}")
+    args = normalize_arguments(name, args)
     endpoint = None
     # Job tools can locate their endpoint from the local job record, so they
     # only resolve when the caller supplied an explicit selector.
-    if name not in {"remote.job_status", "remote.job_tail", "remote.job_stop"} or has_selector(args):
+    if name not in {"remote.job_status", "remote.job_tail", "remote.job_stop", "remote.job_stdin"} or has_selector(args):
         endpoint = resolve_endpoint(args)
     timeout_ms = int(args.get("timeout_ms") or args.get("timeout") or 120000)
     if name == "remote.bash":
         assert endpoint is not None
-        return remote_bash(endpoint, command=str(args["command"]), cwd=args.get("cwd"), description=args.get("description"), timeout_ms=timeout_ms, run_in_background=bool(args.get("run_in_background", False)), runtime_env=args.get("runtime_env"), env=args.get("env") if isinstance(args.get("env"), dict) else {})
+        return remote_bash(
+            endpoint,
+            command=str(_require(args, "command", name, "cmd")),
+            cwd=args.get("cwd"),
+            description=args.get("description"),
+            timeout_ms=timeout_ms,
+            run_in_background=bool(args.get("run_in_background", False)),
+            runtime_env=args.get("runtime_env"),
+            env=args.get("env") if isinstance(args.get("env"), dict) else {},
+            interactive=bool(args.get("interactive", False)),
+            yield_time_ms=int(args["yield_time_ms"]) if args.get("yield_time_ms") is not None else None,
+            max_output_tokens=int(args["max_output_tokens"]) if args.get("max_output_tokens") is not None else None,
+            tty=bool(args.get("tty", False)),
+        )
     if name == "remote.monitor":
         assert endpoint is not None
-        return remote_monitor(endpoint, command=str(args["command"]), cwd=args.get("cwd"), description=args.get("description"), timeout_ms=timeout_ms, pattern=args.get("pattern"), runtime_env=args.get("runtime_env"), env=args.get("env") if isinstance(args.get("env"), dict) else {})
+        return remote_monitor(endpoint, command=str(_require(args, "command", name, "cmd")), cwd=args.get("cwd"), description=args.get("description"), timeout_ms=timeout_ms, pattern=args.get("pattern"), runtime_env=args.get("runtime_env"), env=args.get("env") if isinstance(args.get("env"), dict) else {})
     if name == "remote.read":
         assert endpoint is not None
-        return remote_read(endpoint, file_path=str(args["file_path"]), offset=int(args.get("offset") or 1), limit=int(args.get("limit") or 200), allow_symlink=bool(args.get("allow_symlink", False)), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
+        return remote_read(endpoint, file_path=str(_require(args, "file_path", name, "path")), offset=int(args.get("offset") or 1), limit=int(args.get("limit") or 200), allow_symlink=bool(args.get("allow_symlink", False)), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
     if name == "remote.write":
         assert endpoint is not None
-        return remote_write(endpoint, file_path=str(args["file_path"]), content=str(args.get("content", "")), overwrite=bool(args.get("overwrite", False)), create_dirs=bool(args.get("create_dirs", False)), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
+        return remote_write(endpoint, file_path=str(_require(args, "file_path", name, "path")), content=str(args.get("content", "")), overwrite=bool(args.get("overwrite", False)), append=bool(args.get("append", False)), create_dirs=bool(args.get("create_dirs", False)), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
     if name == "remote.edit":
         assert endpoint is not None
-        return remote_edit(endpoint, file_path=str(args["file_path"]), old_string=str(args["old_string"]), new_string=str(args["new_string"]), replace_all=bool(args.get("replace_all", False)), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
+        return remote_edit(endpoint, file_path=str(_require(args, "file_path", name, "path")), old_string=str(_require(args, "old_string", name)), new_string=str(_require(args, "new_string", name)), replace_all=bool(args.get("replace_all", False)), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
     if name == "remote.multi_edit":
         assert endpoint is not None
-        return remote_multi_edit(endpoint, file_path=str(args["file_path"]), edits=list(args.get("edits") or []), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
+        return remote_multi_edit(endpoint, file_path=str(_require(args, "file_path", name, "path")), edits=list(args.get("edits") or []), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
     if name == "remote.glob":
         assert endpoint is not None
         return remote_glob(endpoint, pattern=str(args["pattern"]), path=args.get("path"), limit=int(args.get("limit") or 100), respect_gitignore=bool(args.get("respect_gitignore", False)), timeout_ms=timeout_ms)
     if name == "remote.grep":
         assert endpoint is not None
-        return remote_grep(endpoint, pattern=str(args["pattern"]), path=args.get("path"), glob=args.get("glob"), type=args.get("type"), output_mode=str(args.get("output_mode") or "files_with_matches"), multiline=bool(args.get("multiline", False)), limit=int(args.get("limit") or 100), timeout_ms=timeout_ms)
+        return remote_grep(
+            endpoint,
+            pattern=str(args["pattern"]),
+            path=args.get("path"),
+            glob=args.get("glob"),
+            type=args.get("type"),
+            output_mode=str(args.get("output_mode") or "files_with_matches"),
+            multiline=bool(args.get("multiline", False)),
+            case_insensitive=bool(args.get("case_insensitive", False)),
+            before_context=int(args.get("before_context") or 0),
+            after_context=int(args.get("after_context") or 0),
+            context_lines=int(args.get("context_lines") or 0),
+            line_numbers=args.get("line_numbers") if args.get("line_numbers") is None else bool(args.get("line_numbers")),
+            include_ignored=bool(args.get("include_ignored", False)),
+            offset=int(args.get("offset") or 0),
+            limit=int(args.get("limit") or 100),
+            timeout_ms=timeout_ms,
+        )
     if name == "remote.ls":
         assert endpoint is not None
         return remote_ls(endpoint, path=args.get("path"), limit=int(args.get("limit") or 200), all=bool(args.get("all", False)), timeout_ms=timeout_ms)
@@ -242,6 +289,15 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
         return remote_job_tail(endpoint, job_id=str(args["job_id"]), lines=int(args.get("lines") or 80), stream=str(args.get("stream") or "both"))
     if name == "remote.job_stop":
         return remote_job_stop(endpoint, job_id=str(args["job_id"]), force=bool(args.get("force", False)))
+    if name == "remote.job_stdin":
+        return remote_job_stdin(
+            endpoint,
+            job_id=str(args["job_id"]),
+            chars=args.get("chars") if args.get("chars") is None else str(args.get("chars")),
+            eof=bool(args.get("eof", False)),
+            yield_time_ms=int(args["yield_time_ms"]) if args.get("yield_time_ms") is not None else None,
+            max_output_tokens=int(args["max_output_tokens"]) if args.get("max_output_tokens") is not None else None,
+        )
     if name == "remote.artifact_manifest":
         assert endpoint is not None
         return remote_artifact_manifest(endpoint, remote_path=str(args["remote_path"]), timeout_ms=timeout_ms)

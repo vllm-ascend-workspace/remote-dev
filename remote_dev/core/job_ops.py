@@ -5,7 +5,7 @@ import shlex
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from remote_dev.core.endpoint import DEFAULT_CWD, DEFAULT_ROOT, Endpoint
@@ -20,6 +20,8 @@ JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,95}$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 RESERVED_ENV_PREFIX = "REMOTE_DEV_JOB_"
 STOP_DRAIN_SECONDS = 2.0
+MAX_YIELD_MS = 30000
+MAX_INCREMENTAL_READ_BYTES = 32768
 
 
 def _duration_ms(start: float) -> int:
@@ -91,7 +93,7 @@ def endpoint_from_job_record(record: dict[str, Any]) -> Endpoint:
     return _endpoint_from_record(record)
 
 
-def _load_record(endpoint: Endpoint | None, job_id: str) -> tuple[Endpoint, dict[str, Any]]:
+def _load_record(endpoint: Endpoint | None, job_id: str) -> tuple[Endpoint, dict[str, Any], Path]:
     job_id = require_job_id(job_id)
     if endpoint is not None:
         path = job_record_path(endpoint, job_id)
@@ -100,12 +102,12 @@ def _load_record(endpoint: Endpoint | None, job_id: str) -> tuple[Endpoint, dict
         import json
 
         data = json.loads(path.read_text(encoding="utf-8"))
-        return endpoint, data
+        return endpoint, data, path
     found = find_job_record(job_id)
     if not found:
         raise FileNotFoundError(f"unknown remote job id: {job_id}")
-    _, data = found
-    return _endpoint_from_record(data), data
+    path, data = found
+    return _endpoint_from_record(data), data, path
 
 
 def _start_failure(
@@ -159,13 +161,23 @@ def start_remote_job(
     runtime_env: bool | None = None,
     description: str | None = None,
     job_id: str | None = None,
+    interactive: bool = False,
+    yield_time_ms: int | None = None,
+    max_output_tokens: int | None = None,
 ) -> dict[str, Any]:
     started = utc_now_iso()
     start = time.monotonic()
     env = env or {}
+    warnings: list[str] = []
     runtime_enabled = endpoint.runtime_env if runtime_env is None else runtime_env
     job_id = require_job_id(job_id or new_job_id())
     cwd = cwd or endpoint.effective_cwd
+    yield_ms = int(yield_time_ms or 0)
+    if yield_ms < 0:
+        yield_ms = 0
+    if yield_ms > MAX_YIELD_MS:
+        warnings.append(f"yield_time_ms clamped from {yield_ms} to {MAX_YIELD_MS}")
+        yield_ms = MAX_YIELD_MS
     local_record = job_record_path(endpoint, job_id)
     found_record = find_job_record(job_id)
     if local_record.exists() or found_record:
@@ -186,6 +198,7 @@ def start_remote_job(
         "cwd": cwd,
         "env": {require_env_name(key): str(value) for key, value in env.items()},
         "timeout_seconds": _timeout_seconds(timeout_ms),
+        "interactive": bool(interactive),
     }
     try:
         prepared = control(endpoint, job_id, "prepare", spec=spec)
@@ -239,10 +252,55 @@ def start_remote_job(
         "remote_dir": remote_dir,
         "started_at": started,
         "timeout_ms": timeout_ms,
+        "interactive": bool(interactive),
         "authorization": authorization,
     }
     atomic_write_json(local_record, record)
     job_state = str(status_row.get("state") or "running")
+    yield_info: dict[str, Any] | None = None
+    if yield_ms > 0:
+        # Codex exec_command habit: hold the response briefly so fast commands
+        # finish (or first output appears) inside the same tool call. The job
+        # stays on the supervisor either way; job_stdin/job_tail continue it.
+        # A yield polling failure must not kill the already-running job.
+        try:
+            deadline = time.monotonic() + yield_ms / 1000
+            while time.monotonic() < deadline:
+                row = control(endpoint, job_id, "status")
+                job_state = str(row.get("state") or job_state)
+                if row.get("quiet"):
+                    break
+                time.sleep(0.1)
+            budget = _output_budget_bytes(max_output_tokens)
+            # Same incremental cursor path as job_stdin polls: the initial
+            # yield returns the first bytes up to the budget (not just the
+            # last lines) and persists the cursors where it stopped, so a
+            # follow-up job_stdin poll neither replays this output nor drops
+            # the earlier unreturned bytes.
+            tail_row = control(endpoint, job_id, "tail", stdout_offset=0, stderr_offset=0, max_bytes=budget)
+            record["stdin_cursors"] = {
+                "stdout_offset": int(tail_row.get("stdout_offset") or 0),
+                "stderr_offset": int(tail_row.get("stderr_offset") or 0),
+            }
+            atomic_write_json(local_record, record)
+            yield_info = {
+                "yield_time_ms": yield_ms,
+                "state": job_state,
+                "stdout": str(tail_row.get("stdout") or ""),
+                "stderr": str(tail_row.get("stderr") or ""),
+                "max_bytes_per_stream": budget,
+                "stdout_bytes_remaining": int(tail_row.get("stdout_bytes_remaining") or 0),
+                "stderr_bytes_remaining": int(tail_row.get("stderr_bytes_remaining") or 0),
+            }
+            for stream_name in ("stdout", "stderr"):
+                remaining = int(tail_row.get(f"{stream_name}_bytes_remaining") or 0)
+                if remaining:
+                    warnings.append(
+                        f"{stream_name}: {remaining} more byte(s) pending beyond the initial yield budget; "
+                        "continue with remote.job_stdin (interactive) or remote.job_tail"
+                    )
+        except (RemoteExecutionError, ValueError, RuntimeError, OSError) as exc:
+            warnings.append(f"yield polling failed; the job is still running under the supervisor: {str(exc)[-500:]}")
     result = make_result(
         tool="remote.bash",
         target=endpoint.to_result_target(),
@@ -252,25 +310,33 @@ def start_remote_job(
         started_at=started,
         duration_ms=_duration_ms(start),
         refs={"job_record": str(local_record)},
+        warnings=warnings,
         extra={
             "job": {
                 "job_id": job_id,
                 "status_tool": "remote.job_status",
                 "tail_tool": "remote.job_tail",
                 "stop_tool": "remote.job_stop",
+                "stdin_tool": "remote.job_stdin" if interactive else None,
+                "interactive": bool(interactive),
                 "remote_dir": remote_dir,
                 "state": job_state,
                 "quiet": status_row.get("quiet"),
                 "receipt": status_row.get("receipt"),
+                "yield": yield_info,
             }
         },
     )
     text = f"RemoteBash started on {endpoint.user}@{endpoint.host}:{endpoint.port}\njob_id: {job_id}\nremote_dir: {remote_dir}\n"
+    if interactive:
+        text += "interactive: true (write to stdin with remote.job_stdin; cancel with remote.job_stop)\n"
+    if yield_info is not None:
+        text += f"state after yield: {job_state}\n__STDOUT__\n{yield_info['stdout']}__STDERR__\n{yield_info['stderr']}"
     return {"text": text, "result": result}
 
 
 def remote_job_status(endpoint: Endpoint | None, *, job_id: str) -> dict[str, Any]:
-    endpoint, record = _load_record(endpoint, job_id)
+    endpoint, record, _record_path = _load_record(endpoint, job_id)
     started = utc_now_iso()
     start = time.monotonic()
     try:
@@ -302,7 +368,7 @@ def remote_job_status(endpoint: Endpoint | None, *, job_id: str) -> dict[str, An
 
 
 def remote_job_tail(endpoint: Endpoint | None, *, job_id: str, lines: int = 80, stream: str = "both") -> dict[str, Any]:
-    endpoint, record = _load_record(endpoint, job_id)
+    endpoint, record, _record_path = _load_record(endpoint, job_id)
     started = utc_now_iso()
     start = time.monotonic()
     warnings = []
@@ -357,8 +423,180 @@ def remote_job_tail(endpoint: Endpoint | None, *, job_id: str, lines: int = 80, 
     return {"text": text, "result": result}
 
 
+def _output_budget_bytes(max_output_tokens: int | None) -> int:
+    """Approximate a token budget as bytes, 4 characters per token.
+
+    Codex counts real model tokens; remote-dev cannot tokenize here, so the
+    documented fixed ratio is applied per stream and never silently drops the
+    remainder: the read cursor only advances past returned bytes.
+    """
+    if max_output_tokens is None:
+        return MAX_INCREMENTAL_READ_BYTES
+    return max(256, min(MAX_INCREMENTAL_READ_BYTES, int(max_output_tokens) * 4))
+
+
+def remote_job_stdin(
+    endpoint: Endpoint | None,
+    *,
+    job_id: str,
+    chars: str | None = None,
+    eof: bool = False,
+    yield_time_ms: int | None = None,
+    max_output_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Write bytes to a running interactive job's stdin, then report fresh output.
+
+    Codex write_stdin habit: empty ``chars`` is a poll. Output is incremental:
+    a per-stream byte cursor in the local job record advances past exactly the
+    bytes this call returns, so repeated polls never replay earlier output and
+    budget-capped calls lose nothing. ``eof`` closes the input so programs
+    waiting for end-of-input finish. Cancellation stays with
+    ``remote.job_stop``; lifecycle, logs, exit code and descendant drain are
+    the shared supervisor's, exactly like every other background job.
+    """
+    endpoint, record, record_path = _load_record(endpoint, job_id)
+    started = utc_now_iso()
+    start = time.monotonic()
+    warnings = []
+    if not record.get("interactive"):
+        error = (
+            f"job {job_id} was not started with interactive=true and has no stdin channel; "
+            "restart it with remote.bash run_in_background=true interactive=true"
+        )
+        result = make_result(
+            tool="remote.job_stdin",
+            target=endpoint.to_result_target(),
+            outcome="failed",
+            status="not_interactive",
+            summary=f"Remote job {job_id} has no stdin channel.",
+            started_at=started,
+            duration_ms=_duration_ms(start),
+            preview={"stderr": error},
+            extra={"job_id": job_id, "error": error},
+        )
+        return {"text": result["summary"] + "\n" + error + "\n", "result": result}
+    yield_ms = max(0, int(yield_time_ms or 0))
+    if yield_ms > MAX_YIELD_MS:
+        warnings.append(f"yield_time_ms clamped from {yield_ms} to {MAX_YIELD_MS}")
+        yield_ms = MAX_YIELD_MS
+    try:
+        reply = control(endpoint, job_id, "stdin", data=chars or "", eof=bool(eof))
+    except (RemoteExecutionError, ValueError, RuntimeError, OSError) as exc:
+        result = make_result(
+            tool="remote.job_stdin",
+            target=endpoint.to_result_target(),
+            outcome="failed",
+            status="failed",
+            summary=f"Remote job {job_id} stdin write failed.",
+            started_at=started,
+            duration_ms=_duration_ms(start),
+            extra={"job_id": job_id, "error": str(exc)[-4000:]},
+        )
+        return {"text": result["summary"] + "\n", "result": result}
+    if not reply.get("accepted"):
+        reason = str(reply.get("reason") or "stdin write was not accepted")
+        result = make_result(
+            tool="remote.job_stdin",
+            target=endpoint.to_result_target(),
+            outcome="failed",
+            status="stdin_rejected",
+            summary=f"Remote job {job_id} stdin write rejected.",
+            started_at=started,
+            duration_ms=_duration_ms(start),
+            preview={"stderr": reason},
+            extra={"job_id": job_id, "error": reason, "state": reply.get("state")},
+        )
+        return {"text": result["summary"] + "\n" + reason + "\n", "result": result}
+    if reply.get("stdin_buffer_full"):
+        warnings.append(
+            f"remote stdin buffer is full; {reply.get('written', 0)} bytes "
+            f"({reply.get('written_chars', 0)} chars) accepted — retry the exact unwritten "
+            "remainder after the job drains it, slicing the original chars at written_chars "
+            "(a byte count cannot slice a Unicode string)"
+        )
+    if reply.get("eof_deferred"):
+        warnings.append(
+            "eof was deferred: stdin closes only once every byte of this call is accepted; "
+            "resend the unwritten remainder with eof=true"
+        )
+    state = str(reply.get("state") or "running")
+    if yield_ms > 0:
+        try:
+            deadline = time.monotonic() + yield_ms / 1000
+            while time.monotonic() < deadline:
+                row = control(endpoint, job_id, "status")
+                state = str(row.get("state") or state)
+                if row.get("quiet"):
+                    break
+                time.sleep(0.1)
+        except (RemoteExecutionError, ValueError, RuntimeError, OSError) as exc:
+            warnings.append(f"yield polling failed: {str(exc)[-500:]}")
+    cursors = record.get("stdin_cursors") if isinstance(record.get("stdin_cursors"), dict) else {}
+    stdout_offset = max(0, int(cursors.get("stdout_offset") or 0))
+    stderr_offset = max(0, int(cursors.get("stderr_offset") or 0))
+    max_bytes = _output_budget_bytes(max_output_tokens)
+    try:
+        tail_row = control(
+            endpoint,
+            job_id,
+            "tail",
+            stdout_offset=stdout_offset,
+            stderr_offset=stderr_offset,
+            max_bytes=max_bytes,
+        )
+    except (RemoteExecutionError, ValueError, RuntimeError, OSError) as exc:
+        tail_row = {}
+        warnings.append(f"incremental read after stdin write failed: {str(exc)[-500:]}")
+    state = str(tail_row.get("state") or state)
+    exit_code = (tail_row.get("result") or {}).get("exit_code") if isinstance(tail_row.get("result"), dict) else None
+    new_stdout = str(tail_row.get("stdout") or "")
+    new_stderr = str(tail_row.get("stderr") or "")
+    if tail_row:
+        record["stdin_cursors"] = {
+            "stdout_offset": int(tail_row.get("stdout_offset", stdout_offset)),
+            "stderr_offset": int(tail_row.get("stderr_offset", stderr_offset)),
+        }
+        atomic_write_json(record_path, record)
+    for stream_name in ("stdout", "stderr"):
+        remaining = int(tail_row.get(f"{stream_name}_bytes_remaining") or 0)
+        if remaining:
+            warnings.append(
+                f"{stream_name}: {remaining} more byte(s) pending beyond this call's "
+                "output budget; call remote.job_stdin again to continue"
+            )
+    sections: list[str] = []
+    for name, body in (("STDOUT", new_stdout), ("STDERR", new_stderr)):
+        sections.append(f"__{name}__\n{body}".rstrip() + ("\n" if body else ""))
+    text = compact_text("".join(sections), limit=MAX_TEXT_CHARS)
+    header = f"Remote job {job_id}: wrote {reply.get('written', 0)} bytes" + (", stdin closed (eof)" if reply.get("eof") else "") + f"; state {state}"
+    if exit_code is not None:
+        header += f"; exit code {exit_code}"
+    result = make_result(
+        tool="remote.job_stdin",
+        target=endpoint.to_result_target(),
+        outcome="success",
+        status="ok",
+        summary=f"Remote job {job_id} stdin updated.",
+        started_at=started,
+        duration_ms=_duration_ms(start),
+        preview={"tail": text, "stderr": ""},
+        warnings=warnings,
+        extra={
+            "job_id": job_id,
+            "stdin": reply,
+            "state": state,
+            "exit_code": exit_code,
+            "eof": bool(eof),
+            "new_output": {"stdout": new_stdout, "stderr": new_stderr},
+            "cursors": record.get("stdin_cursors", {}),
+            "max_bytes_per_stream": max_bytes,
+        },
+    )
+    return {"text": header + "\n" + text, "result": result}
+
+
 def remote_job_stop(endpoint: Endpoint | None, *, job_id: str, force: bool = False) -> dict[str, Any]:
-    endpoint, record = _load_record(endpoint, job_id)
+    endpoint, record, _record_path = _load_record(endpoint, job_id)
     started = utc_now_iso()
     start = time.monotonic()
     try:

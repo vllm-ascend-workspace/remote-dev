@@ -73,7 +73,7 @@ def mcp_and_burden_checks() -> dict[str, Any]:
         for name, schema in TOOL_SCHEMAS.items()
         if ENDPOINT_SELECTOR_DESCRIPTION in schema.get("description", "")
     }
-    endpoint_selector_missing = sorted(set(TOOL_SCHEMAS) - {"remote.job_status", "remote.job_tail", "remote.job_stop"} - endpoint_selector_tools)
+    endpoint_selector_missing = sorted(set(TOOL_SCHEMAS) - {"remote.job_status", "remote.job_tail", "remote.job_stop", "remote.job_stdin"} - endpoint_selector_tools)
     own_required_counts = {
         name: len(required - endpoint_fields)
         for name, required in required_by_tool.items()
@@ -241,6 +241,23 @@ def live_endpoint_checks(args: argparse.Namespace) -> dict[str, Any]:
         time.sleep(2)
         checks.append(require_outcome("job_status", call_tool("remote.job_status", {**endpoint, "job_id": job_id, "timeout_ms": timeout_ms}), statuses={"succeeded"}))
         checks.append(require_outcome("job_tail", call_tool("remote.job_tail", {**endpoint, "job_id": job_id, "lines": 20, "timeout_ms": timeout_ms})))
+
+        interactive_payload = call_tool("remote.bash", {**endpoint, "command": "read -r line; printf 'got:%s\\n' \"$line\"", "cwd": scratch, "run_in_background": True, "interactive": True, "yield_time_ms": 1500, "timeout_ms": timeout_ms})
+        checks.append(require_outcome("interactive_job_start", interactive_payload))
+        interactive_id = interactive_payload["result"].get("job", interactive_payload["result"].get("extra", {}).get("job", {}))["job_id"]
+        stdin_payload = call_tool("remote.job_stdin", {**endpoint, "job_id": interactive_id, "chars": "hello-stdin\x0a", "eof": True, "yield_time_ms": 5000, "timeout_ms": timeout_ms})
+        checks.append(require_outcome("job_stdin", stdin_payload))
+        if "got:hello-stdin" not in json.dumps(stdin_payload.get("result", {})):
+            raise RuntimeError("job_stdin did not surface the echoed stdin line")
+        replay = call_tool("remote.job_stdin", {**endpoint, "job_id": interactive_id, "timeout_ms": timeout_ms})
+        checks.append(require_outcome("job_stdin_poll_after_eof", replay))
+        if "got:hello-stdin" in json.dumps(replay.get("result", {})):
+            raise RuntimeError("job_stdin replayed earlier output; incremental cursors are broken")
+        checks.append(require_outcome("interactive_job_done", call_tool("remote.job_status", {**endpoint, "job_id": interactive_id, "timeout_ms": timeout_ms}), statuses={"succeeded"}))
+        tty_payload = call_tool("remote.bash", {**endpoint, "command": "true", "tty": True, "timeout_ms": timeout_ms})
+        checks.append(require_outcome("bash_tty_capability_boundary", tty_payload, outcomes={"failed"}, statuses={"unsupported_capability"}))
+        noninteractive = call_tool("remote.job_stdin", {**endpoint, "job_id": job_id, "chars": "x", "timeout_ms": timeout_ms})
+        checks.append(require_outcome("job_stdin_rejects_plain_job", noninteractive, outcomes={"failed"}, statuses={"not_interactive"}))
         resource_uris = {item["uri"] for item in list_resources()}
         stdout_uri = next((uri for uri in resource_uris if uri.endswith(f"/job/{job_id}/stdout")), None)
         if not stdout_uri:

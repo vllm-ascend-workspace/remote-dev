@@ -11,11 +11,11 @@ from remote_dev.core.artifact_ops import remote_artifact_manifest, remote_artifa
 from remote_dev.core.context_snapshot import remote_context_snapshot, remote_probe
 from remote_dev.core.endpoint import EndpointError, has_selector, resolve_endpoint
 from remote_dev.core.file_ops import remote_edit, remote_ls, remote_multi_edit, remote_read, remote_write
-from remote_dev.core.job_ops import remote_job_status, remote_job_stop, remote_job_tail
+from remote_dev.core.job_ops import remote_job_stdin, remote_job_status, remote_job_stop, remote_job_tail
 from remote_dev.core.patch_ops import remote_apply_patch
 from remote_dev.core.search_ops import remote_glob, remote_grep
 from remote_dev.core.shell_ops import remote_bash
-from remote_dev.mcp.schemas import TOOL_SCHEMAS
+from remote_dev.mcp.schemas import TOOL_SCHEMAS, normalize_arguments
 from remote_dev.result import make_result
 
 TOOL_NAMES = tuple(name.removeprefix("remote.") for name in TOOL_SCHEMAS)
@@ -26,7 +26,7 @@ def add_endpoint_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--port", type=int)
     parser.add_argument("--user", default=None)
     parser.add_argument("--root", default=None)
-    parser.add_argument("--cwd", default=None)
+    parser.add_argument("--cwd", "--workdir", dest="cwd", default=None, help="Working directory (--workdir is the Codex exec_command habit).")
     parser.add_argument("--runtime-env", dest="runtime_env", action="store_true", default=None)
     parser.add_argument("--no-runtime-env", dest="runtime_env", action="store_false")
     parser.add_argument("--runtime-env-file", dest="runtime_env_file", help="Remote profile script sourced before commands when runtime env is enabled.")
@@ -156,9 +156,13 @@ def build_parser(tool: str) -> argparse.ArgumentParser:
     parser.add_argument("--timeout-ms", type=int, default=120000)
     parser.add_argument("--client-context-id")
     if tool == "bash":
-        parser.add_argument("--command", required=False)
+        parser.add_argument("--command", "--cmd", dest="command", required=False, help="Shell command (--cmd is the Codex exec_command habit).")
         parser.add_argument("--description")
         parser.add_argument("--run-in-background", action="store_true")
+        parser.add_argument("--interactive", action="store_true", help="Background jobs only: keep stdin writable via remote-dev job-stdin.")
+        parser.add_argument("--yield-time-ms", type=int, default=None, help="Background jobs only: poll up to this long before returning, then include the current output tail.")
+        parser.add_argument("--max-output-tokens", type=int, default=None, help="Cap returned output, 4 characters per token, per stream.")
+        parser.add_argument("--tty", action="store_true", help="NOT supported (no PTY); passing it returns an explicit capability error.")
         parser.add_argument("--env", action="append")
     elif tool == "read":
         parser.add_argument("--file-path", required=False)
@@ -174,6 +178,7 @@ def build_parser(tool: str) -> argparse.ArgumentParser:
         parser.add_argument("--content")
         parser.add_argument("--content-file")
         parser.add_argument("--overwrite", action="store_true")
+        parser.add_argument("--append", action="store_true", help="Append content at end of file instead of replacing it (mutually exclusive with --overwrite).")
         parser.add_argument("--create-dirs", action="store_true")
     elif tool == "edit":
         parser.add_argument("--file-path", required=False)
@@ -197,18 +202,31 @@ def build_parser(tool: str) -> argparse.ArgumentParser:
         parser.add_argument("--path")
         parser.add_argument("--glob")
         parser.add_argument("--type")
-        parser.add_argument("--output-mode", default="files_with_matches", choices=["files_with_matches", "content", "count"])
+        parser.add_argument("--output-mode", default="files_with_matches", choices=["files_with_matches", "content", "count", "count_matches"])
         parser.add_argument("--multiline", action="store_true")
+        parser.add_argument("--ignore-case", dest="case_insensitive", action="store_true")
+        parser.add_argument("--context-lines", type=int, default=0)
+        parser.add_argument("--before-context", type=int, default=0)
+        parser.add_argument("--after-context", type=int, default=0)
+        parser.add_argument("--no-line-numbers", dest="line_numbers", action="store_false", default=None)
+        parser.add_argument("--include-ignored", action="store_true", help="Also search hidden and .gitignore-d paths (grep fallback approximates; see docs).")
+        parser.add_argument("--offset", type=int, default=0)
+        parser.add_argument("--head-limit", type=int, default=None, help="Alias of --limit.")
         parser.add_argument("--limit", type=int, default=100)
     elif tool == "apply_patch":
         parser.add_argument("--patch")
         parser.add_argument("--patch-file")
         parser.add_argument("--command")
-    elif tool in {"job_status", "job_tail", "job_stop"}:
+    elif tool in {"job_status", "job_tail", "job_stop", "job_stdin"}:
         parser.add_argument("--job-id", required=False)
         if tool == "job_tail":
             parser.add_argument("--lines", type=int, default=80)
             parser.add_argument("--stream", default="both", choices=["stdout", "stderr", "both"])
+        if tool == "job_stdin":
+            parser.add_argument("--chars", help="Bytes to write to the job's stdin; omit to only poll new output.")
+            parser.add_argument("--eof", action="store_true", help="Close the job's stdin after writing.")
+            parser.add_argument("--yield-time-ms", type=int, default=None, help="Poll up to this long before returning new output.")
+            parser.add_argument("--max-output-tokens", type=int, default=None, help="Cap returned new output, 4 characters per token, per stream.")
         if tool == "job_stop":
             parser.add_argument("--force", action="store_true")
     elif tool in {"artifact_manifest", "artifact_pull", "artifact_push"}:
@@ -240,19 +258,44 @@ def load_input_json(path: str) -> dict[str, Any]:
 def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
     data = load_input_json(args.input_json) if args.input_json else {}
     data = {**endpoint_payload(args), **data}
+    # One shared alias layer: --input-json accepts the same client-native
+    # parameter names as the MCP dispatcher (path, line_offset, -i, ...).
+    data = normalize_arguments(f"remote.{tool}", data)
     endpoint = None
-    if tool not in {"job_status", "job_tail", "job_stop"} or has_selector(data):
+    if tool not in {"job_status", "job_tail", "job_stop", "job_stdin"} or has_selector(data):
         endpoint = resolve_endpoint(data)
     timeout_ms = int(data.get("timeout_ms") or args.timeout_ms)
     if tool == "bash":
         assert endpoint is not None
-        return remote_bash(endpoint, command=data.get("command") or args.command or "", cwd=data.get("cwd"), description=data.get("description") or args.description, timeout_ms=timeout_ms, run_in_background=bool(data.get("run_in_background", args.run_in_background)), runtime_env=data.get("runtime_env"), env=data.get("env") if isinstance(data.get("env"), dict) else parse_env(args.env))
+        command = data.get("command") or args.command
+        if not command:
+            raise ValueError("remote.bash requires command (alias: cmd)")
+        return remote_bash(
+            endpoint,
+            command=command,
+            cwd=data.get("cwd"),
+            description=data.get("description") or args.description,
+            timeout_ms=timeout_ms,
+            run_in_background=bool(data.get("run_in_background", args.run_in_background)),
+            runtime_env=data.get("runtime_env"),
+            env=data.get("env") if isinstance(data.get("env"), dict) else parse_env(args.env),
+            interactive=bool(data.get("interactive", args.interactive)),
+            yield_time_ms=(data.get("yield_time_ms") if data.get("yield_time_ms") is not None else args.yield_time_ms),
+            max_output_tokens=(data.get("max_output_tokens") if data.get("max_output_tokens") is not None else args.max_output_tokens),
+            tty=bool(data.get("tty", args.tty)),
+        )
     if tool == "monitor":
         assert endpoint is not None
-        return remote_bash(endpoint, command=data.get("command") or args.command or "", cwd=data.get("cwd"), description=data.get("description") or args.description, timeout_ms=timeout_ms, run_in_background=True, runtime_env=data.get("runtime_env"), env=data.get("env") if isinstance(data.get("env"), dict) else parse_env(args.env))
+        monitor_command = data.get("command") or args.command
+        if not monitor_command:
+            raise ValueError("remote.monitor requires command (alias: cmd)")
+        return remote_bash(endpoint, command=monitor_command, cwd=data.get("cwd"), description=data.get("description") or args.description, timeout_ms=timeout_ms, run_in_background=True, runtime_env=data.get("runtime_env"), env=data.get("env") if isinstance(data.get("env"), dict) else parse_env(args.env))
     if tool == "read":
         assert endpoint is not None
-        return remote_read(endpoint, file_path=data.get("file_path") or args.file_path, offset=int(data.get("offset", args.offset)), limit=int(data.get("limit", args.limit)), allow_symlink=bool(data.get("allow_symlink", args.allow_symlink)), client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
+        file_path = data.get("file_path") or args.file_path
+        if not file_path:
+            raise ValueError("remote.read requires file_path (alias: path)")
+        return remote_read(endpoint, file_path=file_path, offset=int(data.get("offset", args.offset)), limit=int(data.get("limit", args.limit)), allow_symlink=bool(data.get("allow_symlink", args.allow_symlink)), client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
     if tool == "ls":
         assert endpoint is not None
         return remote_ls(endpoint, path=data.get("path") or args.path, limit=int(data.get("limit", args.limit)), all=bool(data.get("all", args.all)), timeout_ms=timeout_ms)
@@ -261,22 +304,32 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
         content = data.get("content")
         if content is None and args.content_file:
             content = Path(args.content_file).read_text(encoding="utf-8")
-        return remote_write(endpoint, file_path=data.get("file_path") or args.file_path, content=str(content or ""), overwrite=bool(data.get("overwrite", args.overwrite)), create_dirs=bool(data.get("create_dirs", args.create_dirs)), client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
+        file_path = data.get("file_path") or args.file_path
+        if not file_path:
+            raise ValueError("remote.write requires file_path (alias: path)")
+        return remote_write(endpoint, file_path=file_path, content=str(content or ""), overwrite=bool(data.get("overwrite", args.overwrite)), append=bool(data.get("append", args.append)), create_dirs=bool(data.get("create_dirs", args.create_dirs)), client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
     if tool == "edit":
         assert endpoint is not None
-        return remote_edit(endpoint, file_path=data.get("file_path") or args.file_path, old_string=data.get("old_string") if data.get("old_string") is not None else args.old_string, new_string=data.get("new_string") if data.get("new_string") is not None else args.new_string, replace_all=bool(data.get("replace_all", args.replace_all)), client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
+        file_path = data.get("file_path") or args.file_path
+        if not file_path:
+            raise ValueError("remote.edit requires file_path (alias: path)")
+        return remote_edit(endpoint, file_path=file_path, old_string=data.get("old_string") if data.get("old_string") is not None else args.old_string, new_string=data.get("new_string") if data.get("new_string") is not None else args.new_string, replace_all=bool(data.get("replace_all", args.replace_all)), client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
     if tool == "multi_edit":
         assert endpoint is not None
         edits = data.get("edits")
         if edits is None and args.edits_json:
             edits = json.loads(args.edits_json)
-        return remote_multi_edit(endpoint, file_path=data.get("file_path") or args.file_path, edits=edits or [], client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
+        file_path = data.get("file_path") or args.file_path
+        if not file_path:
+            raise ValueError("remote.multi_edit requires file_path (alias: path)")
+        return remote_multi_edit(endpoint, file_path=file_path, edits=edits or [], client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
     if tool == "glob":
         assert endpoint is not None
         return remote_glob(endpoint, pattern=data.get("pattern") or args.pattern or "*", path=data.get("path") or args.path, limit=int(data.get("limit", args.limit)), respect_gitignore=bool(data.get("respect_gitignore", args.respect_gitignore)), timeout_ms=timeout_ms)
     if tool == "grep":
         assert endpoint is not None
-        return remote_grep(endpoint, pattern=data.get("pattern") or args.pattern or "", path=data.get("path") or args.path, glob=data.get("glob") or args.glob, type=data.get("type") or args.type, output_mode=data.get("output_mode") or args.output_mode, multiline=bool(data.get("multiline", args.multiline)), limit=int(data.get("limit", args.limit)), timeout_ms=timeout_ms)
+        args_limit = args.head_limit if args.head_limit is not None else args.limit
+        return remote_grep(endpoint, pattern=data.get("pattern") or args.pattern or "", path=data.get("path") or args.path, glob=data.get("glob") or args.glob, type=data.get("type") or args.type, output_mode=data.get("output_mode") or args.output_mode, multiline=bool(data.get("multiline", args.multiline)), case_insensitive=bool(data.get("case_insensitive", args.case_insensitive)), before_context=int(data.get("before_context") or args.before_context), after_context=int(data.get("after_context") or args.after_context), context_lines=int(data.get("context_lines") or args.context_lines), line_numbers=data.get("line_numbers", args.line_numbers), include_ignored=bool(data.get("include_ignored", args.include_ignored)), offset=int(data.get("offset") or args.offset), limit=int(data.get("limit", args_limit)), timeout_ms=timeout_ms)
     if tool == "apply_patch":
         assert endpoint is not None
         patch = data.get("patch") or args.patch
@@ -289,6 +342,15 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
         return remote_job_tail(endpoint, job_id=data.get("job_id") or args.job_id, lines=int(data.get("lines", args.lines)), stream=data.get("stream") or args.stream)
     if tool == "job_stop":
         return remote_job_stop(endpoint, job_id=data.get("job_id") or args.job_id, force=bool(data.get("force", args.force)))
+    if tool == "job_stdin":
+        return remote_job_stdin(
+            endpoint,
+            job_id=data.get("job_id") or args.job_id,
+            chars=data.get("chars") if data.get("chars") is not None else args.chars,
+            eof=bool(data.get("eof", args.eof)),
+            yield_time_ms=(data.get("yield_time_ms") if data.get("yield_time_ms") is not None else args.yield_time_ms),
+            max_output_tokens=(data.get("max_output_tokens") if data.get("max_output_tokens") is not None else args.max_output_tokens),
+        )
     if tool == "artifact_manifest":
         assert endpoint is not None
         return remote_artifact_manifest(endpoint, remote_path=data.get("remote_path") or args.remote_path, timeout_ms=timeout_ms)
