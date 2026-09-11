@@ -22,6 +22,7 @@ REPO = Path(__file__).resolve().parents[1]
 import remote_dev.core.search_ops as search_ops  # noqa: E402
 
 
+@unittest.skipIf(os.name == "nt", "runs a POSIX grep-only PATH fixture for the Linux peer")
 class GrepFallbackTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

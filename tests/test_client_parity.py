@@ -229,6 +229,8 @@ class RemoteGrepParityTests(unittest.TestCase):
         (hidden / "c.py").write_text("alpha in hidden\n", encoding="utf-8")
 
     def grep(self, path_env: str | None = None, **overrides) -> dict:
+        if os.name == "nt" and shutil.which("rg") is None:
+            self.skipTest("native Windows search fixture requires ripgrep")
         payload = {"op": "grep", "root": str(self.tree), "cwd": str(self.tree), "path": str(self.tree), "pattern": "alpha"}
         payload.update(overrides)
         return run_grep(payload, path_env=path_env)
@@ -245,15 +247,22 @@ class RemoteGrepParityTests(unittest.TestCase):
             link.symlink_to(grep)
         return str(link_dir)
 
+    def search_paths(self):
+        # The grep-only symlink/PATH fixture emulates a POSIX remote host.
+        # Native Windows still exercises rg even when that fixture is unavailable.
+        yield None
+        if os.name != "nt" and shutil.which("grep"):
+            yield self.grep_fallback_path()
+
     def test_case_insensitive_content(self) -> None:
-        for env in (None, self.grep_fallback_path()):
+        for env in self.search_paths():
             data = self.grep(env, output_mode="content", case_insensitive=True)
             self.assertEqual(data["status"], "ok")
             joined = "\n".join(data["matches"])
             self.assertIn("Alpha", joined)
 
     def test_context_lines(self) -> None:
-        for env in (None, self.grep_fallback_path()):
+        for env in self.search_paths():
             data = self.grep(env, output_mode="content", pattern="beta", context_lines=1)
             joined = "\n".join(data["matches"])
             self.assertIn("Alpha", joined)
@@ -281,9 +290,10 @@ class RemoteGrepParityTests(unittest.TestCase):
         self.assertEqual(default["matches"], [])
         included = self.grep(None, output_mode="content", case_insensitive=True, pattern="alpha in hidden", include_ignored=True)
         self.assertTrue(any("c.py" in line for line in included["matches"]))
-        fallback = self.grep(self.grep_fallback_path(), output_mode="content", case_insensitive=True, pattern="alpha in hidden", include_ignored=True)
-        self.assertTrue(any("c.py" in line for line in fallback["matches"]))
-        self.assertTrue(any("gitignore" in warning for warning in fallback["warnings"]))
+        if os.name != "nt" and shutil.which("grep"):
+            fallback = self.grep(self.grep_fallback_path(), output_mode="content", case_insensitive=True, pattern="alpha in hidden", include_ignored=True)
+            self.assertTrue(any("c.py" in line for line in fallback["matches"]))
+            self.assertTrue(any("gitignore" in warning for warning in fallback["warnings"]))
 
     def test_count_and_count_matches_are_semantically_distinct(self) -> None:
         # Distinguishing input: one line holds two matches of the pattern.
@@ -291,11 +301,11 @@ class RemoteGrepParityTests(unittest.TestCase):
         # rg --count-matches) counts *matches*.
         multi = self.tree / "multi.txt"
         multi.write_text("aa\nbb\n", encoding="utf-8")
-        for env in (None, self.grep_fallback_path()):
+        for env in self.search_paths():
             lines = self.grep(env, output_mode="count", pattern="a", glob="multi.txt")
             matches = self.grep(env, output_mode="count_matches", pattern="a", glob="multi.txt")
-            self.assertEqual(lines["matches"], [f"{multi}:1"], f"env={env}")
-            self.assertEqual(matches["matches"], [f"{multi}:2"], f"env={env}")
+            self.assertEqual([row.replace("\\", "/") for row in lines["matches"]], [f"{multi.as_posix()}:1"], f"env={env}")
+            self.assertEqual([row.replace("\\", "/") for row in matches["matches"]], [f"{multi.as_posix()}:2"], f"env={env}")
             self.assertEqual(matches["total_matches"], 2, f"env={env}")
             self.assertIsNone(lines["total_matches"], f"env={env}")
 
