@@ -17,7 +17,9 @@ ENDPOINT_PROPS: dict[str, Any] = {
     "ssh_mux": {
         "type": "boolean",
         "description": (
-            "Per-endpoint OpenSSH multiplexing. true uses the shared ControlMaster; "
+            "Low-level SSH and diagnostic policy. Developer tools use their own "
+            "pooled stdio connection with mux disabled on all clients. "
+            "For low-level operations, true uses the shared ControlMaster; "
             "false forces an independent connection (ControlMaster=no, ControlPath=none, "
             "ControlPersist=no). When omitted, REMOTE_DEV_SSH_MUX is the process default "
             "on POSIX. Native Windows has no Client ControlMaster; omitted ssh_mux already "
@@ -32,7 +34,8 @@ ENDPOINT_PROPS: dict[str, Any] = {
         "type": "boolean",
         "default": False,
         "description": (
-            "Add ServerAliveInterval/CountMax. Mechanism flag, orthogonal to mux: "
+            "Low-level SSH policy; pooled developer RPC and artifact streams always "
+            "enable keepalive. Add ServerAliveInterval/CountMax. Orthogonal to mux: "
             "it only adds TCP probes. Hour-scale streams use Endpoint.for_long_stream "
             "rather than this flag alone. Conditional: attaching ServerAlive to a "
             "ControlMaster client becomes master TCP policy (first-option-wins)."
@@ -81,6 +84,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         {
             "file_path": {"type": "string"},
             "path": {"type": "string", "description": "Alias of file_path (Kimi/Cursor native Read habit)."},
+            "verify_content": {"type": "boolean", "default": True, "description": "Compute full SHA256 and exact line count for edit concurrency. False bounds positive-offset log reads to the requested window and reports unknown total_lines when more data exists."},
             "offset": {"type": "integer", "default": 1, "description": "1-based first line. Negative values count back from the end of the file."},
             "limit": {"type": "integer", "default": 200, "maximum": 500},
             "line_offset": {"type": "integer", "description": "Alias of offset (Kimi native Read habit)."},
@@ -143,44 +147,9 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "description": {"type": "string"},
             "timeout_ms": {"type": "integer"},
             "timeout": {"type": "integer"},
-            "run_in_background": {"type": "boolean"},
-            "tty": {
-                "type": "boolean",
-                "description": (
-                    "PTY allocation. NOT supported: remote sessions use pipes, and this "
-                    "flag returns an explicit capability error instead of being ignored. "
-                    "Control bytes such as \\x03 are delivered as bytes, not signals; "
-                    "cancel with remote.job_stop."
-                ),
-            },
-            "interactive": {
-                "type": "boolean",
-                "description": (
-                    "Background only: keep the job's stdin open so later remote.job_stdin "
-                    "calls can write to it (Codex exec_command/write_stdin habit). The job "
-                    "runs on the same process supervisor as every background job; cancel it "
-                    "with remote.job_stop."
-                ),
-            },
-            "yield_time_ms": {
-                "type": "integer",
-                "description": (
-                    "Background only: after starting, keep polling up to this many "
-                    "milliseconds for output or completion before returning, then include "
-                    "fresh stdout/stderr from the start up to the max_output_tokens budget "
-                    "(Codex exec_command yield habit). Later remote.job_stdin polls continue "
-                    "exactly where this yield stopped. 0 or omitted returns immediately "
-                    "after the start handshake."
-                ),
-            },
-            "max_output_tokens": {
-                "type": "integer",
-                "description": (
-                    "Cap the output returned by this call, counted as 4 characters per "
-                    "token (approximation of token budgets, applied per stream). Full "
-                    "output remains available through refs/remote.job_tail."
-                ),
-            },
+            "tty": {"type": "boolean", "default": False, "description": "Allocate a remote PTY (24x80). Ctrl-C signals its foreground process group; stderr is merged into stdout."},
+            "yield_time_ms": {"type": "integer", "minimum": 0, "maximum": 300000, "default": 10000, "description": "Remote wait for output/completion after connection and preparation. Returns session_id when running or unread output remains."},
+            "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Approximate output budget at four UTF-8 bytes/token across text plus structured previews, shared by stdout/stderr. Status/refs metadata is separate. Unreturned bytes remain available through the session cursor."},
             "env": {"type": "object", "additionalProperties": {"type": "string"}},
         },
         description="command is required; the alias cmd is also accepted (Codex habit). Enforced by the server so alias-only calls pass provider schema validation.",
@@ -220,7 +189,6 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ["pattern"],
     ),
     "remote.ls": schema({"path": {"type": "string"}, "limit": {"type": "integer"}, "all": {"type": "boolean"}}),
-    "remote.monitor": schema({"command": {"type": "string"}, "description": {"type": "string"}, "timeout_ms": {"type": "integer"}, "pattern": {"type": "string"}, "env": {"type": "object", "additionalProperties": {"type": "string"}}}, ["command"]),
     "remote.apply_patch": schema(
         {
             "patch": {"type": "string", "description": "Codex apply_patch payload or unified diff. Prefer this field."},
@@ -238,24 +206,24 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "chars": {"type": "string", "description": "Bytes to write to the job's stdin (Codex write_stdin habit). Omit or pass an empty string to only poll output. When stdin_buffer_full is reported, resend only the unwritten remainder: slice the original string at the returned written_chars character count (a byte count cannot slice a Unicode string)."},
             "eof": {"type": "boolean", "description": "Close the job's stdin after writing chars. Programs waiting for end-of-input then finish. If the write was only partially accepted (stdin_buffer_full), the close is deferred: resend the unwritten remainder with eof=true."},
             "yield_time_ms": {"type": "integer", "description": "After writing, keep polling up to this many milliseconds for output or completion before returning new output."},
-            "max_output_tokens": {"type": "integer", "description": "Cap the new output returned by this call, counted as 4 characters per token, applied per stream. Skipped bytes are not lost: the read cursor only advances past what was returned."},
-            "lines": {"type": "integer", "maximum": 500, "description": "Tail lines per stream when this call falls back to snapshot output (first poll). Incremental reads are byte-based."},
+            "max_output_tokens": {"type": "integer", "description": "Cap the new output returned by this call, counted as four UTF-8 bytes/token across text and structured previews, shared by stdout/stderr; metadata separate. Skipped bytes are not lost: the read cursor only advances past what was returned."},
         },
         ["job_id"],
         endpoint_selector=False,
-        description=(
-            "The job must have been started with remote.bash run_in_background=true and "
-            "interactive=true; otherwise the call fails with an actionable error. "
-            "Cancellation stays with remote.job_stop. The endpoint is rebuilt from the "
-            "local job record unless a selector is supplied."
-        ),
+        description="Poll any session; non-empty chars requires writable stdin. Endpoint and identity are restored from the job record. Stop via remote.job_stop.",
+
     ),
     "remote.artifact_manifest": schema({"remote_path": {"type": "string"}}, ["remote_path"]),
     "remote.artifact_pull": schema({"remote_path": {"type": "string"}, "local_dir": {"type": "string"}}, ["remote_path"]),
     "remote.artifact_push": schema({"local_path": {"type": "string"}, "remote_path": {"type": "string"}}, ["local_path", "remote_path"]),
     "remote.context_snapshot": schema({"live_probe": {"type": "boolean", "default": True}}),
-    "remote.probe": schema({"diagnose_connection": {"type": "boolean", "default": False, "description": "Compare SSH connections with a fixed read-only probe; never replays a business command."}}),
+    "remote.probe": schema({"modules": {"type": "array", "items": {"type": "string"}, "description": "Explicit module imports to check; default empty."}, "diagnose_connection": {"type": "boolean", "default": False, "description": "Compare SSH connections with a fixed read-only probe; never replays a business command."}}),
 }
+
+for _job_name in ("remote.job_status", "remote.job_tail", "remote.job_stop", "remote.job_stdin"):
+    TOOL_SCHEMAS[_job_name]["properties"]["session_id"] = {"type": "string", "description": "Alias of job_id returned by remote.bash."}
+    TOOL_SCHEMAS[_job_name]["required"] = []
+    TOOL_SCHEMAS[_job_name]["description"] = "job_id or session_id is required; checked by the server."
 
 ALIASES: dict[str, str] = {name.replace(".", "_"): name for name in TOOL_SCHEMAS}
 
@@ -270,7 +238,6 @@ PARAM_ALIASES: dict[str, dict[str, str]] = {
     "remote.edit": {"path": "file_path"},
     "remote.multi_edit": {"path": "file_path"},
     "remote.bash": {"cmd": "command", "workdir": "cwd"},
-    "remote.monitor": {"cmd": "command", "workdir": "cwd"},
     "remote.grep": {
         "-i": "case_insensitive",
         "-A": "after_context",
@@ -284,6 +251,10 @@ PARAM_ALIASES: dict[str, dict[str, str]] = {
 
 def normalize_arguments(tool: str, args: dict[str, Any]) -> dict[str, Any]:
     """Fold known client-native alias keys into their canonical fields."""
+    if tool.startswith("remote.job_"):
+        args = dict(args)
+        if "job_id" not in args and "session_id" in args:
+            args["job_id"] = args["session_id"]
     mapping = PARAM_ALIASES.get(tool)
     if not mapping:
         return args

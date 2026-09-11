@@ -86,23 +86,15 @@ def _openssh_G(
 
 
 class SshTransportTests(unittest.TestCase):
-    def test_run_remote_python_quotes_multiline_code_as_one_remote_command(self) -> None:
-        endpoint = Endpoint(host="1.2.3.4", port=46000)
-        observed: dict[str, object] = {}
-
-        def fake_run(args, **kwargs):
-            observed["args"] = args
-            observed["kwargs"] = kwargs
-            return subprocess.CompletedProcess(args=args, returncode=0, stdout='{"status":"ok"}', stderr="")
-
-        with mock.patch.object(ssh_transport.subprocess, "run", fake_run):
-            payload = ssh_transport.run_remote_python(endpoint, "import json\nprint(json.dumps({'status':'ok'}))", {})
-
-        args = observed["args"]
-        self.assertIsInstance(args, list)
+    def test_run_remote_python_uses_rpc_and_parses_json(self) -> None:
+        endpoint = Endpoint(host="192.0.2.10", port=22)
+        from remote_dev.core import rpc_transport
+        row = {"returncode": 0, "stdout": '{"status":"ok"}', "stderr": ""}
+        code = "import json\nprint(json.dumps({'status':'ok'}))"
+        with mock.patch.object(rpc_transport, "request", return_value=row) as execute:
+            payload = ssh_transport.run_remote_python(endpoint, code, {}, timeout_ms=500)
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(args[-1].split(" ", 2)[:2], ["python3", "-c"])
-        self.assertIn("\\n", repr(args[-1]))
+        execute.assert_called_once_with(endpoint, "python", code, {}, timeout_ms=500)
 
     def test_run_bytes_quotes_shell_command_as_one_remote_command(self) -> None:
         endpoint = Endpoint(host="1.2.3.4", port=46000)
@@ -266,14 +258,8 @@ class SshMuxIsolationTests(unittest.TestCase):
                 script_args = list(observed["args"])
                 bytes_result = ssh_transport.run_bytes(self.endpoint, "cat '/tmp/path with spaces'", stdin=b"abc")
                 bytes_args = list(observed["args"])
-                payload = ssh_transport.run_remote_python(
-                    self.endpoint,
-                    "import json\nprint(json.dumps({'status':'ok'}))",
-                    {},
-                )
-                python_args = list(observed["args"])
 
-        for args in (script_args, bytes_args, python_args):
+        for args in (script_args, bytes_args):
             options = _option_map(args)
             self.assertEqual(options["ControlMaster"], "no")
             self.assertEqual(options["ControlPath"], "none")
@@ -292,9 +278,6 @@ class SshMuxIsolationTests(unittest.TestCase):
         self.assertEqual(bytes_result.returncode, 0)
         self.assertEqual(bytes_result.stdout, b"bytes-out")
 
-        self.assertEqual(payload["status"], "ok")
-        self.assertEqual(python_args[-1].split(" ", 2)[:2], ["python3", "-c"])
-        self.assertIn("\\n", repr(python_args[-1]))
 
     def test_subprocess_copies_keep_independent_argv_and_parent_env(self) -> None:
         parent_before = os.environ.copy()

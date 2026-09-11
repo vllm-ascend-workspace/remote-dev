@@ -13,11 +13,14 @@ import fcntl
 import hashlib
 import json
 import os
+import pty
 import re
 import select
 import signal
 import subprocess
+import struct
 import sys
+import termios
 import time
 import uuid
 from pathlib import Path
@@ -92,6 +95,38 @@ def process_identity(pid):
         return None
 
 
+def supervised_family(receipt):
+    """Walk the verified subreaper's kernel child lists, including all threads.
+
+    All job descendants remain below this live anchor, including setsid and
+    clean-environment daemons. A racing exit can postpone a signal to the next
+    drain pass; it cannot report quiet while the anchor remains alive.
+    """
+    anchor = process_identity(receipt["pid"])
+    if not anchor or anchor["state"] == "Z" or anchor["start_ticks"] != receipt["start_ticks"]:
+        return None
+    found, pending, unknown = {anchor["pid"]: anchor}, [anchor["pid"]], []
+    while pending:
+        pid = pending.pop()
+        try:
+            tasks = Path(f"/proc/{pid}/task")
+            for task in tasks.iterdir():
+                try:
+                    children = (task / "children").read_text().split()
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                for child_pid in children:
+                    row = process_identity(child_pid)
+                    if row and row["state"] != "Z" and row["ppid"] == pid and row["pid"] not in found:
+                        found[row["pid"]] = row
+                        pending.append(row["pid"])
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError:
+            unknown.append(f"cannot observe children of {pid}")
+    return list(found.values()), unknown
+
+
 def owned_processes(receipt):
     """Observe marker ownership and ancestry below the verified subreaper.
 
@@ -102,6 +137,10 @@ def owned_processes(receipt):
     """
     if receipt["boot_id"] != boot_id():
         return [], ["boot identity changed"]
+    if receipt.get("supervision") == "subreaper":
+        family = supervised_family(receipt)
+        if family is not None:
+            return family
     identities, tagged, unknown = {}, set(), []
     marker = (JOB_TOKEN_ENV + "=" + receipt["marker"]).encode()
     for entry in Path("/proc").iterdir():
@@ -141,8 +180,17 @@ def job_status(directory):
     receipt = read_json(directory / "receipt.json")
     if receipt is None:
         return {"state": "uncertain", "reason": "launch intent exists without a process receipt", "quiet": False}
-    processes, unknown = owned_processes(receipt)
     result = read_json(directory / "result.json")
+    # A verified subreaper's completion is a stronger fact than another /proc
+    # walk. It cannot publish this receipt until all descendants are reaped.
+    if (result and result.get("descendants_drained") and
+            receipt.get("supervision") == "subreaper" and receipt["boot_id"] == boot_id()):
+        anchor = process_identity(receipt["pid"])
+        processes = ([anchor] if anchor and anchor["state"] != "Z" and
+                     anchor["start_ticks"] == receipt["start_ticks"] else [])
+        unknown = []
+    else:
+        processes, unknown = owned_processes(receipt)
     gate = read_json(directory / "go.json")
     if receipt.get("supervision") == "subreaper" and result is None and not any(
             row["pid"] == receipt["pid"] and row["start_ticks"] == receipt["start_ticks"] for row in processes):
@@ -193,7 +241,8 @@ def worker(directory):
     # readiness marker: prepare only returns after supervisor-ready.json, so a
     # stdin write after prepare/go always finds a reader (opening a FIFO
     # O_WRONLY|O_NONBLOCK without a reader fails with ENXIO).
-    interactive = bool(spec.get("interactive"))
+    tty = bool(spec.get("tty"))
+    interactive = bool(spec.get("interactive")) or tty
     fifo_fd = None
     if interactive:
         fifo_fd = os.open(directory / "stdin.pipe", os.O_RDONLY | os.O_NONBLOCK)
@@ -203,24 +252,43 @@ def worker(directory):
         if (directory / "stop.json").exists() or time.time() >= deadline:
             if fifo_fd is not None:
                 os.close(fifo_fd)
-            atomic_json(directory / "result.json", {"state": "cancelled", "reason": "start gate not opened"})
+            atomic_json(directory / "result.json", {"state": "cancelled", "reason": "start gate not opened", "descendants_drained": True})
             return
         time.sleep(0.1)
     gate = read_json(directory / "go.json")
     if (directory / "stop.json").exists() or gate["valid_until"] <= time.time():
         if fifo_fd is not None:
             os.close(fifo_fd)
-        atomic_json(directory / "result.json", {"state": "cancelled", "reason": "activation ticket expired"})
+        atomic_json(directory / "result.json", {"state": "cancelled", "reason": "activation ticket expired", "descendants_drained": True})
         return
     pipe_w = None
-    if interactive:
+    master_fd = None
+    if tty:
+        master_fd, slave_fd = pty.openpty()
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+        os.set_blocking(master_fd, False)
+        pipe_w = master_fd
+    elif interactive:
         pipe_r, pipe_w = os.pipe()
         os.set_blocking(pipe_w, False)
     with (directory / "stdout.log").open("ab") as stdout, (directory / "stderr.log").open("ab") as stderr:
         environment = {**os.environ, **spec["env"]}
-        child = subprocess.Popen(["bash", "-c", spec["command"]], cwd=spec["cwd"], env=environment,
-                                 stdin=pipe_r if interactive else subprocess.DEVNULL, stdout=stdout, stderr=stderr)
-        if interactive:
+        if tty:
+            environment.setdefault("TERM", "xterm-256color")
+
+            def terminal_child():
+                os.setsid()
+                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+                os.tcsetpgrp(slave_fd, os.getpgrp())
+
+            child = subprocess.Popen(["bash", "-c", spec["command"]], cwd=spec["cwd"], env=environment,
+                                     stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                                     preexec_fn=terminal_child)
+            os.close(slave_fd)
+        else:
+            child = subprocess.Popen(["bash", "-c", spec["command"]], cwd=spec["cwd"], env=environment,
+                                     stdin=pipe_r if interactive else subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+        if interactive and not tty:
             os.close(pipe_r)
         receipt = read_json(directory / "receipt.json")
         timeout_seconds = spec.get("timeout_seconds")
@@ -229,8 +297,25 @@ def worker(directory):
         pending_stdin = bytearray()
         stdin_eof = False
         fifo_drained = False
+        terminal_eof_sent = False
         while True:
             code = child.poll()
+            if master_fd is not None:
+                # Drain the PTY into the same durable output log. stdout and
+                # stderr share a terminal, as with a native tty session.
+                for _ in range(16):
+                    try:
+                        chunk = os.read(master_fd, 65536)
+                    except BlockingIOError:
+                        break
+                    except OSError as exc:
+                        if exc.errno != errno.EIO:
+                            raise
+                        break  # last slave closed
+                    if not chunk:
+                        break
+                    stdout.write(chunk)
+                    stdout.flush()
             if code is not None:
                 # poll() reaps the direct Popen child first. Then reap adopted
                 # orphans without stealing the shell's exit status.
@@ -258,6 +343,13 @@ def worker(directory):
                         del pending_stdin[:written]
                     except BlockingIOError:
                         pass
+                    except OSError as exc:
+                        if exc.errno not in (errno.EPIPE, errno.EIO):
+                            raise
+                        pending_stdin.clear()
+                        if not tty:
+                            os.close(pipe_w)
+                            pipe_w = None
                 if not stdin_eof and (directory / "stdin-eof.json").exists():
                     stdin_eof = True
                 if stdin_eof and fifo_drained and fifo_fd is not None:
@@ -265,8 +357,13 @@ def worker(directory):
                     fifo_fd = None
                 if stdin_eof and fifo_drained and not pending_stdin and pipe_w is not None:
                     # EOF reaches the child only after every accepted byte.
-                    os.close(pipe_w)
-                    pipe_w = None
+                    if tty:
+                        if not terminal_eof_sent:
+                            os.write(pipe_w, b"\x04")
+                            terminal_eof_sent = True
+                    else:
+                        os.close(pipe_w)
+                        pipe_w = None
             stop = read_json(directory / "stop.json")
             timed_out = deadline is not None and time.monotonic() >= deadline
             if terminal is None and (stop or timed_out):
@@ -302,7 +399,68 @@ def signal_processes(processes, sig, *, exclude=None):
                 os.kill(process["pid"], sig)
 
 
-def control_job(request, source):
+def cancel_and_drain(request, source):
+    status = control_job({**request, "action": "stop"}, source)
+    deadline = time.monotonic() + 5
+    while not status.get("quiet") and not status.get("unknown") and time.monotonic() < deadline:
+        time.sleep(0.02)
+        status = control_job({**request, "action": "status"}, source)
+    return status
+
+
+def control_job(request, source, cancel_event=None):
+    """One process authority for gated launches and native execute/poll calls.
+
+    launch and exchange combine existing actions on the remote side. They do
+    not hold the job mutation lock while waiting, so stop can interrupt them.
+    """
+    action = request["action"]
+    if action == "launch":
+        started = time.monotonic()
+        prepared = control_job({**request, "action": "prepare"}, source)
+        prepared_at = time.monotonic()
+        if cancel_event is not None and cancel_event.is_set():
+            return cancel_and_drain(request, source)
+        if not prepared.get("gate_open"):
+            control_job({**request, "action": "go"}, source)
+        activated_at = time.monotonic()
+        observation = control_job({**request, "action": "exchange"}, source, cancel_event)
+        observation["timings"] = {"prepare_ms": round((prepared_at-started)*1000),
+                                  "activate_ms": round((activated_at-prepared_at)*1000),
+                                  "wait_observe_ms": round((time.monotonic()-activated_at)*1000)}
+        return observation
+    if action == "exchange":
+        reply = {"accepted": True, "written": 0, "written_chars": 0}
+        if request.get("data") or request.get("eof"):
+            reply = control_job({**request, "action": "stdin"}, source)
+        root = Path(request["root"]).resolve(strict=True)
+        identifier = request["job_id"]
+        if not JOB_ID_RE.fullmatch(identifier):
+            raise ValueError("invalid job id")
+        directory = root / JOBS_DIRNAME / "jobs" / identifier
+        if root not in directory.resolve().parents:
+            raise ValueError("job directory escapes the runtime root")
+        wait_ms = max(0, min(300000, int(request.get("yield_time_ms") or 0)))
+        deadline = time.monotonic() + wait_ms / 1000
+        while reply.get("accepted") and time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            if (directory / "result.json").exists() or not directory.exists():
+                break
+            available = False
+            for stream in ("stdout", "stderr"):
+                path = directory / (stream + ".log")
+                if path.exists() and path.stat().st_size > int(request.get(stream + "_offset") or 0):
+                    available = True
+                    break
+            if available:
+                break
+            time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+        if cancel_event is not None and cancel_event.is_set():
+            cancel_and_drain(request, source)
+            reply["cancellation_requested"] = True
+        observation = control_job({**request, "action": "tail"}, source)
+        return {**reply, **observation}
     root = Path(request["root"]).resolve(strict=True)
     identifier = request["job_id"]
     if not JOB_ID_RE.fullmatch(identifier):
@@ -324,12 +482,13 @@ def control_job(request, source):
             if not cwd.is_dir():
                 raise NotADirectoryError("command cwd is not a directory")
             timeout_seconds = spec.get("timeout_seconds")
-            if timeout_seconds is not None and (type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 86400):
-                raise ValueError("jobs require timeout_seconds None or 1..86400")
+            if timeout_seconds is not None and (type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 86400):
+                raise ValueError("jobs require timeout_seconds None or a number in (0, 86400]")
             if any(not ENV_NAME_RE.fullmatch(key) or key.startswith(JOB_ENV_PREFIX) for key in spec["env"]):
                 raise ValueError("invalid or reserved environment variable")
-            if "interactive" in spec and type(spec["interactive"]) is not bool:
-                raise ValueError("jobs require interactive to be a boolean")
+            for flag in ("interactive", "tty"):
+                if flag in spec and type(spec[flag]) is not bool:
+                    raise ValueError(f"jobs require {flag} to be a boolean")
             intent = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
             existing = read_json(directory / "intent.json")
             if existing:
@@ -338,7 +497,7 @@ def control_job(request, source):
                 return job_status(directory)
             atomic_json(directory / "intent.json", {"digest": intent})
             atomic_json(directory / "spec.json", spec)
-            if spec.get("interactive"):
+            if spec.get("interactive") or spec.get("tty"):
                 # The stdin channel is an on-disk FIFO owned by the job dir.
                 # The worker holds the read end and proxies bytes into the
                 # child pipe; writers use the "stdin" control action.
@@ -382,9 +541,10 @@ def control_job(request, source):
             receipt = read_json(directory / "receipt.json")
             if receipt is None:
                 return job_status(directory)
-            processes, unknown = owned_processes(receipt)
-            if unknown:
-                return job_status(directory)
+            status = job_status(directory)
+            if status["quiet"] or status["unknown"]:
+                return status
+            processes = status["processes"]
             atomic_json(directory / "stop.json", {"at": time.time(), "force": bool(request.get("force"))})
             # Signal only PIDs whose marker and start ticks were just observed.
             # Do not infer ownership from a PID alone or kill a whole container.
@@ -396,6 +556,8 @@ def control_job(request, source):
             lines = min(200, max(1, int(request.get("lines", 60))))
             result = job_status(directory)
             max_bytes = min(32768, max(1, int(request.get("max_bytes") or 32768)))
+            shared_budget = bool(request.get("shared_budget"))
+            remaining_budget = max_bytes
             live = result.get("state") in LIVE_JOB_STATES
             for name in ("stdout", "stderr"):
                 path = directory / (name + ".log")
@@ -409,9 +571,9 @@ def control_job(request, source):
                         size = path.stat().st_size
                         with path.open("rb") as stream:
                             stream.seek(start_offset)
-                            chunk = stream.read(max_bytes)
+                            chunk = stream.read(remaining_budget if shared_budget else max_bytes)
                         hold = _utf8_incomplete_tail(chunk)
-                        if hold == len(chunk):
+                        if hold == len(chunk) and not shared_budget:
                             # Progress guarantee: a page must always advance the
                             # cursor, even for budgets smaller than one UTF-8
                             # character; the partial bytes flush as U+FFFD.
@@ -427,7 +589,18 @@ def control_job(request, source):
                             # cursor advances past returned bytes only, so the
                             # held bytes stay counted in bytes_remaining.
                             chunk = chunk[:-hold]
+                        if shared_budget:
+                            # Invalid source bytes expand to three-byte U+FFFD.
+                            # Budget the decoded response, retaining unread raw
+                            # bytes at the cursor instead of discarding output.
+                            while (decoded_size := len(chunk.decode("utf-8", "replace").encode("utf-8"))) > remaining_budget:
+                                chunk = chunk[:len(chunk) * remaining_budget // decoded_size]
+                                hold = _utf8_incomplete_tail(chunk)
+                                if hold:
+                                    chunk = chunk[:-hold]
                         result[name] = chunk.decode("utf-8", errors="replace")
+                        if shared_budget:
+                            remaining_budget = max(0, remaining_budget - len(result[name].encode("utf-8")))
                         result[offset_key] = start_offset + len(chunk)
                         result[name + "_bytes_remaining"] = max(0, size - result[offset_key])
                     else:
@@ -449,7 +622,7 @@ def control_job(request, source):
             fifo = directory / "stdin.pipe"
             if not fifo.exists():
                 return {"state": status["state"], "accepted": False, "written": 0,
-                        "reason": "job has no stdin channel; restart it with interactive=true"}
+                        "reason": "job has no stdin channel; start a writable remote.bash session"}
             raw = data.encode("utf-8")
             if raw and (directory / "stdin-eof.json").exists():
                 return {"state": status["state"], "accepted": False, "written": 0,

@@ -43,9 +43,7 @@ summary = {
     "root_exists": root.exists(),
     "git_root": run(["git", "-C", str(root), "rev-parse", "--show-toplevel"], timeout=5),
     "root_head": run(["git", "-C", str(root), "rev-parse", "HEAD"], timeout=5),
-    "vllm_head": run(["git", "-C", str(root / "vllm"), "rev-parse", "HEAD"], timeout=5) if (root / "vllm").exists() else None,
-    "vllm_ascend_head": run(["git", "-C", str(root / "vllm-ascend"), "rev-parse", "HEAD"], timeout=5) if (root / "vllm-ascend").exists() else None,
-    "modules": {name: module_info(name) for name in ("torch", "torch_npu", "vllm", "vllm_ascend")},
+    "modules": {name: module_info(name) for name in payload.get("modules", [])},
 }
 print(json.dumps({"status": "ok", "summary": summary}, sort_keys=True))
 '''
@@ -88,7 +86,7 @@ def _duration_ms(start: float) -> int:
     return int(round((time.monotonic() - start) * 1000))
 
 
-def remote_probe(endpoint: Endpoint, *, timeout_ms: int = 120000, diagnose_connection: bool = False) -> dict[str, Any]:
+def remote_probe(endpoint: Endpoint, *, timeout_ms: int = 120000, diagnose_connection: bool = False, modules: list[str] | None = None) -> dict[str, Any]:
     if diagnose_connection:
         from remote_dev.diagnostics import diagnose_ssh
         diagnosis = diagnose_ssh(endpoint, timeout_ms=timeout_ms)
@@ -100,7 +98,7 @@ def remote_probe(endpoint: Endpoint, *, timeout_ms: int = 120000, diagnose_conne
         return {"text": result["summary"], "result": result}
     started = utc_now_iso()
     start = time.monotonic()
-    data = run_remote_python(endpoint, REMOTE_PROBE_PY, {"root": endpoint.root}, timeout_ms=timeout_ms)
+    data = run_remote_python(endpoint, REMOTE_PROBE_PY, {"root": endpoint.root, "modules": modules or []}, timeout_ms=timeout_ms)
     status = str(data.get("status", "failed"))
     summary = data.get("summary", {}) if isinstance(data.get("summary"), dict) else {}
     snapshot = write_context_snapshot(endpoint, summary, data) if status == "ok" else None

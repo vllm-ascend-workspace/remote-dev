@@ -9,7 +9,6 @@ from remote_dev.core.context_snapshot import remote_context_snapshot, remote_pro
 from remote_dev.core.endpoint import has_selector, resolve_endpoint
 from remote_dev.core.file_ops import remote_edit, remote_ls, remote_multi_edit, remote_read, remote_write
 from remote_dev.core.job_ops import endpoint_from_job_record, remote_job_stdin, require_job_id, remote_job_status, remote_job_stop, remote_job_tail
-from remote_dev.core.monitor_ops import remote_monitor
 from remote_dev.core.patch_ops import remote_apply_patch
 from remote_dev.core.search_ops import remote_glob, remote_grep
 from remote_dev.core.shell_ops import remote_bash
@@ -36,16 +35,15 @@ def list_tools() -> list[dict[str, Any]]:
         "remote.write": "Write a remote file with overwrite support and optional read-ledger concurrency checks.",
         "remote.edit": "Edit a remote file with exact string replacement and optional read-ledger concurrency checks.",
         "remote.multi_edit": "Apply multiple exact edits atomically to one remote file.",
-        "remote.bash": "Run a remote shell command with Bash-like semantics, logs, preview, and optional background job (same process supervisor as remote.job_*).",
+        "remote.bash": "Run a remote shell command with Bash-like semantics, logs, preview, and automatic yield, writable stdin and optional PTY.",
         "remote.glob": "Find remote paths with ** glob semantics.",
         "remote.grep": "Search remote files with rg-compatible semantics and a grep -E (POSIX ERE) fallback.",
         "remote.ls": "List a remote directory without reading file contents.",
-        "remote.monitor": "Start a background remote command for monitoring.",
         "remote.apply_patch": "Apply a Codex apply_patch payload or unified diff on a remote endpoint.",
         "remote.job_status": "Check a remote background job through the shared process supervisor.",
         "remote.job_tail": "Tail remote background job logs through the shared process supervisor.",
         "remote.job_stop": "Stop a remote background job through the shared process supervisor.",
-        "remote.job_stdin": "Write to a running interactive remote job's stdin (Codex write_stdin habit), with optional EOF and output polling.",
+        "remote.job_stdin": "Write to a remote session's stdin (Codex write_stdin habit), with optional EOF and output polling.",
         "remote.artifact_manifest": "Build a remote artifact sha256 manifest.",
         "remote.artifact_pull": "Pull a remote artifact through SSH streaming with hash verification.",
         "remote.artifact_push": "Push a local artifact through SSH streaming with hash verification.",
@@ -223,28 +221,29 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     if name not in {"remote.job_status", "remote.job_tail", "remote.job_stop", "remote.job_stdin"} or has_selector(args):
         endpoint = resolve_endpoint(args)
     timeout_ms = int(args.get("timeout_ms") or args.get("timeout") or 120000)
+    if name.startswith("remote.job_"):
+        _require(args, "job_id", name, "session_id")
     if name == "remote.bash":
         assert endpoint is not None
+        removed = {"run_in_background", "interactive"}.intersection(args)
+        if removed:
+            raise ValueError("remote.bash uses automatic writable sessions; remove " + ", ".join(sorted(removed)) + "; use yield_time_ms=0 to return immediately")
+        command_timeout = args.get("timeout_ms", args.get("timeout"))
         return remote_bash(
             endpoint,
             command=str(_require(args, "command", name, "cmd")),
             cwd=args.get("cwd"),
             description=args.get("description"),
-            timeout_ms=timeout_ms,
-            run_in_background=bool(args.get("run_in_background", False)),
+            timeout_ms=int(command_timeout) if command_timeout is not None else None,
             runtime_env=args.get("runtime_env"),
             env=args.get("env") if isinstance(args.get("env"), dict) else {},
-            interactive=bool(args.get("interactive", False)),
             yield_time_ms=int(args["yield_time_ms"]) if args.get("yield_time_ms") is not None else None,
             max_output_tokens=int(args["max_output_tokens"]) if args.get("max_output_tokens") is not None else None,
             tty=bool(args.get("tty", False)),
         )
-    if name == "remote.monitor":
-        assert endpoint is not None
-        return remote_monitor(endpoint, command=str(_require(args, "command", name, "cmd")), cwd=args.get("cwd"), description=args.get("description"), timeout_ms=timeout_ms, pattern=args.get("pattern"), runtime_env=args.get("runtime_env"), env=args.get("env") if isinstance(args.get("env"), dict) else {})
     if name == "remote.read":
         assert endpoint is not None
-        return remote_read(endpoint, file_path=str(_require(args, "file_path", name, "path")), offset=int(args.get("offset") or 1), limit=int(args.get("limit") or 200), allow_symlink=bool(args.get("allow_symlink", False)), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
+        return remote_read(endpoint, file_path=str(_require(args, "file_path", name, "path")), offset=int(args.get("offset") or 1), limit=int(args.get("limit") or 200), allow_symlink=bool(args.get("allow_symlink", False)), verify_content=bool(args.get("verify_content", True)), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
     if name == "remote.write":
         assert endpoint is not None
         return remote_write(endpoint, file_path=str(_require(args, "file_path", name, "path")), content=str(args.get("content", "")), overwrite=bool(args.get("overwrite", False)), append=bool(args.get("append", False)), create_dirs=bool(args.get("create_dirs", False)), client_context_id=args.get("client_context_id"), timeout_ms=timeout_ms)
@@ -312,5 +311,5 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
         return remote_context_snapshot(endpoint, timeout_ms=timeout_ms, live_probe=bool(args.get("live_probe", True)))
     if name == "remote.probe":
         assert endpoint is not None
-        return remote_probe(endpoint, timeout_ms=timeout_ms, diagnose_connection=bool(args.get("diagnose_connection", False)))
+        return remote_probe(endpoint, timeout_ms=timeout_ms, diagnose_connection=bool(args.get("diagnose_connection", False)), modules=args.get("modules"))
     raise KeyError(f"unknown remote-dev tool: {name}")

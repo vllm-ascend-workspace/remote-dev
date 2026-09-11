@@ -111,23 +111,21 @@ class StartRemoteJobTests(unittest.TestCase):
         self.addCleanup(setattr, state_store, "substrate_root", original_root)
         self.endpoint = Endpoint(host="1.2.3.4", port=46000, root="/srv/app", cwd="/srv/app")
 
-    def test_start_prepare_then_go_through_control(self) -> None:
+    def test_start_combines_prepare_and_go_through_control(self) -> None:
         calls = []
 
         def fake_control(_endpoint, job_id, action, **params):
             calls.append((action, params))
-            if action == "prepare":
-                return _supervisor(state="prepared", quiet=False, gate_open=False, remote_dir=f"/srv/app/.remote-dev/jobs/{job_id}")
-            if action == "go":
+            if action == "launch":
                 return _supervisor(state="running", remote_dir=f"/srv/app/.remote-dev/jobs/{job_id}")
             raise AssertionError(action)
 
         with mock.patch.object(job_ops, "control", fake_control):
             payload = job_ops.start_remote_job(self.endpoint, command="echo ok", job_id="job-start1")
-        self.assertEqual([item[0] for item in calls], ["prepare", "go"])
+        self.assertEqual([item[0] for item in calls], ["launch"])
         self.assertEqual(calls[0][1]["spec"]["command"], "echo ok")
         self.assertEqual(calls[0][1]["spec"]["cwd"], "/srv/app")
-        self.assertIn("authorization", calls[1][1])
+        self.assertIn("authorization", calls[0][1])
         self.assertEqual(payload["result"]["status"], "running")
         self.assertEqual(payload["result"]["outcome"], "success")
         record = state_store.read_json(Path(payload["result"]["refs"]["job_record"]))
@@ -167,7 +165,7 @@ class StartRemoteJobTests(unittest.TestCase):
 
         with mock.patch.object(job_ops, "control", fake_control):
             payload = job_ops.start_remote_job(self.endpoint, command="touch should-not-exist", cwd="/srv/app/missing", job_id="job-missing")
-        self.assertEqual(calls, ["prepare"])
+        self.assertEqual(calls, ["launch"])
         self.assertEqual(payload["result"]["outcome"], "failed")
         self.assertEqual(payload["result"]["status"], "cwd_not_found")
 

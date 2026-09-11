@@ -94,6 +94,7 @@ class RemoteCompleted:
     stderr: str
     timed_out: bool = False
     timings: dict[str, float | None] = field(default_factory=dict)
+    cancelled: bool = False
 
 
 def _control_master_options(identity_file: str | None = None) -> list[str]:
@@ -946,6 +947,29 @@ def run_bytes(
     )
 
 
+_RPC_SCRIPT = r"""
+import json, subprocess, sys
+payload = json.load(sys.stdin)
+result = subprocess.run(["bash", "-c", payload["script"]], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+sys.stdout.buffer.write(result.stdout)
+sys.stderr.buffer.write(result.stderr)
+raise SystemExit(result.returncode)
+"""
+
+
+def run_rpc_script(endpoint: Endpoint, script: str, *, timeout_ms: int | None = None,
+                   mutation: bool = False) -> RemoteCompleted:
+    """Bounded package scripts over RPC, including scoped cancellation.
+
+    User commands use shell_ops' durable supervisor. This primitive is for
+    package-owned scripts such as a validated git-apply transaction.
+    """
+    from .rpc_transport import request
+    row = request(endpoint, "python", _RPC_SCRIPT, {"script": script, "_mutation": mutation}, timeout_ms=timeout_ms)
+    return RemoteCompleted(row["returncode"], row["stdout"], row["stderr"],
+                           timed_out=bool(row.get("timed_out")), cancelled=bool(row.get("cancelled")))
+
+
 def run_remote_python(
     endpoint: Endpoint,
     code: str,
@@ -953,42 +977,24 @@ def run_remote_python(
     *,
     timeout_ms: int | None = None,
 ) -> dict[str, Any]:
-    timeout = None if timeout_ms is None else timeout_ms / 1000
+    from .rpc_transport import request
     try:
-        proc = subprocess.run(
-            [*ssh_base_cmd(endpoint), f"python3 -c {shlex.quote(code)}"],
-            input=json.dumps(payload, ensure_ascii=False),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "status": "timeout",
-            "error": f"remote python timed out after {timeout_ms} ms",
-            "stdout_tail": _decode_stream(exc.stdout)[-4000:],
-            "stderr_tail": _decode_stream(exc.stderr)[-4000:],
-        }
-    if proc.returncode != 0:
-        return {
-            "status": "failed",
-            "error": "remote python failed",
-            "exit_code": proc.returncode,
-            "stdout_tail": (proc.stdout or "")[-4000:],
-            "stderr_tail": (proc.stderr or "")[-4000:],
-        }
+        row = request(endpoint, "python", code, payload,
+                      timeout_ms=timeout_ms)
+    except RemoteExecutionError as exc:
+        return {"status": "failed", "error": str(exc), "remote_outcome": "unknown"}
+    if row.get("timed_out") or row.get("cancelled"):
+        return {"status": "timeout" if row.get("timed_out") else "cancelled",
+                "error": "remote python timed out" if row.get("timed_out") else "remote python cancelled",
+                "stdout_tail": row["stdout"][-4000:], "stderr_tail": row["stderr"][-4000:]}
+    if row["returncode"] != 0:
+        return {"status": "failed", "error": "remote python failed", "exit_code": row["returncode"],
+                "stdout_tail": row["stdout"][-4000:], "stderr_tail": row["stderr"][-4000:]}
     try:
-        data = json.loads((proc.stdout or "").strip())
+        data = json.loads(row["stdout"].strip())
     except json.JSONDecodeError as exc:
-        return {
-            "status": "failed",
-            "error": f"remote python returned non-JSON: {exc}",
-            "stdout_tail": (proc.stdout or "")[-4000:],
-            "stderr_tail": (proc.stderr or "")[-4000:],
-        }
+        return {"status": "failed", "error": f"remote python returned non-JSON: {exc}",
+                "stdout_tail": row["stdout"][-4000:], "stderr_tail": row["stderr"][-4000:]}
     return data if isinstance(data, dict) else {"status": "failed", "error": "remote python JSON was not an object"}
 
 

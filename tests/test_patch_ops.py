@@ -285,7 +285,7 @@ class PatchOpsTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "executes remote Bash/git against local POSIX fixture paths")
     def test_unified_patch_records_before_sha_and_diffstat(self) -> None:
-        original_runner = patch_ops.run_script
+        original_runner = patch_ops.run_rpc_script
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 repo = Path(tmp)
@@ -300,7 +300,7 @@ class PatchOpsTests(unittest.TestCase):
                     proc = subprocess.run(["bash", "-s"], input=script, cwd=repo, capture_output=True, text=True, check=False)
                     return RemoteCompleted(proc.returncode, proc.stdout, proc.stderr)
 
-                patch_ops.run_script = fake_run_script  # type: ignore[assignment]
+                patch_ops.run_rpc_script = fake_run_script  # type: ignore[assignment]
                 patch = """diff --git a/a.py b/a.py
 --- a/a.py
 +++ b/a.py
@@ -315,11 +315,11 @@ class PatchOpsTests(unittest.TestCase):
                 self.assertIsNotNone(changed["after_sha256"])
                 self.assertIn("a.py", payload["result"]["preview"]["diffstat"])
         finally:
-            patch_ops.run_script = original_runner  # type: ignore[assignment]
+            patch_ops.run_rpc_script = original_runner  # type: ignore[assignment]
 
     @unittest.skipIf(os.name == "nt", "executes remote Bash/git against local POSIX fixture paths")
     def test_unified_patch_rejects_symlink_target_before_git_apply(self) -> None:
-        original_runner = patch_ops.run_script
+        original_runner = patch_ops.run_rpc_script
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 repo = Path(tmp)
@@ -334,7 +334,7 @@ class PatchOpsTests(unittest.TestCase):
                     proc = subprocess.run(["bash", "-s"], input=script, cwd=repo, capture_output=True, text=True, check=False)
                     return RemoteCompleted(proc.returncode, proc.stdout, proc.stderr)
 
-                patch_ops.run_script = fake_run_script  # type: ignore[assignment]
+                patch_ops.run_rpc_script = fake_run_script  # type: ignore[assignment]
                 patch = """diff --git a/link.py b/link.py
 --- a/link.py
 +++ b/link.py
@@ -347,7 +347,7 @@ class PatchOpsTests(unittest.TestCase):
                 self.assertEqual(payload["result"]["status"], "symlink_not_allowed")
                 self.assertEqual(real.read_text(encoding="utf-8"), "old\n")
         finally:
-            patch_ops.run_script = original_runner  # type: ignore[assignment]
+            patch_ops.run_rpc_script = original_runner  # type: ignore[assignment]
 
 
 if __name__ == "__main__":

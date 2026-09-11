@@ -17,10 +17,9 @@ Layer A is the remote-native developer tool surface:
 - RemoteGlob / `remote.glob`
 - RemoteGrep / `remote.grep`
 - RemoteLS / `remote.ls`
-- RemoteMonitor / `remote.monitor`
 - RemoteApplyPatch / `remote.apply_patch`
 
-plus jobs (`remote.job_status` / `job_tail` / `job_stop`), artifacts
+plus jobs (`remote.job_status` / `job_tail` / `job_stop` / `job_stdin`), artifacts
 (`remote.artifact_manifest` / `artifact_pull` / `artifact_push`) and endpoint
 facts (`remote.probe`, `remote.context_snapshot`).
 
@@ -28,21 +27,26 @@ Layer B is the shared substrate:
 
 - endpoint identity and explicit resolution (`remote_dev.core.endpoint`)
 - resolver plugin interface for consumer-owned selectors (same module)
-- SSH transport with ControlMaster reuse on POSIX, automatic independent
-  connections on native Windows (Win32-OpenSSH has no Client ControlMaster),
-  per-endpoint unmultiplexed connections, optional ServerAlive keepalive,
-  attached live streams, local port forwards, and one-off interactive
-  bootstrap (`remote_dev.core.ssh_transport`)
+- binary SSH stdio RPC pooling on Windows and POSIX (`core.rpc_transport`),
+  with request ids, bounded code caches, scoped cancellation, concurrent
+  requests and no replay after unknown outcomes; no listener or installation
+- low-level SSH options, attached streams, port forwards and first-contact
+  bootstrap (`core.ssh_transport`); these retain explicit ControlMaster policy
 - full-permission default root with optional explicit root/cwd path policy
   (`remote_dev.core.path_policy`, `remote_dev.core.permissions`)
 - optional read-ledger concurrency checks (`remote_dev.core.read_ledger`,
   `remote_dev.core.state_store`)
 - compact previews plus full refs (`remote_dev.core.preview`, `remote_dev.result`)
 - generic remote process supervision (`remote_dev.processes.control`)
-- background job registry on that same supervisor (`remote_dev.core.job_ops`)
-- artifact manifests and pull/push verification (`remote_dev.core.artifact_ops`)
+- execute/yield/poll sessions and durable cursors on that same supervisor
+  (`core.job_ops`), including pipe input, real PTYs and synchronous library waits
+- artifact manifests and bounded binary batch streams (`core.artifact_ops`,
+  `core.artifact_transport`), atomic replacement after checksum verification
+- local record locks and a shared remote mutation lock across file tools,
+  patches and artifact commits; concurrent reads remain independent
 - Claude/Codex hook guards (`remote_dev.hooks`)
-- MCP server and resources (`remote_dev.mcp`)
+- concurrent MCP server and resources with eight workers and 32 admitted calls
+  (`remote_dev.mcp`); JSON lines and Content-Length frames share one dispatcher
 
 Layer C is whatever the consumer builds on top: workflow skills, session
 managers, coordinators. It lives in the consumer's repository and talks to

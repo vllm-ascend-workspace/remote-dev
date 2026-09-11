@@ -5,6 +5,9 @@ import json
 import os
 import sys
 import uuid
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from remote_dev.core.cancellation import request_context
 from typing import Any
 
 os.environ.setdefault("REMOTE_DEV_SESSION_ID", f"mcp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
@@ -15,6 +18,8 @@ from remote_dev.runtime import process_identity, runtime_status
 
 LOADED_RUNTIME = process_identity("vaws-remote-dev")
 LOADED_VERSION = package_version()
+_OUTPUT_LOCK = threading.Lock()
+_DISPATCHER = None
 
 
 def encode_payload(payload: dict[str, Any]) -> bytes:
@@ -22,14 +27,15 @@ def encode_payload(payload: dict[str, Any]) -> bytes:
 
 
 def send(payload: dict[str, Any], *, framed: bool = False) -> None:
-    encoded = encode_payload(payload)
-    if framed:
-        sys.stdout.buffer.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii"))
-        sys.stdout.buffer.write(encoded)
-        sys.stdout.buffer.flush()
-    else:
-        sys.stdout.write(encoded.decode("utf-8") + "\n")
-        sys.stdout.flush()
+    with _OUTPUT_LOCK:
+        encoded = encode_payload(payload)
+        if framed:
+            sys.stdout.buffer.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii"))
+            sys.stdout.buffer.write(encoded)
+            sys.stdout.buffer.flush()
+        else:
+            sys.stdout.write(encoded.decode("utf-8") + "\n")
+            sys.stdout.flush()
 
 
 def result(request_id: Any, value: dict[str, Any], *, framed: bool = False) -> None:
@@ -94,6 +100,62 @@ def handle(message: dict[str, Any], *, framed: bool = False) -> None:
         error(request_id, -32000, str(exc), {"type": type(exc).__name__}, framed=framed)
 
 
+class Dispatcher:
+    """Bounded request workers; the input reader always remains cancellable."""
+    def __init__(self):
+        self.executor = ThreadPoolExecutor(max_workers=8)
+        self.capacity = threading.BoundedSemaphore(32)
+        self.lock = threading.Lock()
+        self.pending = {}
+
+    def dispatch(self, message, framed=False):
+        if message.get("method") == "notifications/cancelled":
+            identifier = (message.get("params") or {}).get("requestId")
+            with self.lock:
+                event = self.pending.get(identifier)
+                if event is not None:
+                    event.set()
+            return
+        if message.get("method") not in {"tools/call", "resources/read"}:
+            handle(message, framed=framed)
+            return
+        identifier = message.get("id")
+        with self.lock:
+            if identifier in self.pending:
+                error(identifier, -32600, "request id is already running", framed=framed)
+                return
+            if not self.capacity.acquire(blocking=False):
+                error(identifier, -32000, "request capacity exhausted; not executed", framed=framed)
+                return
+            event = threading.Event()
+            self.pending[identifier] = event
+        def execute():
+            try:
+                with request_context(event):
+                    if event.is_set():
+                        error(identifier, -32800, "request cancelled before execution", framed=framed)
+                    else:
+                        handle(message, framed=framed)
+            finally:
+                with self.lock:
+                    self.pending.pop(identifier, None)
+                self.capacity.release()
+        self.executor.submit(execute)
+
+    def close(self):
+        with self.lock:
+            for event in self.pending.values():
+                event.set()
+        self.executor.shutdown(wait=True)
+
+
+def dispatch(message, framed=False):
+    if _DISPATCHER is None:
+        handle(message, framed=framed)
+    else:
+        _DISPATCHER.dispatch(message, framed)
+
+
 def read_framed_messages() -> int:
     while True:
         headers: dict[str, str] = {}
@@ -118,7 +180,7 @@ def read_framed_messages() -> int:
             error(None, -32700, f"parse error: {exc}", framed=True)
             continue
         if isinstance(message, dict):
-            handle(message, framed=True)
+            dispatch(message, framed=True)
         else:
             error(None, -32600, "request must be an object", framed=True)
 
@@ -133,7 +195,7 @@ def read_line_messages() -> int:
             error(None, -32700, f"parse error: {exc}")
             continue
         if isinstance(message, dict):
-            handle(message)
+            dispatch(message)
         else:
             error(None, -32600, "request must be an object")
     return 0
@@ -148,9 +210,17 @@ def main() -> int:
         peeked = sys.stdin.buffer.peek(16)
     except AttributeError:
         peeked = b""
-    if peeked.startswith(b"Content-Length:"):
-        return read_framed_messages()
-    return read_line_messages()
+    global _DISPATCHER
+    _DISPATCHER = Dispatcher()
+    try:
+        if peeked.startswith(b"Content-Length:"):
+            return read_framed_messages()
+        return read_line_messages()
+    finally:
+        _DISPATCHER.close()
+        from remote_dev.core.rpc_transport import close_connections
+        close_connections()
+        _DISPATCHER = None
 
 
 if __name__ == "__main__":

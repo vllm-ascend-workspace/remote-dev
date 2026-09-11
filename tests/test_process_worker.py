@@ -201,6 +201,120 @@ class ProcessWorkerTests(unittest.TestCase):
         self.assertTrue(reply["accepted"])
         self.assertTrue(reply["polled_terminal"])
 
+    def read_until(self, identifier, needle, *, data="", eof=False):
+        output = ""
+        offset = 0
+        for index in range(60):
+            row = self.call(identifier, "exchange", data=data if index == 0 else "",
+                            eof=eof if index == 0 else False, stdout_offset=offset,
+                            stderr_offset=0, shared_budget=True, max_bytes=32768, yield_time_ms=100)
+            output += row.get("stdout", "")
+            offset = row.get("stdout_offset", offset)
+            if needle in output:
+                return output
+        self.fail("missing output: " + repr(output))
+
+    def test_pty_has_terminal_size_unicode_input_and_ctrl_c_signal(self):
+        code = ("import os,sys,time; print('READY', os.isatty(0), os.isatty(1), "
+                "os.get_terminal_size(0), flush=True); "
+                "print('GOT:' + input(), flush=True); time.sleep(30)")
+        identifier, _ = self.prepare("p", shlex.quote(sys.executable) + " -u -c " + shlex.quote(code), tty=True)
+        self.go(identifier)
+        ready = self.read_until(identifier, "READY True True")
+        self.assertIn("columns=80, lines=24", ready)
+        output = self.read_until(identifier, "GOT:你好", data="你好\n")
+        self.assertIn("你好", output)
+        self.call(identifier, "stdin", data="\x03")
+        status = self.until(identifier, lambda row: row["quiet"])
+        self.assertIn(status["result"]["exit_code"], (-signal.SIGINT, 128 + signal.SIGINT))
+        self.assertTrue(status["result"]["descendants_drained"])
+
+    def test_pty_eof_after_complete_line_allows_cat_to_finish(self):
+        identifier, _ = self.prepare("e", "cat", tty=True)
+        self.go(identifier)
+        self.read_until(identifier, "hello", data="hello\n")
+        self.call(identifier, "stdin", data="", eof=True)
+        status = self.until(identifier, lambda row: row["quiet"])
+        self.assertEqual(status["result"]["exit_code"], 0)
+
+    def test_pipe_control_byte_is_data_and_does_not_signal(self):
+        code = "import sys; print('BYTE', sys.stdin.buffer.read(1)[0], flush=True)"
+        identifier, _ = self.prepare("n", shlex.quote(sys.executable) + " -u -c " + shlex.quote(code), interactive=True)
+        self.go(identifier)
+        self.read_until(identifier, "BYTE 3", data="\x03")
+        self.assertEqual(self.until(identifier, lambda row: row["quiet"])["result"]["exit_code"], 0)
+
+    def test_verified_live_supervisor_never_scans_unrelated_proc_entries(self):
+        identifier, _ = self.prepare("f", "sleep 10")
+        self.go(identifier)
+        original = Path.iterdir
+        def limited(path):
+            if str(path) == "/proc":
+                raise AssertionError("live status must walk only the owned family")
+            return original(path)
+        from unittest import mock
+        with mock.patch.object(Path, "iterdir", limited):
+            status = self.call(identifier, "status")
+            self.assertFalse(status["quiet"])
+            self.call(identifier, "stop", force=True)
+        self.until(identifier, lambda row: row["quiet"])
+
+    def test_launch_and_empty_exchange_use_the_same_terminal_snapshot(self):
+        identifier = "job-combined"
+        self.identifiers.append(identifier)
+        row = self.call(identifier, "launch", spec={"command": "printf done", "cwd": str(self.root),
+                        "env": {}, "timeout_seconds": 10}, authorization={"token": "test"},
+                        stdout_offset=0, stderr_offset=0, max_bytes=8, shared_budget=True, yield_time_ms=1000)
+        self.until(identifier, lambda row: row["quiet"])
+        last = self.call(identifier, "exchange", stdout_offset=row.get("stdout_offset", 0),
+                         stderr_offset=0, max_bytes=8, shared_budget=True, yield_time_ms=100)
+        self.assertEqual(row.get("stdout", "") + last.get("stdout", ""), "done")
+        self.assertEqual(last["state"], "succeeded")
+        self.assertEqual(last["result"]["exit_code"], 0)
+        self.assertTrue(last["quiet"])
+
+    def test_cancelled_launch_does_not_open_the_gate(self):
+        import threading
+        event = threading.Event()
+        event.set()
+        identifier = "job-never-run"
+        self.identifiers.append(identifier)
+        self.worker.control_job({"root": str(self.root), "job_id": identifier, "action": "launch",
+                                 "spec": {"cwd": str(self.root), "command": "touch forbidden", "env": {}, "timeout_seconds": 10},
+                                 "authorization": {"token": "test"}}, self.source, event)
+        self.until(identifier, lambda row: row["quiet"])
+        self.assertFalse((self.root / "forbidden").exists())
+
+    def test_cancelled_exchange_waits_for_owned_family_to_drain(self):
+        import threading
+        event = threading.Event()
+        identifier, _ = self.prepare("cancel", "sleep 30")
+        self.go(identifier)
+        event.set()
+        row = self.worker.control_job({"root": str(self.root), "job_id": identifier,
+            "action": "exchange", "stdout_offset": 0, "stderr_offset": 0, "yield_time_ms": 30000}, self.source, event)
+        self.assertEqual(row["state"], "cancelled")
+        self.assertTrue(row["quiet"])
+        self.assertTrue(row["cancellation_requested"])
+
+    def test_shared_budget_counts_invalid_utf8_expansion_without_losing_bytes(self):
+        code = "import os; os.write(1,b'\\xff'*9+'你好'.encode()); os.write(2,'世界'.encode())"
+        identifier, _ = self.prepare("bytes", shlex.quote(sys.executable) + " -c " + shlex.quote(code))
+        self.go(identifier)
+        self.until(identifier, lambda row: row["quiet"])
+        offsets = dict(stdout_offset=0, stderr_offset=0)
+        collected = dict(stdout="", stderr="")
+        for _ in range(20):
+            row = self.call(identifier, "tail", **offsets, max_bytes=4, shared_budget=True)
+            self.assertLessEqual(sum(len(row[name].encode()) for name in collected), 4)
+            for name in collected:
+                collected[name] += row[name]
+                offsets[name + "_offset"] = row[name + "_offset"]
+            if not any(row[name + "_bytes_remaining"] for name in collected):
+                break
+        self.assertEqual(collected, dict(stdout='\ufffd' * 9 + '你好', stderr='世界'))
+
+
 
 @unittest.skipIf(sys.platform == "win32", "Linux worker is not a native Windows module")
 class ProcessWorkerEntrypointTests(unittest.TestCase):

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from .endpoint import Endpoint, substrate_root
+from .atomic import replace_file
 from .errors import PathPolicyError
 from .path_policy import path_fingerprint
 from remote_dev.result import dumps, new_invocation_id, utc_now_iso
@@ -70,7 +71,7 @@ def atomic_write_json(path: Path, data: Any) -> None:
             fh.write(dumps(data) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(temp_name, path)
+        replace_file(temp_name, path)
     finally:
         try:
             os.unlink(temp_name)
@@ -86,7 +87,7 @@ def atomic_write_text(path: Path, data: str) -> None:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(temp_name, path)
+        replace_file(temp_name, path)
     finally:
         try:
             os.unlink(temp_name)

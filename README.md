@@ -17,7 +17,6 @@ the console entry is `remote-dev`.
 | Glob        | `remote.glob`        | `remote-dev glob`                        |
 | Grep        | `remote.grep`        | `remote-dev grep`                        |
 | LS          | `remote.ls`          | `remote-dev ls`                          |
-| Monitor     | `remote.monitor`     | `remote-dev monitor`                     |
 | apply_patch | `remote.apply_patch` | `remote-dev apply-patch`                 |
 | write_stdin | `remote.job_stdin`   | `remote-dev job-stdin`                   |
 
@@ -101,7 +100,7 @@ by both the MCP dispatcher and the CLI `--input-json` path):
 
 - Aliases: `path` for `file_path` (read/write/edit/multi_edit),
   `line_offset`/`n_lines` for `offset`/`limit` (read), `cmd`/`workdir` for
-  `command`/`cwd` (bash/monitor), `-i`/`-A`/`-B`/`-C`/`-n`/`head_limit`
+  `command`/`cwd` (bash), `session_id` for `job_id`, `-i`/`-A`/`-B`/`-C`/`-n`/`head_limit`
   (grep). A canonical key always wins; unknown keys pass through. Fields with
   aliases are enforced by the server, not the wire schema's `required` list,
   so alias-only calls pass provider-side validation.
@@ -119,28 +118,40 @@ by both the MCP dispatcher and the CLI `--input-json` path):
   (matching lines per file, `rg -c`) from `count_matches` (total matches per
   file, `rg --count-matches`; the grep fallback counts `-o` matches per
   file). They differ whenever one line holds several matches.
-- Codex exec habits: `remote.bash run_in_background=true` accepts
-  `yield_time_ms` (poll briefly, then return state plus fresh output) and
-  `interactive=true` (keep stdin writable). `remote.job_stdin` writes `chars`
-  to a running interactive job, closes input with `eof`, and returns only
-  *new* output: a per-stream byte cursor in the local job record advances
-  past exactly the bytes returned, so repeated polls never replay output and
-  a capped call loses nothing. The initial yield uses the same cursor path —
-  it returns the first bytes up to the budget and follow-up polls continue
-  where it stopped. Paged reads hold back a UTF-8 character split by the byte
-  budget for the next poll instead of corrupting it into U+FFFD; genuinely
-  invalid bytes still surface as replacements so the cursor never stalls.
-  `max_output_tokens` caps returned output at
-  4 characters per token per stream (an approximation, documented on the
-  schema); full output stays reachable via `remote.job_tail` and refs. A
-  large write that exceeds the remote buffer reports how many bytes were
-  accepted (`stdin_buffer_full`, plus `written_chars` so Unicode input is
-  sliced at the right character boundary) instead of pretending success, and
-  an `eof` on a partially accepted write is deferred until the exact
-  remainder is retried and accepted — stdin never closes early. These are
-  pipe sessions, not PTYs: `tty=true` returns an explicit
-  `unsupported_capability` error, and control bytes such as `\x03` are bytes,
-  not signals. Cancellation stays with `remote.job_stop`.
+- `remote.bash command=...` starts with writable stdin and waits up to
+  `yield_time_ms` (default 10000) for output or completion. A live process or
+  unread output returns `session_id`; completion reports `exit_code` and
+  `quiet`. The wait excludes SSH connection and process preparation. Omitted
+  `timeout_ms` (or zero) means no command deadline; an explicit value limits
+  remote execution. `run_in_background`, `interactive`, and the separate
+  monitor tool have been removed.
+- `remote.job_stdin session_id=... chars=...` writes input; empty `chars`
+  polls any session, including completed sessions with unread output. Per-stream
+  byte cursors advance under a cross-process lock, preserving Unicode and
+  preventing concurrent polls from replaying bytes. A partial input write
+  reports `written_chars`; resend that exact remainder. EOF is deferred until
+  all submitted characters are accepted.
+- `tty=true` allocates a real 24x80 remote PTY with merged stdout/stderr.
+  Ctrl-C signals the terminal foreground group. `eof=true` sends terminal
+  Ctrl-D (canonical terminal semantics); pipe EOF closes stdin. In pipe mode,
+  control bytes remain data. `remote.job_stop` stops the owned process family.
+- `max_output_tokens` budgets approximately four UTF-8 bytes per token across
+  both text and structured previews, shared by stdout/stderr. Each preview has
+  a four-byte minimum so one Unicode character can progress. Status/refs
+  metadata is separate. Unreturned bytes remain at the cursor; full decoded
+  logs accumulate in local refs as pages are consumed.
+- Developer calls reuse one binary SSH stdio connection on Windows and POSIX,
+  independently of OpenSSH ControlMaster. MCP processes up to eight calls
+  concurrently and accepts cancellation while another call waits. Source caches,
+  queued requests and endpoint connections are bounded. A lost reply is an
+  unknown outcome and is never automatically replayed.
+- Reads scan in bounded memory. `verify_content=false` (CLI
+  `--no-verify-content`) stops after a positive-offset log window and omits the
+  hash/read ledger; the default retains a full hash and exact line count for
+  guarded editing. Search results stream to a bounded page. Artifact batches
+  use one SSH stream with 1 MiB chunks, checksum verification and atomic file
+  replacement. Default probes avoid importing application modules; request
+  explicit `modules` (CLI `--module`) when needed.
 
 ## The endpoint-explicit contract
 
@@ -358,13 +369,19 @@ reader: `select` on POSIX, reader threads on native Windows). It returns
 
 Detached background work uses one process implementation:
 `remote_dev.processes.control(endpoint, job_id, action, **parameters)`.
-Actions are `prepare`, `go`, `status`, `tail`, and `stop`. The Linux worker
+Actions are `prepare`, `go`, `status`, `tail`, `stop`, `stdin`, `launch`, and
+`exchange`. The Linux worker
 is a child-subreaper with identity/marker checks, a start gate, descendant
-drain, and timeout/stop. Ordinary `remote.bash --run-in-background` and
+drain, and timeout/stop. Ordinary `remote.bash` and
 `remote.job_*` call this same boundary. Coordinator may call it directly
 with an explicit host+port mapping; remote-dev does not load coordinator
 state. The worker is Linux-only; the local transport client supports
 macOS, Linux, and native Windows.
+
+Python consumers needing a completed result call `remote_bash(..., wait=True)`.
+This waits and drains full log refs through the same supervisor, with stdin
+closed unless a PTY is requested. Coordinator retains its separate
+`prepare`/authorized `go` gate for managed execution.
 
 Two more transport primitives close the remaining SSH-option gaps. They are
 library APIs, not MCP tools, and they do not accept extra `-o` strings.

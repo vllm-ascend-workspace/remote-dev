@@ -5,12 +5,13 @@ import time
 import uuid
 from pathlib import PurePosixPath
 from typing import Any
+from .locking import serialize_mutation
 
 from .endpoint import Endpoint
 from .errors import PathPolicyError
 from .path_policy import join_under_root
 from remote_dev.result import make_result, utc_now_iso
-from .ssh_transport import run_remote_python, run_script
+from .ssh_transport import run_remote_python, run_rpc_script
 from .state_store import atomic_write_json, ensure_endpoint_state
 
 REMOTE_CODEX_PATCH_PY = r'''
@@ -388,6 +389,7 @@ def _duration_ms(start: float) -> int:
     return int(round((time.monotonic() - start) * 1000))
 
 
+@serialize_mutation
 def remote_apply_patch(
     endpoint: Endpoint,
     *,
@@ -426,7 +428,7 @@ def remote_apply_patch(
         data = run_remote_python(
             endpoint,
             REMOTE_CODEX_PATCH_PY,
-            {"root": endpoint.root, "cwd": effective_cwd, "ops": ops},
+            {"root": endpoint.root, "cwd": effective_cwd, "ops": ops, "_mutation": True},
             timeout_ms=timeout_ms,
         )
         return _patch_result(endpoint, started, start, effective_cwd, data)
@@ -460,6 +462,7 @@ def _apply_unified_patch(
             "tmp=$(mktemp)",
             "tmp_before=\"$tmp.before\"",
             "tmp_stat=\"$tmp.stat\"",
+            'trap \'rm -f "$tmp" "$tmp_before" "$tmp_stat" "$tmp.check"\' EXIT',
             f"cat > \"$tmp\" <<'{delimiter}'",
             patch,
             delimiter,
@@ -492,9 +495,9 @@ def _apply_unified_patch(
             "pathlib.Path(sys.argv[1]).write_text(json.dumps(before), encoding='utf-8')",
             "REMOTE_DEV_BEFORE",
             "git apply --stat \"$tmp\" > \"$tmp_stat\" 2>&1 || true",
-            "if ! git apply --check \"$tmp\" >/tmp/remote-dev-git-apply-check.out 2>&1; then",
-            "  cat /tmp/remote-dev-git-apply-check.out >&2",
-            "  rm -f \"$tmp\" \"$tmp_before\" \"$tmp_stat\" /tmp/remote-dev-git-apply-check.out",
+            "if ! git apply --check \"$tmp\" >\"$tmp.check\" 2>&1; then",
+            "  cat \"$tmp.check\" >&2",
+            "  rm -f \"$tmp\" \"$tmp_before\" \"$tmp_stat\" \"$tmp.check\"",
             "  exit 73",
             "fi",
             "git apply \"$tmp\"",
@@ -512,10 +515,12 @@ def _apply_unified_patch(
             "    changed.append({'path': str(p), 'before_sha256': before.get(raw), 'after_sha256': digest, 'size': size})",
             "print(json.dumps({'status':'applied','changed_files':changed,'diffstat':diffstat}))",
             "REMOTE_DEV_CHANGED",
-            "rm -f \"$tmp\" \"$tmp_before\" \"$tmp_stat\" /tmp/remote-dev-git-apply-check.out",
+            "rm -f \"$tmp\" \"$tmp_before\" \"$tmp_stat\" \"$tmp.check\"",
         ]
     )
-    completed = run_script(endpoint, script, timeout_ms=timeout_ms)
+    completed = run_rpc_script(endpoint, script, timeout_ms=timeout_ms, mutation=True)
+    if completed.cancelled:
+        return _patch_failed(endpoint, started, start, "cancelled", "RemoteApplyPatch cancelled", outcome="cancelled")
     if completed.timed_out:
         return _patch_failed(endpoint, started, start, "timeout", "RemoteApplyPatch timed out", outcome="timeout")
     if completed.returncode == 72:

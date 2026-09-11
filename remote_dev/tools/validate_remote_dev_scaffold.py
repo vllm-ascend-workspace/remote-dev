@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -154,12 +155,39 @@ def endpoint_payload(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
+def finish_session(payload, endpoint, timeout_ms):
+    """Validate the actual execute/poll interface, retaining a bounded preview."""
+    deadline = time.monotonic() + timeout_ms / 1000 + 45
+    output = {"stdout": "", "stderr": ""}
+    truncated = False
+    while True:
+        result = payload["result"]
+        for name in output:
+            text = str(result.get("preview", {}).get(name) or "")
+            output[name] = (output[name] + text)[:8192]
+            truncated = truncated or bool(result.get("bytes_remaining", {}).get(name))
+        if not result.get("session_id") or result.get("status") in {"job_start_failed", "cwd_not_found", "cwd_outside_root", "cwd_not_directory", "job_id_exists"}:
+            break
+        if time.monotonic() >= deadline:
+            call_tool("remote.job_stop", {**endpoint, "job_id": result["job_id"], "force": True})
+            raise RuntimeError("validation command did not finish within its deadline")
+        payload = call_tool("remote.job_stdin", {**endpoint, "job_id": result["job_id"], "yield_time_ms": 1000})
+    result["preview"] = output
+    result["output_truncated"] = truncated
+    payload["text"] = result["summary"] + "\n" + output["stdout"] + output["stderr"]
+    return payload
+
+
+def completed_bash(arguments):
+    return finish_session(call_tool("remote.bash", arguments), arguments, int(arguments.get("timeout_ms") or 30000))
+
+
 def run_parallel_worker(endpoint: dict[str, Any], scratch: str, index: int, timeout_ms: int) -> dict[str, Any]:
     worker_dir = f"{scratch}/parallel-{index}"
     file_path = f"{worker_dir}/task.txt"
     command = f"mkdir -p {worker_dir!r} && printf 'worker-{index}\\ninitial\\n' > {file_path!r}"
     checks = [
-        require_outcome(f"parallel_{index}_create", call_tool("remote.bash", {**endpoint, "command": command, "timeout_ms": timeout_ms})),
+        require_outcome(f"parallel_{index}_create", completed_bash({**endpoint, "command": command, "timeout_ms": timeout_ms})),
         require_outcome(f"parallel_{index}_read", call_tool("remote.read", {**endpoint, "file_path": file_path, "timeout_ms": timeout_ms}), statuses={"ok"}),
         require_outcome(
             f"parallel_{index}_edit",
@@ -184,33 +212,33 @@ def live_endpoint_checks(args: argparse.Namespace) -> dict[str, Any]:
     if not has_selector(endpoint):
         return {"status": "skipped", "reason": f"no endpoint selector was provided (known selector fields: {', '.join(selector_fields())})"}
     timeout_ms = args.timeout_ms
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:8]
     scratch_root = (endpoint.get("cwd") or DEFAULT_CWD or endpoint.get("root") or DEFAULT_ROOT).rstrip("/")
     scratch = f"{scratch_root}/.remote-dev/validation/{stamp}"
-    narrow_endpoint = {**endpoint, "root": scratch_root, "cwd": scratch_root}
+    narrow_endpoint = {**endpoint, "root": scratch, "cwd": scratch}
     checks: list[dict[str, Any]] = []
     failures: list[str] = []
     try:
         progress("remote:probe")
         checks.append(require_outcome("probe", call_tool("remote.probe", {**endpoint, "timeout_ms": timeout_ms})))
         checks.append(require_outcome("context_snapshot", call_tool("remote.context_snapshot", {**endpoint, "timeout_ms": timeout_ms, "live_probe": True})))
-        checks.append(require_outcome("cwd_blocked", call_tool("remote.bash", {**narrow_endpoint, "cwd": "/tmp", "command": "pwd", "timeout_ms": timeout_ms}), outcomes={"blocked"}, statuses={"cwd_outside_root"}))
-        checks.append(require_outcome("cwd_not_found", call_tool("remote.bash", {**endpoint, "cwd": f"{scratch}/missing", "command": "pwd", "timeout_ms": timeout_ms}), outcomes={"failed"}, statuses={"cwd_not_found"}))
-        checks.append(require_outcome("nonzero_exit", call_tool("remote.bash", {**endpoint, "command": "exit 7", "timeout_ms": timeout_ms}), outcomes={"failed"}, statuses={"nonzero_exit"}))
-        checks.append(require_outcome("timeout", call_tool("remote.bash", {**endpoint, "command": "sleep 2", "timeout_ms": 500}), outcomes={"timeout"}, statuses={"timeout"}))
+        checks.append(require_outcome("cwd_blocked", completed_bash({**narrow_endpoint, "cwd": "/tmp", "command": "pwd", "timeout_ms": timeout_ms}), outcomes={"blocked"}, statuses={"cwd_outside_root"}))
+        checks.append(require_outcome("cwd_not_found", completed_bash({**endpoint, "cwd": f"{scratch}/missing", "command": "pwd", "timeout_ms": timeout_ms}), outcomes={"failed"}, statuses={"cwd_not_found"}))
+        checks.append(require_outcome("nonzero_exit", completed_bash({**endpoint, "command": "exit 7", "timeout_ms": timeout_ms}), outcomes={"failed"}, statuses={"failed"}))
+        checks.append(require_outcome("timeout", completed_bash({**endpoint, "command": "sleep 2", "timeout_ms": 500}), outcomes={"timeout"}, statuses={"timeout"}))
 
         setup = f"mkdir -p {scratch!r} && printf 'alpha\\nbeta\\n' > {scratch!r}/file.txt && ln -sf /etc/passwd {scratch!r}/escape-link"
-        checks.append(require_outcome("bash_create", call_tool("remote.bash", {**endpoint, "command": setup, "timeout_ms": timeout_ms})))
-        big = call_tool("remote.bash", {**endpoint, "command": "python3 - <<'PY'\nprint('x' * 50000)\nPY", "timeout_ms": timeout_ms})
+        checks.append(require_outcome("bash_create", completed_bash({**endpoint, "command": setup, "timeout_ms": timeout_ms})))
+        big = completed_bash({**endpoint, "command": "python3 - <<'PY'\nprint('x' * 50000)\nPY", "timeout_ms": timeout_ms})
         checks.append(require_outcome("large_output_preview", big))
-        if not big.get("result", {}).get("preview", {}).get("stdout", {}).get("truncated"):
+        if not big.get("result", {}).get("output_truncated"):
             raise RuntimeError("large_output_preview did not mark stdout as truncated")
         checks.append(require_outcome("ls", call_tool("remote.ls", {**endpoint, "path": scratch, "timeout_ms": timeout_ms})))
         checks.append(require_outcome("read", call_tool("remote.read", {**endpoint, "file_path": f"{scratch}/file.txt", "offset": 1, "limit": 10, "timeout_ms": timeout_ms}), statuses={"ok"}))
         checks.append(require_outcome("directory_read_rejected", call_tool("remote.read", {**endpoint, "file_path": scratch, "timeout_ms": timeout_ms}), outcomes={"failed"}, statuses={"is_directory"}))
         checks.append(require_outcome("symlink_read_blocked", call_tool("remote.read", {**narrow_endpoint, "file_path": f"{scratch}/escape-link", "timeout_ms": timeout_ms}), outcomes={"blocked"}, statuses={"path_outside_root"}))
         checks.append(require_outcome("artifact_symlink_blocked", call_tool("remote.artifact_manifest", {**endpoint, "remote_path": f"{scratch}/escape-link", "timeout_ms": timeout_ms}), outcomes={"blocked"}))
-        checks.append(require_outcome("remove_escape_symlink", call_tool("remote.bash", {**endpoint, "command": f"rm -f {scratch!r}/escape-link", "timeout_ms": timeout_ms})))
+        checks.append(require_outcome("remove_escape_symlink", completed_bash({**endpoint, "command": f"rm -f {scratch!r}/escape-link", "timeout_ms": timeout_ms})))
         checks.append(require_outcome("edit", call_tool("remote.edit", {**endpoint, "file_path": f"{scratch}/file.txt", "old_string": "beta", "new_string": "gamma", "timeout_ms": timeout_ms}), statuses={"edited"}))
         checks.append(require_outcome("read_after_edit", call_tool("remote.read", {**endpoint, "file_path": f"{scratch}/file.txt", "timeout_ms": timeout_ms}), statuses={"ok"}))
         checks.append(require_outcome("write", call_tool("remote.write", {**endpoint, "file_path": f"{scratch}/write.txt", "content": "created\\n", "create_dirs": True, "timeout_ms": timeout_ms}), statuses={"written"}))
@@ -235,17 +263,18 @@ def live_endpoint_checks(args: argparse.Namespace) -> dict[str, Any]:
             local_push.write_text("pushed\n", encoding="utf-8")
             checks.append(require_outcome("artifact_push", call_tool("remote.artifact_push", {**endpoint, "local_path": str(local_push), "remote_path": f"{scratch}/pushed.txt", "timeout_ms": timeout_ms}), statuses={"ok"}))
 
-        job_payload = call_tool("remote.bash", {**endpoint, "command": "printf 'job-out\\n'; printf 'job-err\\n' >&2", "cwd": scratch, "run_in_background": True, "timeout_ms": timeout_ms})
-        checks.append(require_outcome("background_job_start", job_payload, statuses={"running"}))
-        job_id = job_payload["result"].get("job", job_payload["result"].get("extra", {}).get("job", {}))["job_id"]
+        job_payload = completed_bash({**endpoint, "command": "printf 'job-out\\n'; printf 'job-err\\n' >&2", "cwd": scratch, "timeout_ms": timeout_ms})
+        checks.append(require_outcome("background_job_start", job_payload, statuses={"succeeded"}))
+        job_id = job_payload["result"]["job_id"]
         time.sleep(2)
         checks.append(require_outcome("job_status", call_tool("remote.job_status", {**endpoint, "job_id": job_id, "timeout_ms": timeout_ms}), statuses={"succeeded"}))
         checks.append(require_outcome("job_tail", call_tool("remote.job_tail", {**endpoint, "job_id": job_id, "lines": 20, "timeout_ms": timeout_ms})))
 
-        interactive_payload = call_tool("remote.bash", {**endpoint, "command": "read -r line; printf 'got:%s\\n' \"$line\"", "cwd": scratch, "run_in_background": True, "interactive": True, "yield_time_ms": 1500, "timeout_ms": timeout_ms})
+        interactive_payload = call_tool("remote.bash", {**endpoint, "command": "read -r line; printf 'got:%s\\n' \"$line\"", "cwd": scratch, "yield_time_ms": 1500, "timeout_ms": timeout_ms})
         checks.append(require_outcome("interactive_job_start", interactive_payload))
-        interactive_id = interactive_payload["result"].get("job", interactive_payload["result"].get("extra", {}).get("job", {}))["job_id"]
+        interactive_id = interactive_payload["result"]["job_id"]
         stdin_payload = call_tool("remote.job_stdin", {**endpoint, "job_id": interactive_id, "chars": "hello-stdin\x0a", "eof": True, "yield_time_ms": 5000, "timeout_ms": timeout_ms})
+        stdin_payload = finish_session(stdin_payload, endpoint, timeout_ms)
         checks.append(require_outcome("job_stdin", stdin_payload))
         if "got:hello-stdin" not in json.dumps(stdin_payload.get("result", {})):
             raise RuntimeError("job_stdin did not surface the echoed stdin line")
@@ -254,10 +283,10 @@ def live_endpoint_checks(args: argparse.Namespace) -> dict[str, Any]:
         if "got:hello-stdin" in json.dumps(replay.get("result", {})):
             raise RuntimeError("job_stdin replayed earlier output; incremental cursors are broken")
         checks.append(require_outcome("interactive_job_done", call_tool("remote.job_status", {**endpoint, "job_id": interactive_id, "timeout_ms": timeout_ms}), statuses={"succeeded"}))
-        tty_payload = call_tool("remote.bash", {**endpoint, "command": "true", "tty": True, "timeout_ms": timeout_ms})
-        checks.append(require_outcome("bash_tty_capability_boundary", tty_payload, outcomes={"failed"}, statuses={"unsupported_capability"}))
+        tty_payload = completed_bash({**endpoint, "command": "true", "tty": True, "timeout_ms": timeout_ms})
+        checks.append(require_outcome("bash_tty", tty_payload, statuses={"succeeded"}))
         noninteractive = call_tool("remote.job_stdin", {**endpoint, "job_id": job_id, "chars": "x", "timeout_ms": timeout_ms})
-        checks.append(require_outcome("job_stdin_rejects_plain_job", noninteractive, outcomes={"failed"}, statuses={"not_interactive"}))
+        checks.append(require_outcome("job_stdin_rejects_plain_job", noninteractive, outcomes={"failed"}, statuses={"stdin_rejected"}))
         resource_uris = {item["uri"] for item in list_resources()}
         stdout_uri = next((uri for uri in resource_uris if uri.endswith(f"/job/{job_id}/stdout")), None)
         if not stdout_uri:
@@ -281,7 +310,7 @@ def live_endpoint_checks(args: argparse.Namespace) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         failures.append(str(exc))
     finally:
-        cleanup = call_tool("remote.bash", {**endpoint, "command": f"rm -rf {scratch!r}", "timeout_ms": timeout_ms})
+        cleanup = completed_bash({**endpoint, "command": f"rm -rf {scratch!r}", "timeout_ms": timeout_ms})
         checks.append({
             "name": "cleanup",
             "outcome": cleanup.get("result", {}).get("outcome"),

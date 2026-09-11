@@ -21,7 +21,6 @@ REMOTE_TOOL_PATH_FIELDS = {
     "remote.glob": ("path",),
     "remote.grep": ("path",),
     "remote.ls": ("path",),
-    "remote.monitor": ("cwd",),
     "remote.apply_patch": ("cwd",),
     "remote.artifact_manifest": ("remote_path",),
     "remote.artifact_pull": ("remote_path",),

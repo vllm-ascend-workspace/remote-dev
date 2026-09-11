@@ -17,10 +17,11 @@ def test_nested_local_paths_use_remote_slashes_and_preserve_bytes(tmp_path):
     expected = hashlib.sha256(data).hexdigest()
     assert _local_manifest(root)["files"][0]["relpath"] == "子目录/deeper/数据.bin"
     observed = []
-    def transfer(endpoint, command, **kwargs):
-        observed.append((command, kwargs["stdin"]))
-        return subprocess.CompletedProcess([], 0, (expected + "\n").encode(), b"")
-    with patch("remote_dev.core.artifact_ops.run_bytes", side_effect=transfer):
+    def transfer(item, source):
+        observed.append((item["path"], source.read_bytes()))
+        return expected
+    with patch("remote_dev.core.artifact_ops.ArtifactStream") as factory:
+        factory.return_value.__enter__.return_value.push.side_effect = transfer
         result = remote_artifact_push(Endpoint(host="192.0.2.1", port=22),
                                       local_path=str(root), remote_path="/tmp/upload")
     assert result["result"]["outcome"] == "success"

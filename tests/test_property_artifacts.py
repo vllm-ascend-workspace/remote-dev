@@ -312,27 +312,38 @@ class TransferHarness:
         patchers = [
             mock.patch.object(state_store, "substrate_root", return_value=self.state),
             mock.patch.object(artifact_ops, "run_remote_python", side_effect=lambda _endpoint, code, payload, **_kw: run_remote_script(code, payload)),
-            mock.patch.object(artifact_ops, "run_bytes", side_effect=self._fake_run_bytes),
+            mock.patch.object(artifact_ops, "ArtifactStream", side_effect=self._stream),
         ]
         for patcher in patchers:
             patcher.start()
             test.addCleanup(patcher.stop)
         self.endpoint = Endpoint(host=DOC_HOSTS[0], port=46000, root=str(self.root), cwd=str(self.root))
 
-    def _fake_run_bytes(self, _endpoint: Endpoint, command: str, *, stdin: bytes | None = None, timeout_ms: int | None = None) -> subprocess.CompletedProcess[bytes]:
-        words = shlex.split(command)
-        if words[:1] == ["cat"]:
-            path = Path(words[1])
-            if str(path) in self.missing or not path.exists():
-                return subprocess.CompletedProcess(args=[], returncode=1, stdout=b"", stderr=b"cat: no such file")
-            data = path.read_bytes()
-            corruption = self.corrupt.get(str(path))
-            if corruption is not None:
-                data = corruption(data)
-            return subprocess.CompletedProcess(args=[], returncode=0, stdout=data, stderr=b"")
-        # push: the fake remote reports the sha of what it received.
-        digest = sha(stdin or b"")
-        return subprocess.CompletedProcess(args=[], returncode=0, stdout=(digest + "\n").encode(), stderr=b"")
+    def _stream(self, endpoint, operation, count, timeout_ms):
+        harness = self
+        class Stream:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def pull(self, item, destination):
+                path = Path(item["path"])
+                if str(path) in harness.missing:
+                    raise OSError("source missing")
+                data = path.read_bytes()
+                if str(path) in harness.corrupt:
+                    data = harness.corrupt[str(path)](data)
+                observed = sha(data)
+                if observed != item["sha256"]:
+                    raise artifact_ops.ArtifactTransferError("hash_mismatch", item["sha256"], observed)
+                destination.write_bytes(data)
+                return observed
+            def push(self, item, source):
+                observed = sha(source.read_bytes())
+                if getattr(harness, "bad_push", None) == item["path"]:
+                    observed = sha(b"different")
+                if observed != item["sha256"]:
+                    raise artifact_ops.ArtifactTransferError("hash_mismatch", item["sha256"], observed)
+                return observed
+        return Stream()
 
 
 def corruption(gen: Gen) -> Any:
@@ -416,14 +427,7 @@ class TransferProperties(unittest.TestCase):
             lie = gen.boolean(0.3)
             if lie:
                 bad = gen.choice(sorted(files))
-                original = harness._fake_run_bytes
-
-                def lying_run_bytes(endpoint: Endpoint, command: str, *, stdin: bytes | None = None, timeout_ms: int | None = None) -> subprocess.CompletedProcess[bytes]:
-                    if shlex.quote(str(Path(remote_base) / bad)) in command or (bad == "." and remote_base in command):
-                        return subprocess.CompletedProcess(args=[], returncode=74, stdout=(sha(b"different") + "\n").encode(), stderr=b"")
-                    return original(endpoint, command, stdin=stdin, timeout_ms=timeout_ms)
-
-                artifact_ops.run_bytes.side_effect = lying_run_bytes  # type: ignore[attr-defined]
+                harness.bad_push = str(Path(remote_base) / bad)
             payload = artifact_ops.remote_artifact_push(harness.endpoint, local_path=str(local_tree), remote_path=remote_base)
             result = payload["result"]
             pushed = {item["relpath"]: item for item in result["artifacts"][0]["pushed"]}
@@ -445,7 +449,7 @@ class TransferProperties(unittest.TestCase):
         local = Path(harness.tmp.name) / "one.txt"
         local.write_text("x\n", encoding="utf-8")
         calls: list[str] = []
-        artifact_ops.run_bytes.side_effect = lambda *args, **kwargs: calls.append(args[1]) or subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b"")  # type: ignore[attr-defined]
+        artifact_ops.ArtifactStream.side_effect = lambda *args, **kwargs: calls.append(args)  # type: ignore[attr-defined]
         for remote_path in ("/etc/x", str(harness.root) + "/../escape", "../escape"):
             with self.subTest(remote_path=remote_path):
                 result = artifact_ops.remote_artifact_push(harness.endpoint, local_path=str(local), remote_path=remote_path)["result"]

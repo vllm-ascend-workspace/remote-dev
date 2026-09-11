@@ -113,23 +113,23 @@ interactive calls should use the client's confirmation flow.
 - `remote_write append=true` appends atomically (Kimi `mode=append`);
   `remote_read` on a binary file returns an actionable `binary_file` status —
   there is no remote image/media preview tool.
-- Codex exec habits map to the shared supervisor: `remote_bash
-  run_in_background=true interactive=true yield_time_ms=...` starts a pipe
-  session and yields initial output; `remote_job_stdin` writes `chars` (empty
-  = poll), closes input with `eof`, and returns only new output (per-stream
-  byte cursors, no replay across polls). The initial yield shares that cursor
-  path: it returns the first bytes up to the budget and later polls continue
-  exactly where it stopped, so skipped bytes are never lost. Incremental reads
-  hold back a UTF-8 character split by the byte budget for the next poll
-  (invalid bytes still flush as U+FFFD so the cursor always advances). A write
-  accepted partially reports `stdin_buffer_full` with `written`/`written_chars`
-  counts — retry the exact remainder sliced at `written_chars`; an `eof` on a
-  partial write is deferred until the remainder is accepted. `max_output_tokens`
-  is honored as a
-  4-characters-per-token budget per stream with an explicit remainder
-  warning, never accepted and ignored. `tty=true` is an explicit
-  `unsupported_capability` error: remote-dev sessions are pipes, not PTYs,
-  and control bytes are delivered as bytes, not signals.
+- In 0.6, `remote_bash command=... yield_time_ms=...` automatically yields
+  `session_id` when the process or output remains. Stdin is writable by default;
+  `remote_job_stdin session_id=... chars=...` writes input or polls when empty.
+  `eof=true` closes pipe input. `tty=true` allocates a 24x80 remote terminal,
+  merges stderr into stdout, and gives Ctrl-C/Ctrl-D terminal semantics.
+  The old `run_in_background`/`interactive` flags and monitor tool are removed.
+- Output cursors survive process restarts and concurrent polls. Unicode
+  characters split at a page boundary remain for the next page. Partial writes
+  report `written_chars`; retry the exact remainder. EOF is deferred until that
+  remainder is accepted. `max_output_tokens` uses four UTF-8 bytes per token
+  across text plus structured previews, shared by stdout/stderr; each preview
+  has a four-byte minimum and bounded status/refs metadata is separate.
+- MCP accepts concurrent calls and scoped cancellation in both framing modes.
+  Windows and WSL use the same pooled binary SSH RPC, without depending on
+  OpenSSH ControlMaster. The remote execution shell remains Bash on Linux;
+  local PowerShell/WSL quoting is avoided by JSON tool arguments. Connection
+  startup and remote shell profiles still contribute latency.
 - `remote_multi_edit.edits` exposes typed item fields; omitted `new_string`
   retains the existing empty-string deletion behavior.
 - Path containment, symlink checks, read ledgers, patch atomicity, and SSH

@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+import hashlib
+import os
+from pathlib import Path
+import tempfile
+import tracemalloc
+import unittest
+from unittest import mock
+
+from local_ssh import local_python_ssh
+from remote_dev.core.artifact_transport import ArtifactStream, ArtifactTransferError
+from remote_dev.core.endpoint import Endpoint
+from remote_dev.core.errors import RemoteExecutionError
+
+
+def digest(path):
+    result = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            result.update(chunk)
+    return result.hexdigest()
+
+
+class ArtifactStreamTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name).resolve()
+        self.root = self.base / "remote"
+        self.root.mkdir()
+        self.endpoint = Endpoint(host="192.0.2.10", port=22, root=str(self.root))
+        patcher = mock.patch.dict(os.environ, REMOTE_DEV_STATE_DIR=str(self.base / "state"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        adapter = local_python_ssh()
+        adapter.__enter__()
+        self.addCleanup(adapter.__exit__, None, None, None)
+
+    def test_multiple_binary_files_share_one_connection_and_roundtrip_unicode_paths(self):
+        data = bytes(range(256)) * 16384 + b"\r\nUnix\n\x00"
+        source = self.base / "源 数据.bin"
+        source.write_bytes(data)
+        expected = hashlib.sha256(data).hexdigest()
+        items = [{"path": str(self.root / name), "size": len(data), "sha256": expected}
+                 for name in ("子目录/数据.bin", "second.bin")]
+        with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("whole-file buffering forbidden")):
+            with ArtifactStream(self.endpoint, "push", 2, 10000) as stream:
+                pid = stream.proc.pid
+                for item in items:
+                    self.assertEqual(stream.push(item, source), expected)
+                    self.assertEqual(stream.proc.pid, pid)
+            with ArtifactStream(self.endpoint, "pull", 2, 10000) as stream:
+                for index, item in enumerate(items):
+                    self.assertEqual(stream.pull(item, self.base / f"download-{index}"), expected)
+        for index in range(2):
+            self.assertEqual((self.base / f"download-{index}").read_bytes(), data)
+
+    def test_push_hash_failure_preserves_existing_file_and_cleans_temporary(self):
+        source = self.base / "source"
+        source.write_bytes(b"new bytes")
+        destination = self.root / "destination"
+        destination.write_bytes(b"existing bytes")
+        item = {"path": str(destination), "size": source.stat().st_size, "sha256": "0" * 64}
+        with ArtifactStream(self.endpoint, "push", 1, 5000) as stream:
+            with self.assertRaises(ArtifactTransferError):
+                stream.push(item, source)
+        self.assertEqual(destination.read_bytes(), b"existing bytes")
+        self.assertEqual(list(self.root.glob(".remote-dev-*")), [])
+
+    def test_pull_hash_failure_preserves_existing_file_and_cleans_temporary(self):
+        source = self.root / "source"
+        source.write_bytes(b"server bytes")
+        destination = self.base / "destination"
+        destination.write_bytes(b"existing bytes")
+        item = {"path": str(source), "size": source.stat().st_size, "sha256": "0" * 64}
+        with ArtifactStream(self.endpoint, "pull", 1, 5000) as stream:
+            with self.assertRaises(ArtifactTransferError):
+                stream.pull(item, destination)
+        self.assertEqual(destination.read_bytes(), b"existing bytes")
+        self.assertEqual(list(self.base.glob(".remote-dev-*")), [])
+
+    def test_source_size_change_and_path_escape_never_replace_local_target(self):
+        source = self.root / "source"
+        source.write_bytes(b"server bytes")
+        destination = self.base / "destination"
+        destination.write_bytes(b"existing")
+        for path, size in ((source, 999), (destination, 8)):
+            with self.subTest(path=path), ArtifactStream(self.endpoint, "pull", 1, 5000) as stream:
+                with self.assertRaises(RemoteExecutionError):
+                    stream.pull({"path": str(path), "size": size, "sha256": "0" * 64}, destination)
+            self.assertEqual(destination.read_bytes(), b"existing")
+
+    def test_client_allocations_are_bounded_for_a_large_transfer(self):
+        source = self.root / "large.bin"
+        with source.open("wb") as stream:
+            chunk = b"a" * (1024 * 1024)
+            for _ in range(32):
+                stream.write(chunk)
+        item = {"path": str(source), "size": source.stat().st_size, "sha256": digest(source)}
+        tracemalloc.start()
+        try:
+            with ArtifactStream(self.endpoint, "pull", 1, 10000) as stream:
+                stream.pull(item, self.base / "download")
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 12 * 1024 * 1024)
+        self.assertEqual(digest(self.base / "download"), item["sha256"])

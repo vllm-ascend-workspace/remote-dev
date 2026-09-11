@@ -28,27 +28,6 @@ class RemoteBashTests(unittest.TestCase):
         )
         self.assertIn("--root /tmp --cwd /tmp", payload["text"])
 
-    def test_remote_bash_core_allows_secret_like_argv(self) -> None:
-        endpoint = Endpoint(host="1.2.3.4", port=46000)
-        original_state_root = state_store.substrate_root
-        original_runner = shell_ops.run_script
-        scripts = []
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                state_store.substrate_root = lambda: Path(tmp)  # type: ignore[assignment]
-
-                def fake_run_script(_endpoint, script, **_kwargs):
-                    scripts.append(script)
-                    return RemoteCompleted(0, "ok\n", "")
-
-                shell_ops.run_script = fake_run_script  # type: ignore[assignment]
-                payload = shell_ops.remote_bash(endpoint, command="echo token=abc")
-                self.assertEqual(payload["result"]["outcome"], "success")
-                self.assertIn("echo token=abc", scripts[0])
-        finally:
-            state_store.substrate_root = original_state_root  # type: ignore[assignment]
-            shell_ops.run_script = original_runner  # type: ignore[assignment]
-
     def test_remote_bash_relative_cwd_hint_does_not_suggest_bad_root(self) -> None:
         endpoint = Endpoint(host="1.2.3.4", port=46000, root="/vllm-workspace")
         payload = shell_ops.remote_bash(endpoint, command="pwd", cwd="tmp")
@@ -56,59 +35,23 @@ class RemoteBashTests(unittest.TestCase):
         self.assertEqual(payload["result"]["next"]["suggested_action"], "rerun_with_absolute_cwd")
         self.assertNotIn("endpoint_patch", payload["result"]["next"])
 
-    def test_remote_bash_success_writes_log_refs(self) -> None:
-        endpoint = Endpoint(host="1.2.3.4", port=46000)
-        original_state_root = state_store.substrate_root
-        original_runner = shell_ops.run_script
-        scripts = []
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                state_store.substrate_root = lambda: Path(tmp)  # type: ignore[assignment]
-
-                def fake_run_script(_endpoint, script, **_kwargs):
-                    scripts.append(script)
-                    return RemoteCompleted(0, "ok\n", "")
-
-                shell_ops.run_script = fake_run_script  # type: ignore[assignment]
-                payload = shell_ops.remote_bash(endpoint, command="echo ok")
-                self.assertEqual(payload["result"]["outcome"], "success")
-                self.assertTrue(Path(payload["result"]["refs"]["stdout"]).exists())
-                self.assertIn('bash -c "$REMOTE_DEV_COMMAND"', scripts[0])
-                self.assertNotIn("bash -lc", scripts[0])
-        finally:
-            state_store.substrate_root = original_state_root  # type: ignore[assignment]
-            shell_ops.run_script = original_runner  # type: ignore[assignment]
-
-    def test_runtime_env_preamble_is_explicit_per_endpoint(self) -> None:
-        # No consumer-specific profile script is baked into the substrate: the
-        # preamble appears only when the endpoint names a runtime_env_file.
-        original_state_root = state_store.substrate_root
-        original_runner = shell_ops.run_script
-        scripts = []
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                state_store.substrate_root = lambda: Path(tmp)  # type: ignore[assignment]
-
-                def fake_run_script(_endpoint, script, **_kwargs):
-                    scripts.append(script)
-                    return RemoteCompleted(0, "ok\n", "")
-
-                shell_ops.run_script = fake_run_script  # type: ignore[assignment]
-                plain = Endpoint(host="1.2.3.4", port=46000)
-                shell_ops.remote_bash(plain, command="echo ok")
-                self.assertNotIn("profile.d", scripts[-1])
-                self.assertNotIn("set +u; .", scripts[-1])
-
-                configured = Endpoint(host="1.2.3.4", port=46000, runtime_env_file="/etc/profile.d/tool chain.sh")
-                payload = shell_ops.remote_bash(configured, command="echo ok")
-                self.assertIn("if [ -f '/etc/profile.d/tool chain.sh' ]; then set +u; . '/etc/profile.d/tool chain.sh'; set -u; fi", scripts[-1])
-                self.assertEqual(payload["result"]["environment"]["runtime_env_file"], "/etc/profile.d/tool chain.sh")
-
-                shell_ops.remote_bash(configured, command="echo ok", runtime_env=False)
-                self.assertNotIn("profile.d", scripts[-1])
-        finally:
-            state_store.substrate_root = original_state_root  # type: ignore[assignment]
-            shell_ops.run_script = original_runner  # type: ignore[assignment]
+    def test_plain_and_configured_runtime_environment(self) -> None:
+        commands = []
+        def control(endpoint, job_id, action, **parameters):
+            commands.append(parameters["spec"]["command"])
+            return {"state": "succeeded", "quiet": True, "stdout": "ok\n", "result": {"exit_code": 0}}
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict(__import__("os").environ, REMOTE_DEV_STATE_DIR=tmp), \
+             unittest.mock.patch.object(job_ops, "control", control):
+            plain = Endpoint(host="192.0.2.10", port=22)
+            payload = shell_ops.remote_bash(plain, command="echo token=abc")
+            self.assertEqual(commands[-1], "echo token=abc")
+            self.assertEqual(Path(payload["result"]["refs"]["stdout"]).read_text(), "ok\n")
+            configured = Endpoint(host="192.0.2.10", port=22, runtime_env_file="/etc/profile.d/tool chain.sh")
+            payload = shell_ops.remote_bash(configured, command="echo ok")
+            self.assertIn(". '/etc/profile.d/tool chain.sh'", commands[-1])
+            self.assertEqual(payload["result"]["environment"]["runtime_env_file"], configured.runtime_env_file)
+            shell_ops.remote_bash(configured, command="echo ok", runtime_env=False)
+            self.assertEqual(commands[-1], "echo ok")
 
     def test_background_job_records_runtime_env_file_and_restores_it(self) -> None:
         endpoint = Endpoint(host="1.2.3.4", port=46000, runtime_env_file="/etc/profile.d/toolchain.sh")
@@ -155,11 +98,11 @@ class RemoteBashTests(unittest.TestCase):
                         endpoint,
                         command="touch /srv/app/should-not-exist",
                         cwd="/srv/app/missing",
-                        run_in_background=True,
+                        yield_time_ms=0,
                     )
                 self.assertEqual(payload["result"]["outcome"], "failed")
                 self.assertEqual(payload["result"]["status"], "cwd_not_found")
-                self.assertEqual(calls, ["prepare"])
+                self.assertEqual(calls, ["launch"])
         finally:
             state_store.substrate_root = original_state_root  # type: ignore[assignment]
 

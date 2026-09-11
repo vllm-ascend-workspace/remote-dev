@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from typing import Any
+from .locking import serialize_mutation
 
 from .endpoint import Endpoint
 from .errors import PathPolicyError
@@ -91,59 +92,94 @@ def unified(before, after, path):
         n=3,
     ))[:12000]
 
+def scan_text_lines(path, max_chars, digest=None):
+    # Split like str.splitlines(), including CRLF across chunk boundaries.
+    # Keep only a bounded prefix even if a file contains one enormous line.
+    import codecs
+    import re
+    breaks = re.compile(r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    prefix, length, skip_lf, first = "", 0, False, True
+    with path.open("rb") as stream:
+        while True:
+            raw = stream.read(65536)
+            if first:
+                first = False
+                if b"\x00" in raw[:8192]:
+                    fail("binary_file", "remote.read returns UTF-8 text; use remote.artifact_pull for binary/image files")
+            if digest is not None:
+                digest.update(raw)
+            text = decoder.decode(raw, final=not raw)
+            if skip_lf and text:
+                if text.startswith("\n"):
+                    text = text[1:]
+                skip_lf = False
+            start = 0
+            for match in breaks.finditer(text):
+                piece = text[start:match.start()]
+                prefix += piece[:max(0, max_chars - len(prefix))]
+                length += len(piece)
+                yield prefix, length > max_chars
+                prefix, length = "", 0
+                skip_lf = match.group() == "\r" and match.end() == len(text)
+                start = match.end()
+            piece = text[start:]
+            prefix += piece[:max(0, max_chars - len(prefix))]
+            length += len(piece)
+            if not raw:
+                if length:
+                    yield prefix, length > max_chars
+                return
+
+
 if op == "read":
     path, resolved = resolve_path(payload["file_path"])
     if path.is_dir():
         fail("is_directory", f"RemoteRead reads files, not directories: {path}")
-    if path.is_symlink() and not payload.get("allow_symlink", False):
-        target = path.resolve()
-        if target != root and root not in target.parents:
-            fail("path_outside_root", f"symlink target escapes root: {target}")
-    raw = path.read_bytes()
-    if b"\x00" in raw[:8192]:
-        fail(
-            "binary_file",
-            f"remote.read returns UTF-8 text and {path} looks binary (NUL byte in the first 8192 bytes). "
-            "There is no remote image/media preview tool: inspect it with remote.bash "
-            "(file, sha256sum, xxd) or copy it back with remote.artifact_pull.",
-        )
-    text = raw.decode("utf-8", errors="replace")
-    lines = text.splitlines()
     offset = int(payload.get("offset") or 1)
     limit = int(payload.get("limit") or 200)
     if limit < 1 or offset == 0:
-        fail("invalid_pagination", "limit must be a positive integer and offset must not be 0")
-    if offset < 0:
-        # Kimi native Read habit: a negative offset counts back from the end
-        # of the file, so offset=-N reads the last N lines.
-        offset = max(1, len(lines) + offset + 1)
-    start = min(offset - 1, len(lines))
-    end = min(start + limit, len(lines))
+        fail("invalid_pagination", "limit must be positive and offset must not be zero")
     max_line_chars = int(payload.get("max_line_chars") or 2000)
-    truncated_lines = 0
-    formatted_lines = []
-    for idx, line in enumerate(lines[start:end], start=start + 1):
-        if len(line) > max_line_chars:
-            line = line[:max_line_chars] + "<remote-dev line truncated>"
-            truncated_lines += 1
-        formatted_lines.append(f"{idx} | {line}")
-    numbered = "\n".join(formatted_lines)
-    info = file_info(path, content=raw)
-    info.update({
-        "total_lines": len(lines),
-        "offset": offset,
-        "limit": limit,
-        "line_start": start + 1 if lines else 0,
-        "line_end": end,
-        "partial": start > 0 or end < len(lines),
-        "content": numbered,
-        "truncated_line_count": truncated_lines,
-        "symlink": path.is_symlink(),
-        "resolved_path": str(resolved),
-    })
+    verify = bool(payload.get("verify_content", True))
+    before = path.stat()
+    digest = hashlib.sha256() if verify else None
+    selected, total, more = [], 0, False
+    for index, line in enumerate(scan_text_lines(path, max_line_chars, digest), 1):
+        total = index
+        if offset > 0 and offset <= index < offset + limit:
+            selected.append((index, *line))
+        if not verify and offset > 0 and index >= offset + limit:
+            more = True
+            break
+    total_lines = None if more else total
+    if offset < 0:
+        offset = max(1, total + offset + 1)
+        for index, line in enumerate(scan_text_lines(path, max_line_chars), 1):
+            if offset <= index < offset + limit:
+                selected.append((index, *line))
+            if index >= offset + limit:
+                break
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
+        fail("file_changed", "file changed during read; retry to obtain a consistent read")
+    start = min(offset - 1, total)
+    end = min(start + limit, total)
+    truncated_lines = sum(clipped for _, _, clipped in selected)
+    numbered = "\n".join(f"{index} | {body}" + ("<remote-dev line truncated>" if clipped else "")
+                         for index, body, clipped in selected)
+    info = {"path": str(path), "resolved_path": str(resolved), "size": after.st_size,
+            "mtime_ns": after.st_mtime_ns, "sha256": digest.hexdigest() if digest else None,
+            "total_lines": total_lines, "offset": offset, "limit": limit,
+            "line_start": start + 1 if total else 0, "line_end": end,
+            "partial": start > 0 or more or end < total, "content": numbered,
+            "truncated_line_count": truncated_lines, "symlink": path.is_symlink(),
+            "content_verified": verify}
     warnings = []
     if truncated_lines:
         warnings.append(f"{truncated_lines} line(s) truncated to {max_line_chars} chars")
+    if not verify:
+        warnings.append("Content hash not requested; this read does not update the edit concurrency guard.")
     print(json.dumps({"status": "partial" if info["partial"] else "ok", "file": info, "warnings": warnings}, sort_keys=True))
     raise SystemExit(0)
 
@@ -293,6 +329,7 @@ def remote_read(
     offset: int = 1,
     limit: int = 200,
     allow_symlink: bool = False,
+    verify_content: bool = True,
     client_context_id: str | None = None,
     timeout_ms: int = 120000,
 ) -> dict[str, Any]:
@@ -319,6 +356,7 @@ def remote_read(
             "offset": offset,
             "limit": limit,
             "allow_symlink": allow_symlink,
+            "verify_content": verify_content,
             "max_line_chars": MAX_LINE_CHARS,
         },
         timeout_ms=timeout_ms,
@@ -326,7 +364,7 @@ def remote_read(
     status = str(data.get("status", "failed"))
     refs: dict[str, Any] = {}
     ledger_scope = resolve_ledger_scope(client_context_id)
-    if status in {"ok", "partial"} and isinstance(data.get("file"), dict):
+    if status in {"ok", "partial"} and isinstance(data.get("file"), dict) and data["file"].get("sha256"):
         ledger = write_read_ledger(endpoint, data["file"], client_context_id)
         refs["read_ledger"] = str(ledger)
     file_info = data.get("file", {}) if isinstance(data.get("file"), dict) else {}
@@ -385,6 +423,7 @@ def remote_ls(
     return {"text": _format_ls_text(endpoint, result), "result": result}
 
 
+@serialize_mutation
 def remote_write(
     endpoint: Endpoint,
     *,
@@ -411,7 +450,7 @@ def remote_write(
         endpoint,
         REMOTE_FILE_PY,
         {
-            "op": "write",
+            "op": "write", "_mutation": True,
             "root": endpoint.root,
             "cwd": endpoint.effective_cwd,
             "file_path": path,
@@ -426,6 +465,7 @@ def remote_write(
     return _write_like_result(endpoint, "remote.write", path, data, started, start, client_context_id=client_context_id)
 
 
+@serialize_mutation
 def remote_edit(
     endpoint: Endpoint,
     *,
@@ -451,7 +491,7 @@ def remote_edit(
         endpoint,
         REMOTE_FILE_PY,
         {
-            "op": "edit",
+            "op": "edit", "_mutation": True,
             "root": endpoint.root,
             "cwd": endpoint.effective_cwd,
             "file_path": path,
@@ -465,6 +505,7 @@ def remote_edit(
     return _write_like_result(endpoint, "remote.edit", path, data, started, start, client_context_id=client_context_id)
 
 
+@serialize_mutation
 def remote_multi_edit(
     endpoint: Endpoint,
     *,
@@ -488,7 +529,7 @@ def remote_multi_edit(
         endpoint,
         REMOTE_FILE_PY,
         {
-            "op": "multi_edit",
+            "op": "multi_edit", "_mutation": True,
             "root": endpoint.root,
             "cwd": endpoint.effective_cwd,
             "file_path": path,

@@ -34,7 +34,6 @@ class McpSchemaTests(unittest.TestCase):
             "remote.glob",
             "remote.grep",
             "remote.ls",
-            "remote.monitor",
             "remote.apply_patch",
             "remote.job_status",
             "remote.job_tail",
@@ -87,7 +86,7 @@ class McpSchemaTests(unittest.TestCase):
         # semantics and live in the consumer, not in this server.
         for name in TOOL_SCHEMAS:
             self.assertTrue(name.startswith("remote."), name)
-        self.assertEqual(len(TOOL_SCHEMAS), 19)
+        self.assertEqual(len(TOOL_SCHEMAS), 18)
 
     def test_endpoint_props_carry_no_consumer_selectors(self) -> None:
         for legacy in ("session_id", "session_file", "machine"):
@@ -189,7 +188,7 @@ class McpSchemaTests(unittest.TestCase):
         import remote_dev.core.patch_ops as patch_ops
 
         endpoint = {"host": "example.invalid", "port": 22, "root": "/tmp", "cwd": "/tmp"}
-        with patch.object(patch_ops, "run_remote_python") as run_python, patch.object(patch_ops, "run_script") as run_shell:
+        with patch.object(patch_ops, "run_remote_python") as run_python, patch.object(patch_ops, "run_rpc_script") as run_shell:
             for name in ("remote.apply_patch", "remote_apply_patch"):
                 result = mcp_tools.call_tool(name, endpoint)["result"]
                 self.assertEqual(result["status"], "patch_required")

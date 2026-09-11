@@ -1,0 +1,157 @@
+"""Binary artifact streaming over one independent, cancellable SSH channel."""
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import tempfile
+import threading
+import time
+from dataclasses import replace
+
+from .cancellation import current_event
+from .atomic import replace_file
+from .errors import RemoteExecutionError
+from .locking import path_lock
+
+CHUNK_SIZE = 1024 * 1024
+
+
+class ArtifactTransferError(RemoteExecutionError):
+    def __init__(self, message, expected_sha256=None, observed_sha256=None):
+        super().__init__(message)
+        self.expected_sha256 = expected_sha256
+        self.observed_sha256 = observed_sha256
+
+
+class ArtifactStream:
+    def __init__(self, endpoint, operation, count, timeout_ms):
+        from .ssh_transport import ssh_base_cmd
+        source = (Path(__file__).parents[1] / "processes" / "artifact_worker.py").read_text(encoding="utf-8")
+        helper = (Path(__file__).parents[1] / "processes" / "mutation.py").read_text(encoding="utf-8")
+        source = source.replace("# REMOTE_DEV_MUTATION_LOCK", helper)
+        self.proc = subprocess.Popen(
+            [*ssh_base_cmd(replace(endpoint, ssh_mux=False, keepalive=True)), "python3 -u -c " + shlex.quote(source)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.done = threading.Event()
+        self.cancelled = current_event()
+        self.deadline = time.monotonic() + timeout_ms / 1000
+        self.reason = ""
+        self.expected_sha256 = None
+        self.stderr = bytearray()
+        self.guard = threading.Thread(target=self._watch, daemon=True)
+        self.drain = threading.Thread(target=self._drain, daemon=True)
+        self.guard.start()
+        self.drain.start()
+        try:
+            self.send({"root": endpoint.root, "operation": operation, "count": count, "timeout_ms": timeout_ms})
+        except BaseException:
+            self.close()
+            raise
+
+    def _watch(self):
+        while not self.done.wait(0.05):
+            if self.cancelled is not None and self.cancelled.is_set():
+                self.reason = "artifact transfer cancelled"
+            elif time.monotonic() >= self.deadline:
+                self.reason = "artifact transfer timed out"
+            if self.reason:
+                with contextlib.suppress(OSError):
+                    self.proc.kill()
+                return
+
+    def _drain(self):
+        while True:
+            chunk = self.proc.stderr.read(1024)
+            if not chunk:
+                return
+            self.stderr.extend(chunk)
+            del self.stderr[:-4000]
+
+    def send(self, data):
+        self.proc.stdin.write((json.dumps(data) + "\n").encode("utf-8"))
+        self.proc.stdin.flush()
+
+    def receive(self):
+        line = self.proc.stdout.readline(65536)
+        if not line.endswith(b"\n"):
+            raise RemoteExecutionError(self.reason or "artifact stream disconnected: " + self.stderr.decode("utf-8", "replace"))
+        result = json.loads(line)
+        if result.get("status") not in {"ready", "ok"}:
+            raise ArtifactTransferError("artifact " + str(result.get("status", "failed")) + ": " + str(result.get("error", "")), self.expected_sha256, result.get("sha256"))
+        return result
+
+    def pull(self, item, destination):
+        with path_lock(destination):
+            self.expected_sha256 = item["sha256"]
+            self.send(item)
+            ready = self.receive()
+            if ready.get("size") != item["size"]:
+                raise RemoteExecutionError("artifact size changed")
+            fd, temporary = tempfile.mkstemp(prefix=".remote-dev-", dir=str(destination.parent))
+            try:
+                digest = hashlib.sha256()
+                size = item["size"]
+                with os.fdopen(fd, "wb") as output:
+                    while size:
+                        chunk = self.proc.stdout.read(min(CHUNK_SIZE, size))
+                        if not chunk:
+                            raise RemoteExecutionError(self.reason or "incomplete artifact stream")
+                        output.write(chunk)
+                        digest.update(chunk)
+                        size -= len(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+                reply = self.receive()
+                if digest.hexdigest() != item["sha256"] or reply.get("sha256") != item["sha256"]:
+                    raise ArtifactTransferError("artifact hash_mismatch", item["sha256"], digest.hexdigest())
+                if destination.is_symlink():
+                    raise RemoteExecutionError("refusing to replace a local symlink")
+                replace_file(temporary, destination)
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(temporary)
+        return item["sha256"]
+
+    def push(self, item, source):
+        self.expected_sha256 = item["sha256"]
+        self.send(item)
+        self.receive()
+        remaining = item["size"]
+        with source.open("rb") as stream:
+            while remaining:
+                chunk = stream.read(min(CHUNK_SIZE, remaining))
+                if not chunk:
+                    raise RemoteExecutionError("local artifact changed since manifest")
+                self.proc.stdin.write(chunk)
+                remaining -= len(chunk)
+        self.proc.stdin.flush()
+        reply = self.receive()
+        if reply.get("sha256") != item["sha256"]:
+            raise ArtifactTransferError("artifact hash_mismatch", item["sha256"], reply.get("sha256"))
+        return item["sha256"]
+
+    def close(self):
+        with contextlib.suppress(OSError):
+            self.proc.stdin.close()
+        try:
+            self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+        self.done.set()
+        self.guard.join(timeout=1)
+        self.drain.join(timeout=1)
+        for stream in (self.proc.stdout, self.proc.stderr):
+            stream.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()

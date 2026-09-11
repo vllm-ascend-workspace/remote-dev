@@ -1,6 +1,50 @@
 # Remote-Dev Validation Record
 
-Last updated: 2026-09-11 (session-semantics review batch).
+Last updated: 2026-09-11 (native session and transport implementation).
+
+## Version 0.6 validation (2026-09-11)
+
+This version has 18 tools. It replaces the separate monitor/background flags
+with execute/yield/poll, writable stdin and real remote PTYs. Both native
+Windows Python and WSL use the shipped binary SSH RPC and artifact workers.
+
+- Full native Windows suite: 342 passed, 82 skipped, 146 subtests passed.
+- Full WSL suite: 410 passed, 2 skipped, 174 subtests passed.
+- After the real-MCP cancellation check identified a stale running reply,
+  cancellation now waits for the owned family to drain. The affected Linux
+  worker/session suite passed 29 tests, including two additional cases for
+  cancellation completion and invalid-UTF-8 output budgeting.
+- Both clients passed live SSH scaffold validation, including three concurrent
+  scratch workers, read/edit/write, search, patches, artifacts, stdin/EOF,
+  process timeouts and status/log resources. Test-created jobs were stopped
+  and verified quiet. No NPU workload was used.
+- Transport tests execute the actual shipped worker source through local
+  subprocess pipes; this exercises both client OS implementations without
+  requiring SSH fixtures. They cover concurrent replies, scoped cancellation,
+  unknown outcomes without replay, bounded source caches and mutation locks.
+- A 32 MiB artifact download stays below 12 MiB of measured Python allocations;
+  a 32 MiB single-line text read stays below 8 MiB. Fast log windows stop early
+  and intentionally omit the content hash/read ledger.
+- Clean 0.6.0 wheel installations on Windows and WSL passed actual MCP over
+  JSON lines and Content-Length framing against the same explicit Linux SSH
+  endpoint. Both passed fast-before-slow concurrent replies, cancellation with
+  quiet completion, PTY terminal detection/Chinese input/Ctrl-C, a shared
+  64-token output budget with complete later drain, and a hash-checked 4 MiB
+  binary roundtrip. Every job created by the harness was verified quiet.
+- In these paired live runs, warm short commands took approximately 1.5–2.0 s;
+  first calls took 6.7–7.3 s. A fast command returned in 1.5–1.6 s while a
+  two-second command completed in about 3.5–3.6 s. These are endpoint-specific
+  observations, including network and remote shell startup, not a promise of
+  local-shell latency or a measurement of the desktop application's scheduling.
+
+The initial Windows suite encountered a transient file-replacement denial;
+the isolated reproduction passed. A later session-record test reproduced the
+same Windows error. Local atomic publication now retries only the prepared
+replacement for up to 500 ms on Windows sharing/access errors, preserving the
+existing destination and never replaying remote execution.
+
+Older sections below are dated evidence for prior releases, including their
+former tool counts and no-PTY boundary.
 
 ## Client-parity batch (2026-09-10, this checkout)
 

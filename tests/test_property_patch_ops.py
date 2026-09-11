@@ -550,7 +550,7 @@ class UnifiedDiffProperties(unittest.TestCase):
                     proc = subprocess.run(["bash", "-s"], input=script, cwd=repo, capture_output=True, text=True, check=False)
                     return RemoteCompleted(proc.returncode, proc.stdout, proc.stderr)
 
-                with mock.patch.object(patch_ops, "run_script", fake_run_script), \
+                with mock.patch.object(patch_ops, "run_rpc_script", fake_run_script), \
                         mock.patch.object(state_store, "substrate_root", return_value=repo.parent / "state"):
                     payload = patch_ops.remote_apply_patch(endpoint, patch=patch, cwd=str(repo))
                 result = payload["result"]

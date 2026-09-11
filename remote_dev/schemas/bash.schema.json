@@ -2,16 +2,46 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "remote-dev.bash.v1",
   "allOf": [
-    {"$ref": "endpoint.schema.json"},
+    {
+      "$ref": "endpoint.schema.json"
+    },
     {
       "type": "object",
-      "required": ["command"],
+      "required": [
+        "command"
+      ],
       "properties": {
-        "command": {"type": "string"},
-        "description": {"type": "string"},
-        "timeout_ms": {"type": "integer", "default": 120000},
-        "run_in_background": {"type": "boolean", "default": false},
-        "env": {"type": "object", "additionalProperties": {"type": "string"}}
+        "command": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Whole command deadline; omitted or zero means no deadline."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "tty": {
+          "type": "boolean",
+          "default": false
+        },
+        "yield_time_ms": {
+          "type": "integer",
+          "default": 10000,
+          "minimum": 0,
+          "maximum": 300000
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
     }
   ]

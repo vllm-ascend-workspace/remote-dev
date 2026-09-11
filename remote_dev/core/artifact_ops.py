@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import hashlib
-import os
-import shlex
 import time
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
+from .locking import serialize_mutation
 
 from .endpoint import Endpoint
 from .errors import PathPolicyError
 from .path_policy import join_under_root
 from remote_dev.result import make_result, utc_now_iso
-from .ssh_transport import run_bytes, run_remote_python
+from .ssh_transport import run_remote_python
+from .artifact_transport import ArtifactStream, ArtifactTransferError
+from .errors import RemoteExecutionError
 from .state_store import atomic_write_json, ensure_endpoint_state
 
 REMOTE_MANIFEST_PY = r'''
@@ -199,206 +200,83 @@ def remote_artifact_manifest(endpoint: Endpoint, *, remote_path: str, timeout_ms
     return {"text": f"RemoteArtifactManifest {status}: {path}\nfiles: {data.get('file_count', 0)}\n", "result": result}
 
 
-def remote_artifact_pull(
-    endpoint: Endpoint,
-    *,
-    remote_path: str,
-    local_dir: str | None = None,
-    timeout_ms: int = 120000,
-) -> dict[str, Any]:
-    started = utc_now_iso()
-    start = time.monotonic()
+def _transfer_failure(endpoint, tool, started, start, exc, evidence):
+    message = str(exc)[-4000:]
+    status = ("hash_mismatch" if "hash_mismatch" in message else "cancelled" if "cancelled" in message
+              else "timeout" if "timed out" in message else "path_traversal" if isinstance(exc, ValueError) else "failed")
+    outcome = "blocked" if status == "path_traversal" else status if status in {"cancelled", "timeout"} else "failed"
+    result = make_result(tool=tool, target=endpoint.to_result_target(), outcome=outcome,
+                         status=status, summary=f"Artifact transfer {status}.", started_at=started,
+                         duration_ms=_duration_ms(start), preview={"stderr": message}, artifacts=[evidence],
+                         extra={"expected_sha256": getattr(exc, "expected_sha256", None), "observed_sha256": getattr(exc, "observed_sha256", None)})
+    return {"text": result["summary"] + "\n" + message + "\n", "result": result}
+
+
+@serialize_mutation
+def remote_artifact_pull(endpoint: Endpoint, *, remote_path: str, local_dir: str | None = None,
+                         timeout_ms: int = 120000) -> dict[str, Any]:
+    started, start = utc_now_iso(), time.monotonic()
     manifest_payload = remote_artifact_manifest(endpoint, remote_path=remote_path, timeout_ms=timeout_ms)
     manifest = manifest_payload["result"].get("manifest", {})
     if manifest.get("status") != "ok":
         return manifest_payload
-    base = Path(local_dir) if local_dir else ensure_endpoint_state(endpoint) / "artifacts" / str(int(time.time()))
+    base = Path(local_dir) if local_dir else ensure_endpoint_state(endpoint) / "artifacts" / uuid.uuid4().hex
     base.mkdir(parents=True, exist_ok=True)
-    pulled = []
-    skipped = []
-    for item in manifest.get("files", []):
-        relpath = item["relpath"]
-        try:
-            local_path = _safe_local_artifact_path(base, str(relpath))
-        except ValueError as exc:
-            result = make_result(
-                tool="remote.artifact_pull",
-                target=endpoint.to_result_target(),
-                outcome="blocked",
-                status="path_traversal",
-                summary=f"Blocked unsafe artifact path {relpath}.",
-                started_at=started,
-                duration_ms=_duration_ms(start),
-                artifacts=[{"manifest": manifest, "pulled": pulled, "skipped": skipped}],
-                preview={"stderr": str(exc)},
-                extra={"error": str(exc)},
-            )
-            return {"text": result["summary"] + "\n" + str(exc) + "\n", "result": result}
-        if local_path.exists() and _sha256_file(local_path) == item["sha256"]:
-            skipped.append({"relpath": relpath, "local_path": str(local_path), "reason": "hash-match"})
-            continue
-        proc = run_bytes(endpoint, f"cat {shlex.quote(item['path'])}", timeout_ms=timeout_ms)
-        if proc.returncode != 0:
-            result = make_result(
-                tool="remote.artifact_pull",
-                target=endpoint.to_result_target(),
-                outcome="failed",
-                status="failed",
-                summary=f"Failed to pull remote artifact {item['path']}.",
-                started_at=started,
-                duration_ms=_duration_ms(start),
-                preview={"stderr": proc.stderr.decode("utf-8", errors="replace")[-4000:]},
-                artifacts=[{"manifest": manifest, "pulled": pulled, "skipped": skipped}],
-            )
-            return {"text": result["summary"] + "\n", "result": result}
-        tmp = local_path.with_suffix(local_path.suffix + ".tmp")
-        tmp.write_bytes(proc.stdout)
-        observed = _sha256_file(tmp)
-        if observed != item["sha256"]:
-            tmp.unlink(missing_ok=True)
-            result = make_result(
-                tool="remote.artifact_pull",
-                target=endpoint.to_result_target(),
-                outcome="failed",
-                status="hash_mismatch",
-                summary=f"Hash mismatch pulling {item['path']}.",
-                started_at=started,
-                duration_ms=_duration_ms(start),
-                artifacts=[{"manifest": manifest, "pulled": pulled, "skipped": skipped}],
-                extra={"expected_sha256": item["sha256"], "observed_sha256": observed},
-            )
-            return {"text": result["summary"] + "\n", "result": result}
-        os.replace(tmp, local_path)
-        pulled.append({"relpath": relpath, "local_path": str(local_path), "sha256": observed, "size": item["size"]})
+    pulled, skipped, pending = [], [], []
+    evidence = {"manifest": manifest, "pulled": pulled, "skipped": skipped, "local_dir": str(base), "remote_path": remote_path}
+    try:
+        for item in manifest.get("files", []):
+            path = _safe_local_artifact_path(base, str(item["relpath"]))
+            if path.exists() and _sha256_file(path) == item["sha256"]:
+                skipped.append({"relpath": item["relpath"], "local_path": str(path), "reason": "hash-match"})
+            else:
+                pending.append((item, path))
+        if pending:
+            with ArtifactStream(endpoint, "pull", len(pending), timeout_ms) as stream:
+                for item, path in pending:
+                    digest = stream.pull(item, path)
+                    pulled.append({"relpath": item["relpath"], "local_path": str(path), "sha256": digest, "size": item["size"]})
+    except (RemoteExecutionError, OSError, ValueError) as exc:
+        return _transfer_failure(endpoint, "remote.artifact_pull", started, start, exc, evidence)
     manifest_path = base / "manifest.json"
     atomic_write_json(manifest_path, manifest)
-    result = make_result(
-        tool="remote.artifact_pull",
-        target=endpoint.to_result_target(),
-        outcome="success",
-        status="ok",
-        summary=f"Pulled {len(pulled)} files from {remote_path}.",
-        started_at=started,
-        duration_ms=_duration_ms(start),
-        refs={"local_manifest": str(manifest_path)},
-        artifacts=[{"remote_path": remote_path, "local_dir": str(base), "manifest": manifest, "pulled": pulled, "skipped": skipped}],
-    )
+    result = make_result(tool="remote.artifact_pull", target=endpoint.to_result_target(), outcome="success",
+                         status="ok", summary=f"Pulled {len(pulled)} files from {remote_path}.",
+                         started_at=started, duration_ms=_duration_ms(start),
+                         refs={"local_manifest": str(manifest_path)}, artifacts=[evidence])
     return {"text": f"RemoteArtifactPull completed\nlocal_dir: {base}\npulled: {len(pulled)}\nskipped: {len(skipped)}\n", "result": result}
 
 
-def remote_artifact_push(
-    endpoint: Endpoint,
-    *,
-    local_path: str,
-    remote_path: str,
-    timeout_ms: int = 120000,
-) -> dict[str, Any]:
-    started = utc_now_iso()
-    start = time.monotonic()
+@serialize_mutation
+def remote_artifact_push(endpoint: Endpoint, *, local_path: str, remote_path: str,
+                         timeout_ms: int = 120000) -> dict[str, Any]:
+    started, start = utc_now_iso(), time.monotonic()
+    pushed = []
+    evidence = {"pushed": pushed}
     try:
         remote_base = join_under_root(endpoint.root, endpoint.effective_cwd, remote_path)
-    except PathPolicyError as exc:
-        result = make_result(
-            tool="remote.artifact_push",
-            target=endpoint.to_result_target(),
-            outcome="blocked",
-            status="path_outside_root",
-            summary=f"Remote artifact push blocked for {remote_path}.",
-            started_at=started,
-            duration_ms=_duration_ms(start),
-            preview={"stderr": str(exc)},
-            extra={"error": str(exc)},
-        )
-        return {"text": result["summary"] + "\n" + str(exc) + "\n", "result": result}
-    try:
         manifest = _local_manifest(Path(local_path))
-    except (FileNotFoundError, ValueError) as exc:
-        result = make_result(
-            tool="remote.artifact_push",
-            target=endpoint.to_result_target(),
-            outcome="blocked" if isinstance(exc, ValueError) else "needs_input",
-            status="symlink_not_allowed" if isinstance(exc, ValueError) else "local_path_not_found",
-            summary="Remote artifact push could not read local artifact.",
-            started_at=started,
-            duration_ms=_duration_ms(start),
-            preview={"stderr": str(exc)},
-            extra={"error": str(exc)},
-        )
-        return {"text": result["summary"] + "\n" + str(exc) + "\n", "result": result}
-
-    pushed: list[dict[str, Any]] = []
-    for item in manifest["files"]:
-        relpath = str(item["relpath"])
-        remote_file = remote_base if relpath == "." else str(PurePosixPath(remote_base) / PurePosixPath(relpath))
-        try:
-            remote_file = join_under_root(endpoint.root, endpoint.effective_cwd, remote_file)
-        except PathPolicyError as exc:
-            result = make_result(
-                tool="remote.artifact_push",
-                target=endpoint.to_result_target(),
-                outcome="blocked",
-                status="path_outside_root",
-                summary=f"Remote artifact push blocked for {remote_file}.",
-                started_at=started,
-                duration_ms=_duration_ms(start),
-                artifacts=[{"manifest": manifest, "pushed": pushed}],
-                preview={"stderr": str(exc)},
-                extra={"error": str(exc)},
-            )
-            return {"text": result["summary"] + "\n" + str(exc) + "\n", "result": result}
-        remote_tmp = f"{remote_file}.tmp-{uuid.uuid4().hex[:8]}"
-        remote_parent = str(PurePosixPath(remote_file).parent)
-        command = "\n".join(
-            [
-                "set -e",
-                f"mkdir -p {shlex.quote(remote_parent)}",
-                f"cat > {shlex.quote(remote_tmp)}",
-                "observed=$(python3 - " + shlex.quote(remote_tmp) + " <<'PY'",
-                "import hashlib, pathlib, sys",
-                "path = pathlib.Path(sys.argv[1])",
-                "h = hashlib.sha256()",
-                "with path.open('rb') as fh:",
-                "    for chunk in iter(lambda: fh.read(1024 * 1024), b''):",
-                "        h.update(chunk)",
-                "print(h.hexdigest())",
-                "PY",
-                ")",
-                f"if [ \"$observed\" != {shlex.quote(str(item['sha256']))} ]; then rm -f {shlex.quote(remote_tmp)}; printf '%s\\n' \"$observed\"; exit 74; fi",
-                f"mv -f {shlex.quote(remote_tmp)} {shlex.quote(remote_file)}",
-                'printf \'%s\\n\' "$observed"',
-            ]
-        )
-        proc = run_bytes(endpoint, command, stdin=Path(item["path"]).read_bytes(), timeout_ms=timeout_ms)
-        observed = proc.stdout.decode("utf-8", errors="replace").strip().splitlines()[-1:] or [""]
-        if proc.returncode != 0 or observed[0] != item["sha256"]:
-            result = make_result(
-                tool="remote.artifact_push",
-                target=endpoint.to_result_target(),
-                outcome="failed",
-                status="hash_mismatch" if proc.returncode == 74 else "failed",
-                summary=f"Failed to push local artifact {item['path']}.",
-                started_at=started,
-                duration_ms=_duration_ms(start),
-                artifacts=[{"manifest": manifest, "pushed": pushed}],
-                preview={"stderr": proc.stderr.decode("utf-8", errors="replace")[-4000:]},
-                extra={"expected_sha256": item["sha256"], "observed_sha256": observed[0], "exit_code": proc.returncode},
-            )
-            return {"text": result["summary"] + "\n", "result": result}
-        pushed.append({
-            "relpath": relpath,
-            "local_path": item["path"],
-            "remote_path": remote_file,
-            "sha256": observed[0],
-            "size": item["size"],
-        })
-    result = make_result(
-        tool="remote.artifact_push",
-        target=endpoint.to_result_target(),
-        outcome="success",
-        status="ok",
-        summary=f"Pushed {len(pushed)} files to {remote_base}.",
-        started_at=started,
-        duration_ms=_duration_ms(start),
-        artifacts=[{"remote_path": remote_base, "manifest": manifest, "pushed": pushed}],
-    )
+        evidence.update(manifest=manifest, remote_path=remote_base)
+        files = manifest["files"]
+        if files:
+            with ArtifactStream(endpoint, "push", len(files), timeout_ms) as stream:
+                for item in files:
+                    relpath = item["relpath"]
+                    remote_file = remote_base if relpath == "." else str(PurePosixPath(remote_base) / relpath)
+                    remote_file = join_under_root(endpoint.root, endpoint.effective_cwd, remote_file)
+                    digest = stream.push({**item, "path": remote_file}, Path(item["path"]))
+                    pushed.append({"relpath": relpath, "local_path": item["path"], "remote_path": remote_file,
+                                   "sha256": digest, "size": item["size"]})
+    except (RemoteExecutionError, OSError, ValueError, PathPolicyError) as exc:
+        payload = _transfer_failure(endpoint, "remote.artifact_push", started, start, exc, evidence)
+        if isinstance(exc, PathPolicyError):
+            payload["result"].update(outcome="blocked", status="path_outside_root")
+        elif isinstance(exc, FileNotFoundError):
+            payload["result"].update(outcome="needs_input", status="local_path_not_found")
+        elif "symlink" in str(exc):
+            payload["result"].update(outcome="blocked", status="symlink_not_allowed")
+        return payload
+    result = make_result(tool="remote.artifact_push", target=endpoint.to_result_target(), outcome="success",
+                         status="ok", summary=f"Pushed {len(pushed)} files to {remote_base}.",
+                         started_at=started, duration_ms=_duration_ms(start), artifacts=[evidence])
     return {"text": f"RemoteArtifactPush completed\nremote_path: {remote_base}\npushed: {len(pushed)}\n", "result": result}

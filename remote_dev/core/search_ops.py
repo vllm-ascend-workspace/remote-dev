@@ -195,6 +195,75 @@ def apply_gitignore(base, matches):
             kept.append(item)
     return kept, warnings
 
+def command_lines(cmd, max_chars=32768):
+    """Yield bounded line prefixes; close the process when the caller stops."""
+    import contextlib
+    import threading
+    tail = bytearray()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=False)
+    def drain():
+        for chunk in iter(lambda: proc.stderr.read(4096), b""):
+            tail.extend(chunk)
+            del tail[:-4000]
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    import io
+    output = io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="replace")
+    try:
+        prefix, length = "", 0
+        while True:
+            fragment = output.readline(65536)
+            if not fragment:
+                if length:
+                    yield prefix, length > max_chars
+                break
+            ended = fragment.endswith("\n")
+            piece = fragment[:-1] if ended else fragment
+            prefix += piece[:max(0, max_chars-len(prefix))]
+            length += len(piece)
+            if ended:
+                yield prefix, length > max_chars
+                prefix, length = "", 0
+        code = proc.wait()
+        reader.join()
+        if code not in (0, 1):
+            fail("failed", tail.decode("utf-8", "replace"))
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        reader.join()
+        output.close()
+        proc.stderr.close()
+
+
+def collect_page(cmd, output_mode, offset, limit, max_line_chars, *, skip_zeros=False):
+    import contextlib
+    matches, count, truncated_lines = [], 0, 0
+    total_matches = 0 if output_mode == "count_matches" else None
+    cap = max_line_chars if output_mode == "content" else 32768
+    with contextlib.closing(command_lines(cmd, cap)) as rows:
+        for index, (line, clipped) in enumerate(rows):
+            if index < offset or (skip_zeros and line.endswith(":0")):
+                continue
+            count += 1
+            if total_matches is not None and line.rsplit(":", 1)[-1].isdigit():
+                total_matches += int(line.rsplit(":", 1)[-1])
+            if len(matches) < limit:
+                if clipped:
+                    line += "<remote-dev line truncated>"
+                    truncated_lines += 1
+                matches.append(line)
+            elif total_matches is None:
+                break
+    return matches, count > limit, total_matches, truncated_lines
+
+
 if op == "glob":
     base, resolved = resolve_path(payload.get("path") or payload["root"])
     if not base.is_dir():
@@ -204,19 +273,31 @@ if op == "glob":
     respect_gitignore = bool(payload.get("respect_gitignore"))
     matches = []
     warnings = []
+    import heapq
+    seen = 0
     # One-shot helper: chdir so glob(pattern, recursive=True) works on Python 3.9 (no root_dir).
     os.chdir(str(base))
-    for item in glob_mod.glob(pattern, recursive=True):
+    for item in glob_mod.iglob(pattern, recursive=True):
         path = base / item
         try:
             st = path.lstat()
         except OSError:
             continue
-        matches.append({"path": str(path), "relpath": item, "type": "directory" if path.is_dir() else "file", "mtime_ns": st.st_mtime_ns, "size": st.st_size})
+        row = {"path": str(path), "relpath": item, "type": "directory" if path.is_dir() else "file", "mtime_ns": st.st_mtime_ns, "size": st.st_size}
+        seen += 1
+        if respect_gitignore:
+            matches.append(row)
+        else:
+            heapq.heappush(matches, (st.st_mtime_ns, -seen, row))
+            if len(matches) > limit + 1:
+                heapq.heappop(matches)
     if respect_gitignore:
         matches, gi_warnings = apply_gitignore(base, matches)
         warnings.extend(gi_warnings)
-    matches.sort(key=lambda row: row["mtime_ns"], reverse=True)
+    if respect_gitignore:
+        matches.sort(key=lambda row: row["mtime_ns"], reverse=True)
+    else:
+        matches = [row for _, _, row in sorted(matches, reverse=True)]
     print(json.dumps({"status": "ok", "matches": matches[:limit], "truncated": len(matches) > limit, "warnings": warnings}, sort_keys=True))
     raise SystemExit(0)
 
@@ -281,34 +362,12 @@ if op == "grep":
             if after_context:
                 cmd.extend(["-A", str(after_context)])
         cmd.extend([pattern, str(base)])
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if proc.returncode not in (0, 1):
-            fail("failed", proc.stderr[-4000:])
-        lines = proc.stdout.splitlines()
-        if offset:
-            lines = lines[offset:]
-        truncated_line_count = 0
-        if output_mode == "content":
-            capped = []
-            for line in lines:
-                if len(line) > max_line_chars:
-                    line = line[:max_line_chars] + "<remote-dev line truncated>"
-                    truncated_line_count += 1
-                capped.append(line)
-            lines = capped
-        total_matches = None
-        if output_mode == "count_matches":
-            total_matches = sum(int(line.rsplit(":", 1)[1]) for line in lines if line.rsplit(":", 1)[-1].isdigit())
-        print(json.dumps({
-            "status": "ok",
-            "engine": "rg",
-            "output_mode": output_mode,
-            "offset": offset,
-            "matches": lines[:limit],
-            "total_matches": total_matches,
-            "truncated": len(lines) > limit,
-            "warnings": warnings + ([f"{truncated_line_count} line(s) truncated to {max_line_chars} chars"] if truncated_line_count else []),
-        }, sort_keys=True))
+        lines, truncated, total_matches, clipped = collect_page(cmd, output_mode, offset, limit, max_line_chars)
+        if clipped:
+            warnings.append(f"{clipped} line(s) truncated to {max_line_chars} chars")
+        print(json.dumps({"status": "ok", "engine": "rg", "output_mode": output_mode, "offset": offset,
+                          "matches": lines, "total_matches": total_matches, "truncated": truncated,
+                          "warnings": warnings}, sort_keys=True))
         raise SystemExit(0)
 
     # rg is unavailable: fall back to POSIX `grep -E`, which preserves regex
@@ -348,24 +407,22 @@ if op == "grep":
         # POSIX grep has no per-file match count. Find candidate files first,
         # then count -o matches per file. Never degrade to line counts: with
         # several matches on one line that would silently change semantics.
-        list_proc = subprocess.run([*cmd, "-l", "--", pattern, str(base)], capture_output=True, text=True, check=False)
-        if list_proc.returncode not in (0, 1):
-            fail("failed", list_proc.stderr[-4000:])
-        counts = []
-        total_matches = 0
+        import contextlib
+        counts, total_matches, count = [], 0, 0
         count_cmd = [grep_path, "-o", "-E"]
         if case_insensitive:
             count_cmd.append("-i")
-        for candidate in list_proc.stdout.splitlines():
-            sub = subprocess.run([*count_cmd, "--", pattern, candidate], capture_output=True, text=True, check=False)
-            if sub.returncode not in (0, 1):
-                fail("failed", sub.stderr[-4000:])
-            amount = len(sub.stdout.splitlines())
-            counts.append(f"{candidate}:{amount}")
-            total_matches += amount
-        if offset:
-            counts = counts[offset:]
-        print(json.dumps({"status": "ok", "engine": "grep", "output_mode": output_mode, "offset": offset, "matches": counts[:limit], "total_matches": total_matches, "truncated": len(counts) > limit, "warnings": warnings}, sort_keys=True))
+        with contextlib.closing(command_lines([*cmd, "-l", "--", pattern, str(base)])) as candidates:
+            for index, (candidate, _) in enumerate(candidates):
+                amount = sum(1 for _ in command_lines([*count_cmd, "--", pattern, candidate]))
+                total_matches += amount
+                if index >= offset:
+                    count += 1
+                    if len(counts) < limit:
+                        counts.append(f"{candidate}:{amount}")
+        print(json.dumps({"status": "ok", "engine": "grep", "output_mode": output_mode, "offset": offset,
+                          "matches": counts, "total_matches": total_matches, "truncated": count > limit,
+                          "warnings": warnings}, sort_keys=True))
         raise SystemExit(0)
     if output_mode == "files_with_matches":
         cmd.append("-l")
@@ -381,27 +438,12 @@ if op == "grep":
         if after_context:
             cmd.append(f"-A{after_context}")
     cmd.extend(["--", pattern, str(base)])
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if proc.returncode not in (0, 1):
-        fail("failed", proc.stderr[-4000:])
-    lines = proc.stdout.splitlines()
-    if offset:
-        lines = lines[offset:]
-    if output_mode == "count":
-        # Match rg -c behavior: only report files with at least one match.
-        lines = [line for line in lines if not line.endswith(":0")]
-    truncated_line_count = 0
-    if output_mode == "content":
-        capped = []
-        for line in lines:
-            if len(line) > max_line_chars:
-                line = line[:max_line_chars] + "<remote-dev line truncated>"
-                truncated_line_count += 1
-            capped.append(line)
-        lines = capped
-        if truncated_line_count:
-            warnings.append(f"{truncated_line_count} line(s) truncated to {max_line_chars} chars")
-    print(json.dumps({"status": "ok", "engine": "grep", "output_mode": output_mode, "offset": offset, "matches": lines[:limit], "total_matches": None, "truncated": len(lines) > limit, "warnings": warnings}, sort_keys=True))
+    lines, truncated, _, clipped = collect_page(cmd, output_mode, offset, limit, max_line_chars,
+                                                skip_zeros=output_mode == "count")
+    if clipped:
+        warnings.append(f"{clipped} line(s) truncated to {max_line_chars} chars")
+    print(json.dumps({"status": "ok", "engine": "grep", "output_mode": output_mode, "offset": offset,
+                      "matches": lines, "total_matches": None, "truncated": truncated, "warnings": warnings}, sort_keys=True))
     raise SystemExit(0)
 
 fail("unsupported_op", f"unsupported search op: {op}")
