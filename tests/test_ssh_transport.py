@@ -253,6 +253,9 @@ class SshMuxIsolationTests(unittest.TestCase):
         def fake_run(args, **kwargs):
             observed["args"] = args
             observed["kwargs"] = kwargs
+            if args[-2:] == ["bash", "-s"]:
+                self.assertEqual(kwargs["input"], b"echo hi")
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout=b'{"status":"ok"}', stderr=b"")
             if kwargs.get("text"):
                 return subprocess.CompletedProcess(args=args, returncode=0, stdout='{"status":"ok"}', stderr="")
             return subprocess.CompletedProcess(args=args, returncode=0, stdout=b"bytes-out", stderr=b"")

@@ -104,7 +104,7 @@ def _local_manifest(local_path: Path) -> dict[str, Any]:
             raise ValueError(f"local artifact symlinks are not allowed: {path}")
         stat = path.stat()
         files.append({
-            "relpath": "." if path == resolved else str(path.relative_to(resolved)),
+            "relpath": "." if path == resolved else path.relative_to(resolved).as_posix(),
             "path": str(path),
             "size": stat.st_size,
             "sha256": _sha256_file(path),

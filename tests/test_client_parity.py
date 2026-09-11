@@ -58,6 +58,13 @@ def run_grep(payload: dict, *, path_env: str | None = None) -> dict:
 
 
 class NormalizeArgumentsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        patcher = mock.patch.dict(os.environ, {"REMOTE_DEV_STATE_DIR": temporary.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_read_aliases_fold_into_canonical_fields(self) -> None:
         args = normalize_arguments("remote.read", {"path": "/a/b.py", "line_offset": -50, "n_lines": 40})
         self.assertEqual(args, {"file_path": "/a/b.py", "offset": -50, "limit": 40})
@@ -229,7 +236,8 @@ class RemoteGrepParityTests(unittest.TestCase):
     def grep_fallback_path(self) -> str:
         # A PATH containing grep but not rg forces the POSIX fallback branch.
         grep = shutil.which("grep")
-        assert grep, "grep must exist on this host"
+        if not grep:
+            self.skipTest("POSIX grep fallback requires a local grep executable")
         link_dir = self.tree / "bin"
         link_dir.mkdir(exist_ok=True)
         link = link_dir / "grep"
@@ -454,6 +462,7 @@ class InteractiveJobTests(unittest.TestCase):
         self.assertIn("not running", payload["text"])
 
 
+@unittest.skipIf(os.name == "nt", "remote Linux worker requires fcntl and FIFO semantics")
 class WorkerStdinActionTests(unittest.TestCase):
     """The worker's stdin control action is exercised locally (macOS-safe):
     job_status is stubbed, the FIFO and EOF marker are real filesystem objects.

@@ -44,6 +44,8 @@ class LedgerHarness:
     """Runs file_ops against a temporary root with an in-process 'remote'."""
 
     def __init__(self, test: unittest.TestCase) -> None:
+        if os.name == "nt":
+            test.skipTest("fake transport maps remote POSIX paths to a local Linux tree")
         self.tmp = tempfile.TemporaryDirectory()
         test.addCleanup(self.tmp.cleanup)
         base = Path(self.tmp.name).resolve()
@@ -82,6 +84,7 @@ def unique_content(gen: Gen, tag: str, count: int) -> str:
     return "".join(f"{tag}{i:02d} {gen.text('abcxyz ' + MULTIBYTE, 0, 8)}\n" for i in range(count))
 
 
+@unittest.skipIf(os.name == "nt", "fake transport maps POSIX remote paths to a local Linux tree")
 class StaleWriteGuardProperties(unittest.TestCase):
     def test_interleavings_are_judged_exactly_by_the_last_read_model(self) -> None:
         def body(gen: Gen, index: int) -> None:

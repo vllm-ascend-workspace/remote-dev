@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,14 @@ from remote_dev.mcp.schemas import TOOL_SCHEMAS, normalize_arguments
 from remote_dev.result import make_result
 
 TOOL_NAMES = tuple(name.removeprefix("remote.") for name in TOOL_SCHEMAS)
+
+
+def configure_cli_streams() -> None:
+    """The JSON CLI protocol uses UTF-8, including redirected Windows pipes."""
+    if os.name == "nt":
+        for stream in (sys.stdin, sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8")
 
 
 def add_endpoint_args(parser: argparse.ArgumentParser) -> None:
@@ -370,6 +379,7 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
 
 
 def run_tool_main(tool: str, argv: list[str] | None = None) -> int:
+    configure_cli_streams()
     parser = build_parser(tool)
     args = parser.parse_args(argv)
     try:
@@ -413,6 +423,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_cli_streams()
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] in {"-h", "--help"}:
         _build_root_parser().print_help()

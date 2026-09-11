@@ -180,7 +180,7 @@ def snapshot_tree(root: Path) -> dict[str, tuple[str, Any]]:
     """
     result: dict[str, tuple[str, Any]] = {}
     for path in sorted(root.rglob("*")):
-        rel = str(path.relative_to(root))
+        rel = path.relative_to(root).as_posix()
         if path.is_symlink():
             result[rel] = ("symlink", os.readlink(path))
         elif path.is_dir():

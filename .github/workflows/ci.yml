@@ -55,11 +55,11 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Install package
         run: python -m pip install -e ".[test]"
-      - name: Local subprocess, stream, process-control, and standalone tests
+      - name: All portable client contracts
         # No SSH server. These prove the local macOS/Windows client path:
         # pipe readers, process-group stop, control() JSON stdin shipping,
         # and ordinary job wrappers. Linux worker tests skip off Linux.
-        run: python -m pytest tests/test_ssh_transport.py tests/test_process_control.py tests/test_process_worker.py tests/test_job_ops.py tests/test_remote_bash.py tests/test_endpoint.py tests/test_required_modules.py tests/test_service_api_contract.py tests/test_cli_help.py
+        run: python -m pytest -q tests --junitxml=client-portability.xml
 
   wheel:
     name: Wheel install (P14)

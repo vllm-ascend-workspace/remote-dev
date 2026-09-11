@@ -302,6 +302,9 @@ the shared master (`ControlMaster=no`, `ControlPath=none`, `ControlPersist=no`
 on every SSH invocation from that process that does not set `ssh_mux`).
 Accepted values are unset, `1`, and `0`; any other value is a configuration
 error. Ordinary POSIX serving and parity calls keep the default shared mux.
+Native Windows CLI and MCP pipes use UTF-8. Shell script uploads preserve LF
+bytes, and nested artifact paths use POSIX separators on the Linux peer.
+
 On native Windows the transport chooses independent connections by itself
 because Win32-OpenSSH does not implement Client ControlMaster; do not set
 `ssh_mux=true` or `REMOTE_DEV_SSH_MUX=1` there.
