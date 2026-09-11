@@ -140,3 +140,16 @@ def test_idle_expiration_does_not_select_busy_entries(pool):
         entry.active = 0
         assert rpc._idle_connections(entry.last_used + rpc._IDLE_SECONDS + 1) == [entry.connection]
     entry.connection.close()
+
+
+def test_lru_uses_completion_order_when_clock_ticks_are_equal(pool):
+    first = Endpoint(host="a.example", port=22)
+    second = replace(first, host="z.example")
+    with mock.patch.object(rpc, "_POOL_LIMIT", 2), mock.patch.object(rpc.time, "monotonic", return_value=1):
+        invoke(first)
+        invoke(second)
+        entries = {entry.connection.endpoint.host: entry.connection for entry in rpc._pool.values()}
+        invoke(first)  # Same timer tick, but now newer than the second entry.
+        invoke(replace(first, host="third.example"))
+        assert entries[second.host].closed
+        assert not entries[first.host].closed

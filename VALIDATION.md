@@ -4,6 +4,12 @@ Last updated: 2026-09-12 (connection lifecycle, control capacity and runtime she
 
 ## Version 0.7 validation (2026-09-12)
 
+- Hosted Windows Python 3.9/3.12 exposed equal monotonic timer ticks in the
+  pool's LRU selection. A completion-order counter now breaks this ambiguity
+  without changing idle-expiry deadlines. A fixed-clock regression confirms
+  that reusing an entry protects it from eviction; the 17 affected pool/RPC
+  tests pass on Windows Python 3.9/3.13 and WSL Python 3.13.
+
 - WSL full suite: 428 passed, 2 skipped, 174 subtests passed. Native Windows
   full suite: 353 passed, 89 skipped, 146 subtests passed. The pool tests
   cover concurrent first calls, unrelated endpoint progress during slow open

@@ -8,6 +8,7 @@ from __future__ import annotations
 import atexit
 from collections import OrderedDict
 import contextlib
+import itertools
 import hashlib
 import json
 import queue
@@ -178,9 +179,11 @@ class _Entry:
     connection: object = None
     active: int = 0
     last_used: float = 0
+    use_order: int = 0
 
 
 _pool = {}
+_use_order = itertools.count(1)
 _pool_lock = threading.Condition()
 _POOL_LIMIT = 32
 _IDLE_SECONDS = 300
@@ -228,7 +231,7 @@ def _acquire(endpoint, key, deadline):
                 entry = None
             if entry is None:
                 if len(_pool) >= _POOL_LIMIT:
-                    idle = [(item.last_used, candidate) for candidate, item in _pool.items()
+                    idle = [(item.use_order, candidate) for candidate, item in _pool.items()
                             if item.connection is not None and not item.active]
                     if idle:
                         _, candidate = min(idle)
@@ -286,6 +289,7 @@ def request(endpoint, kind, source, payload, *, timeout_ms=45000):
         with _pool_lock:
             entry.active -= 1
             entry.last_used = time.monotonic()
+            entry.use_order = next(_use_order)
             _pool_lock.notify_all()
 
 
