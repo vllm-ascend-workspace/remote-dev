@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 
 from remote_dev.cli import TOOL_NAMES
@@ -14,6 +17,44 @@ def _cli(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 class CliHelpTests(unittest.TestCase):
+    def test_parser_feedback_does_not_import_transport_or_start_processes(self) -> None:
+        guard = '''
+import importlib.abc, sys
+class NoBackend(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.startswith("remote_dev.core.") and (fullname.endswith("_ops") or fullname.endswith("ssh_transport")):
+            raise AssertionError("parser loaded backend: " + fullname)
+sys.meta_path.insert(0, NoBackend())
+def audit(event, args):
+    if event in {"socket.connect", "subprocess.Popen", "os.system"}:
+        raise AssertionError("parser attempted side effect: " + event)
+sys.addaudithook(audit)
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sitecustomize.py").write_text(guard, encoding="utf-8")
+            home = root / "home"
+            home.mkdir()
+            env = os.environ.copy()
+            source = str(Path(__file__).resolve().parents[1])
+            env.update(PYTHONPATH=os.pathsep.join((str(root), source)), HOME=str(home), USERPROFILE=str(home))
+            for key in list(env):
+                if key.startswith("REMOTE_DEV_"):
+                    env.pop(key)
+            cases = [(["--help"], 0), (["--unknown-option"], 2), (["read"], 1)]
+            cases.extend(([name.replace("_", "-"), "--help"], 0) for name in TOOL_NAMES)
+            for argv, expected in cases:
+                with self.subTest(argv=argv):
+                    result = subprocess.run(
+                        [sys.executable, "-m", "remote_dev", *argv], env=env,
+                        capture_output=True, encoding="utf-8", timeout=15,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertNotIn("AssertionError", result.stdout + result.stderr)
+                    if argv == ["read"]:
+                        self.assertEqual(json.loads(result.stdout)["result"]["status"], "endpoint_required")
+            self.assertEqual(list(home.iterdir()), [])
+
     def test_cli_wrappers_have_help(self) -> None:
         expected = {name.removeprefix("remote.") for name in TOOL_SCHEMAS}
         self.assertEqual(set(TOOL_NAMES), expected)

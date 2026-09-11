@@ -8,14 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from remote_dev import package_version
-from remote_dev.core.artifact_ops import remote_artifact_manifest, remote_artifact_pull, remote_artifact_push
-from remote_dev.core.context_snapshot import remote_context_snapshot, remote_probe
 from remote_dev.core.endpoint import EndpointError, has_selector, resolve_endpoint
-from remote_dev.core.file_ops import remote_edit, remote_ls, remote_multi_edit, remote_read, remote_write
-from remote_dev.core.job_ops import remote_job_stdin, remote_job_status, remote_job_stop, remote_job_tail
-from remote_dev.core.patch_ops import remote_apply_patch
-from remote_dev.core.search_ops import remote_glob, remote_grep
-from remote_dev.core.shell_ops import remote_bash
 from remote_dev.mcp.schemas import TOOL_SCHEMAS, normalize_arguments
 from remote_dev.result import make_result
 
@@ -279,6 +272,8 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
         command = data.get("command") or args.command
         if not command:
             raise ValueError("remote.bash requires command (alias: cmd)")
+        from remote_dev.core.shell_ops import remote_bash
+
         return remote_bash(
             endpoint,
             command=command,
@@ -298,14 +293,20 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
         monitor_command = data.get("command") or args.command
         if not monitor_command:
             raise ValueError("remote.monitor requires command (alias: cmd)")
+        from remote_dev.core.shell_ops import remote_bash
+
         return remote_bash(endpoint, command=monitor_command, cwd=data.get("cwd"), description=data.get("description") or args.description, timeout_ms=timeout_ms, run_in_background=True, runtime_env=data.get("runtime_env"), env=data.get("env") if isinstance(data.get("env"), dict) else parse_env(args.env))
     if tool == "read":
         assert endpoint is not None
         file_path = data.get("file_path") or args.file_path
         if not file_path:
             raise ValueError("remote.read requires file_path (alias: path)")
+        from remote_dev.core.file_ops import remote_read
+
         return remote_read(endpoint, file_path=file_path, offset=int(data.get("offset", args.offset)), limit=int(data.get("limit", args.limit)), allow_symlink=bool(data.get("allow_symlink", args.allow_symlink)), client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
     if tool == "ls":
+        from remote_dev.core.file_ops import remote_ls
+
         assert endpoint is not None
         return remote_ls(endpoint, path=data.get("path") or args.path, limit=int(data.get("limit", args.limit)), all=bool(data.get("all", args.all)), timeout_ms=timeout_ms)
     if tool == "write":
@@ -316,12 +317,16 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
         file_path = data.get("file_path") or args.file_path
         if not file_path:
             raise ValueError("remote.write requires file_path (alias: path)")
+        from remote_dev.core.file_ops import remote_write
+
         return remote_write(endpoint, file_path=file_path, content=str(content or ""), overwrite=bool(data.get("overwrite", args.overwrite)), append=bool(data.get("append", args.append)), create_dirs=bool(data.get("create_dirs", args.create_dirs)), client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
     if tool == "edit":
         assert endpoint is not None
         file_path = data.get("file_path") or args.file_path
         if not file_path:
             raise ValueError("remote.edit requires file_path (alias: path)")
+        from remote_dev.core.file_ops import remote_edit
+
         return remote_edit(endpoint, file_path=file_path, old_string=data.get("old_string") if data.get("old_string") is not None else args.old_string, new_string=data.get("new_string") if data.get("new_string") is not None else args.new_string, replace_all=bool(data.get("replace_all", args.replace_all)), client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
     if tool == "multi_edit":
         assert endpoint is not None
@@ -331,11 +336,17 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
         file_path = data.get("file_path") or args.file_path
         if not file_path:
             raise ValueError("remote.multi_edit requires file_path (alias: path)")
+        from remote_dev.core.file_ops import remote_multi_edit
+
         return remote_multi_edit(endpoint, file_path=file_path, edits=edits or [], client_context_id=data.get("client_context_id") or args.client_context_id, timeout_ms=timeout_ms)
     if tool == "glob":
+        from remote_dev.core.search_ops import remote_glob
+
         assert endpoint is not None
         return remote_glob(endpoint, pattern=data.get("pattern") or args.pattern or "*", path=data.get("path") or args.path, limit=int(data.get("limit", args.limit)), respect_gitignore=bool(data.get("respect_gitignore", args.respect_gitignore)), timeout_ms=timeout_ms)
     if tool == "grep":
+        from remote_dev.core.search_ops import remote_grep
+
         assert endpoint is not None
         args_limit = args.head_limit if args.head_limit is not None else args.limit
         return remote_grep(endpoint, pattern=data.get("pattern") or args.pattern or "", path=data.get("path") or args.path, glob=data.get("glob") or args.glob, type=data.get("type") or args.type, output_mode=data.get("output_mode") or args.output_mode, multiline=bool(data.get("multiline", args.multiline)), case_insensitive=bool(data.get("case_insensitive", args.case_insensitive)), before_context=int(data.get("before_context") or args.before_context), after_context=int(data.get("after_context") or args.after_context), context_lines=int(data.get("context_lines") or args.context_lines), line_numbers=data.get("line_numbers", args.line_numbers), include_ignored=bool(data.get("include_ignored", args.include_ignored)), offset=int(data.get("offset") or args.offset), limit=int(data.get("limit", args_limit)), timeout_ms=timeout_ms)
@@ -344,14 +355,24 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
         patch = data.get("patch") or args.patch
         if patch is None and args.patch_file:
             patch = Path(args.patch_file).read_text(encoding="utf-8")
+        from remote_dev.core.patch_ops import remote_apply_patch
+
         return remote_apply_patch(endpoint, patch=patch, command=data.get("command") or args.command, cwd=data.get("cwd"), timeout_ms=timeout_ms)
     if tool == "job_status":
+        from remote_dev.core.job_ops import remote_job_status
+
         return remote_job_status(endpoint, job_id=data.get("job_id") or args.job_id)
     if tool == "job_tail":
+        from remote_dev.core.job_ops import remote_job_tail
+
         return remote_job_tail(endpoint, job_id=data.get("job_id") or args.job_id, lines=int(data.get("lines", args.lines)), stream=data.get("stream") or args.stream)
     if tool == "job_stop":
+        from remote_dev.core.job_ops import remote_job_stop
+
         return remote_job_stop(endpoint, job_id=data.get("job_id") or args.job_id, force=bool(data.get("force", args.force)))
     if tool == "job_stdin":
+        from remote_dev.core.job_ops import remote_job_stdin
+
         return remote_job_stdin(
             endpoint,
             job_id=data.get("job_id") or args.job_id,
@@ -361,18 +382,28 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
             max_output_tokens=(data.get("max_output_tokens") if data.get("max_output_tokens") is not None else args.max_output_tokens),
         )
     if tool == "artifact_manifest":
+        from remote_dev.core.artifact_ops import remote_artifact_manifest
+
         assert endpoint is not None
         return remote_artifact_manifest(endpoint, remote_path=data.get("remote_path") or args.remote_path, timeout_ms=timeout_ms)
     if tool == "artifact_pull":
+        from remote_dev.core.artifact_ops import remote_artifact_pull
+
         assert endpoint is not None
         return remote_artifact_pull(endpoint, remote_path=data.get("remote_path") or args.remote_path, local_dir=data.get("local_dir") or args.local_dir, timeout_ms=timeout_ms)
     if tool == "artifact_push":
+        from remote_dev.core.artifact_ops import remote_artifact_push
+
         assert endpoint is not None
         return remote_artifact_push(endpoint, local_path=data.get("local_path") or args.local_path, remote_path=data.get("remote_path") or args.remote_path, timeout_ms=timeout_ms)
     if tool == "context_snapshot":
+        from remote_dev.core.context_snapshot import remote_context_snapshot
+
         assert endpoint is not None
         return remote_context_snapshot(endpoint, timeout_ms=timeout_ms, live_probe=not bool(data.get("no_live_probe", args.no_live_probe)))
     if tool == "probe":
+        from remote_dev.core.context_snapshot import remote_probe
+
         assert endpoint is not None
         return remote_probe(endpoint, timeout_ms=timeout_ms, diagnose_connection=bool(data.get("diagnose_connection", args.diagnose_connection)))
     raise ValueError(f"unsupported tool: {tool}")

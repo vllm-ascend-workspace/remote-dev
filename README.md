@@ -28,6 +28,9 @@ Plus background jobs (`remote.job_status` / `job_tail` / `job_stop` /
 server (`remote-dev server`) and mirrored one-to-one by CLI subcommands.
 `python -m remote_dev` is equivalent to `remote-dev`.
 
+Help and parser errors do not import execution backends or contact endpoints.
+The selected operation loads its implementation after argument parsing.
+
 Runtime requirements: Python 3.9+ and an `ssh` client. No third-party
 packages. Nothing here needs GPU/NPU hardware; the remote host only needs
 `bash`, `python3`, and (for `remote.apply_patch` unified diffs) `git`.
