@@ -305,6 +305,16 @@ class McpSchemaTests(unittest.TestCase):
         self.assertEqual(response["id"], 1)
         self.assertIn("tools", response["result"])
 
+    def test_unknown_arguments_fail_before_executing_or_resolving_endpoint(self) -> None:
+        from remote_dev.mcp import tools as mcp_tools
+        with patch.object(mcp_tools, "resolve_endpoint") as resolve, patch.object(mcp_tools, "remote_bash") as run:
+            with self.assertRaisesRegex(ValueError, "unsupported argument.*wait.*Python SDK"):
+                mcp_tools.call_tool("remote.bash", {"command": "touch unwanted", "wait": True})
+            with self.assertRaisesRegex(ValueError, "unsupported argument.*overwite"):
+                mcp_tools.call_tool("remote.write", {"path": "/tmp/file", "content": "x", "overwite": True})
+            resolve.assert_not_called()
+            run.assert_not_called()
+
     def test_server_json_lines_lists_the_same_portable_schemas(self) -> None:
         request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
         proc = subprocess.run(

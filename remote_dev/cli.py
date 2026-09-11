@@ -266,6 +266,9 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
         data["limit"] = data["head_limit"]
     if "no_live_probe" in data:
         data["live_probe"] = not data.pop("no_live_probe")
+    # These flags are consumed by the CLI itself, not remote tool arguments.
+    for key in ("input_json", "selector", "long_stream", "content_file", "patch_file", "edits_json", "head_limit"):
+        data.pop(key, None)
     # JSON aliases override CLI defaults before the canonical dispatcher sees
     # them; otherwise an argparse default could shadow an explicit alias.
     explicit = normalize_arguments(f"remote.{tool}", load_input_json(args.input_json)) if args.input_json else {}

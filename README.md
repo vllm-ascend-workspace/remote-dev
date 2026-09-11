@@ -141,10 +141,24 @@ by both the MCP dispatcher and the CLI `--input-json` path):
   metadata is separate. Unreturned bytes remain at the cursor; full decoded
   logs accumulate in local refs as pages are consumed.
 - Developer calls reuse one binary SSH stdio connection on Windows and POSIX,
-  independently of OpenSSH ControlMaster. MCP processes up to eight calls
-  concurrently and accepts cancellation while another call waits. Source caches,
-  queued requests and endpoint connections are bounded. A lost reply is an
-  unknown outcome and is never automatically replayed.
+  independently of OpenSSH ControlMaster. Concurrent first calls to the same
+  endpoint share startup; different endpoints do not hold a global startup lock.
+  The 32-connection pool evicts idle LRU entries automatically and expires idle
+  connections after five minutes (reaped within another minute). Busy connections
+  are never evicted; capacity waits respect cancellation and the request deadline.
+  Both MCP and remote RPC reserve two workers/eight slots for status, stop, tail
+  and short stdin exchanges, alongside eight ordinary workers/32 slots. Long
+  waits cannot consume that control capacity. A lost reply remains an unknown
+  outcome and is never automatically replayed.
+- Explicit `runtime_env_file` runs once per command in that command's Bash
+  process, preserving functions, non-exported variables, PATH order and shell
+  options. Missing scripts or failed initialization prevent the user command.
+  Normal Bash startup (including BASH_ENV and SSH .bashrc behavior) is retained;
+  arbitrary dynamic initialization is never cached.
+- Tool arguments outside the published schema, native aliases and registered
+  endpoint selectors are rejected before execution. MCP `remote.bash` uses
+  `yield_time_ms` and continuation through `session_id`; `wait=True` is an SDK
+  option and is rejected on the MCP surface.
 - Reads scan in bounded memory. `verify_content=false` (CLI
   `--no-verify-content`) stops after a positive-offset log window and omits the
   hash/read ledger; the default retains a full hash and exact line count for

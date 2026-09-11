@@ -31,13 +31,15 @@ def main():
     module_lock = threading.Lock()
     capacity = threading.BoundedSemaphore(32)
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+    control_capacity = threading.BoundedSemaphore(8)
+    control_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
     def send(value):
         with output_lock:
             sys.stdout.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
             sys.stdout.flush()
 
-    def execute(message, cancelled):
+    def execute(message, cancelled, admission):
         identifier = message["id"]
         try:
             if cancelled.is_set():
@@ -95,7 +97,7 @@ def main():
         finally:
             with pending_lock:
                 pending.pop(identifier, None)
-            capacity.release()
+            admission.release()
 
     send({"id": 0, "ready": True, "protocol": 1})
     try:
@@ -117,18 +119,25 @@ def main():
             message["_source"] = codes[message["code_key"]]
             if len(codes) > 32:
                 codes.popitem(last=False)
-            if not capacity.acquire(blocking=False):
+            payload = message.get("payload") or {}
+            short_control = message.get("kind") == "control" and (
+                payload.get("action") in {"status", "tail", "stop", "stdin"}
+                or (payload.get("action") == "exchange" and int(payload.get("yield_time_ms") or 0) <= 250))
+            admission = control_capacity if short_control else capacity
+            selected_executor = control_executor if short_control else executor
+            if not admission.acquire(blocking=False):
                 send({"id": identifier, "error": {"type": "RuntimeError", "message": "RPC capacity exhausted; request was not executed"}})
                 continue
             cancelled = threading.Event()
             with pending_lock:
                 pending[identifier] = cancelled
-            executor.submit(execute, message, cancelled)
+            selected_executor.submit(execute, message, cancelled, admission)
     finally:
         with pending_lock:
             for event in pending.values():
                 event.set()
         executor.shutdown(wait=True)
+        control_executor.shutdown(wait=True)
 
 
 if __name__ == "__main__":

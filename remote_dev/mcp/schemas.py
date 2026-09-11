@@ -85,6 +85,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "file_path": {"type": "string"},
             "path": {"type": "string", "description": "Alias of file_path (Kimi/Cursor native Read habit)."},
             "verify_content": {"type": "boolean", "default": True, "description": "Compute full SHA256 and exact line count for edit concurrency. False bounds positive-offset log reads to the requested window and reports unknown total_lines when more data exists."},
+            "allow_symlink": {"type": "boolean", "default": False},
             "offset": {"type": "integer", "default": 1, "description": "1-based first line. Negative values count back from the end of the file."},
             "limit": {"type": "integer", "default": 200, "maximum": 500},
             "line_offset": {"type": "integer", "description": "Alias of offset (Kimi native Read habit)."},

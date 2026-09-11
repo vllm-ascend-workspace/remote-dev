@@ -69,6 +69,23 @@ sys.addaudithook(audit)
                 self.assertEqual(help_proc.returncode, 0, help_proc.stderr)
                 self.assertIn("usage:", help_proc.stdout)
 
+    def test_cli_consumes_local_input_files_before_tool_argument_validation(self) -> None:
+        from unittest import mock
+        from remote_dev import cli
+        from remote_dev.mcp import tools
+        with tempfile.TemporaryDirectory() as directory:
+            content = Path(directory) / "content.txt"
+            content.write_text("file body", encoding="utf-8")
+            arguments = Path(directory) / "arguments.json"
+            arguments.write_text(json.dumps({"file_path": "/tmp/example", "overwrite": True}), encoding="utf-8")
+            args = cli.build_parser("write").parse_args(["--host", "example.invalid", "--port", "22",
+                "--content-file", str(content), "--input-json", str(arguments)])
+            with mock.patch.object(tools, "remote_write", return_value={"ok": True}) as write:
+                self.assertEqual(cli.run_tool("write", args), {"ok": True})
+                self.assertEqual(write.call_args.kwargs["content"], "file body")
+                self.assertEqual(write.call_args.kwargs["file_path"], "/tmp/example")
+                self.assertTrue(write.call_args.kwargs["overwrite"])
+
     def test_cli_payload_maps_ssh_mux_keepalive_and_long_stream_flags(self) -> None:
         from remote_dev.cli import build_parser, endpoint_payload
 

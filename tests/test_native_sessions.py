@@ -145,6 +145,56 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(result["session_id"], result["job_id"])
         self.assertTrue(Path(result["refs"]["job_record"]).exists())
 
+    def test_long_poll_does_not_block_stdin_or_replay_consumed_output(self):
+        result = self.start(yield_time_ms=0)
+        entered, release = threading.Event(), threading.Event()
+        writes = []
+        def exchange(*args, **kwargs):
+            if kwargs.get("data"):
+                writes.append(kwargs["data"])
+            if kwargs.get("yield_time_ms") == 30000:
+                entered.set()
+                self.assertTrue(release.wait(3))
+            return self.control(*args, **kwargs)
+        with mock.patch.object(job_ops, "control", exchange), ThreadPoolExecutor(max_workers=2) as pool:
+            waiting = pool.submit(job_ops.remote_job_stdin, None, job_id=result["job_id"], yield_time_ms=30000)
+            self.assertTrue(entered.wait(2))
+            self.stdout = b"one response"
+            try:
+                reply = pool.submit(job_ops.remote_job_stdin, None, job_id=result["job_id"],
+                                    chars="input", yield_time_ms=0).result(timeout=2)["result"]
+                self.assertEqual(reply["preview"]["stdout"], "one response")
+            finally:
+                release.set()
+            self.assertEqual(waiting.result(timeout=2)["result"]["preview"]["stdout"], "")
+        self.assertEqual(writes, ["input"])
+
+    def test_conflicting_long_input_exchange_never_sends_input_twice(self):
+        result = self.start(yield_time_ms=0)
+        entered, release = threading.Event(), threading.Event()
+        writes = []
+        def exchange(*args, **kwargs):
+            if kwargs.get("data"):
+                writes.append(kwargs["data"])
+            if kwargs.get("yield_time_ms") == 30000:
+                entered.set()
+                self.assertTrue(release.wait(3))
+            return self.control(*args, **kwargs)
+        with mock.patch.object(job_ops, "control", exchange), ThreadPoolExecutor(max_workers=2) as pool:
+            waiting = pool.submit(job_ops.remote_job_stdin, None, job_id=result["job_id"],
+                                  chars="input", yield_time_ms=30000)
+            self.assertTrue(entered.wait(2))
+            self.stdout = b"consumed"
+            try:
+                reply = job_ops.remote_job_stdin(None, job_id=result["job_id"], yield_time_ms=0)["result"]
+                self.assertEqual(reply["preview"]["stdout"], "consumed")
+            finally:
+                release.set()
+            reply = waiting.result(timeout=2)["result"]
+            self.assertEqual(reply["preview"]["stdout"], "")
+            self.assertEqual(reply["stdin"]["written_chars"], 5)
+        self.assertEqual(writes, ["input"])
+
     def test_wait_mode_uses_same_session_and_preserves_full_logs(self):
         self.done, self.stdout = True, b"x" * 40000
         result = self.start(wait=True, max_output_tokens=64)
@@ -168,6 +218,28 @@ class SessionTests(unittest.TestCase):
 
 
 class McpConcurrencyTests(unittest.TestCase):
+    def test_control_calls_have_reserved_slots_under_full_wait_queue(self):
+        finished = threading.Event()
+        responses = []
+        def tool(name, args):
+            if name == "remote.bash":
+                current_event().wait(5)
+            else:
+                finished.set()
+            return {"text": name, "result": {"outcome": "success"}}
+        with mock.patch.object(server, "call_tool", tool), mock.patch.object(server, "runtime_status", return_value={}), \
+                mock.patch.object(server, "send", lambda value, **kwargs: responses.append(value)):
+            dispatcher = server.Dispatcher()
+            try:
+                for identifier in range(32):
+                    dispatcher.dispatch({"id": identifier, "method": "tools/call", "params": {"name": "remote.bash"}})
+                self.assertEqual(len(dispatcher.pending), 32)
+                dispatcher.dispatch({"id": 40, "method": "tools/call", "params": {"name": "remote_job_stop"}})
+                self.assertTrue(finished.wait(2))
+            finally:
+                dispatcher.close()
+        self.assertEqual(responses[0]["id"], 40)
+
     def test_fast_call_overtakes_slow_call_and_cancellation_is_scoped(self):
         slow_started = threading.Event()
         fast_finished = threading.Event()
