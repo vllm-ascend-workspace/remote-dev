@@ -51,6 +51,12 @@ def control(endpoint: Endpoint | Mapping[str, Any], job_id: str, action: str, **
     ``authorization`` value; this package does not interpret resource-lease
     or fence semantics. Return value is the structured supervisor dict
     (``state``, ``quiet``, ``receipt``, ...).
+
+    ``spec.prepared_timeout_seconds`` bounds waiting for ``go`` independently
+    of command execution, defaulting to 120 seconds. It must be a number in
+    ``[1, 86400]``. A coordinator that queues prepared jobs must explicitly set
+    this to its bounded queue/activation window; local lease heartbeats do not
+    extend it. ``timeout_seconds`` starts when the gated command is launched.
     """
     if action not in ACTIONS:
         raise ValueError(f"unsupported job action: {action}")

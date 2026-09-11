@@ -110,6 +110,34 @@ class ProcessWorkerTests(unittest.TestCase):
         self.assertFalse(after["quiet"])
         self.assertEqual(before["receipt"]["pid"], after["receipt"]["pid"])
 
+    def test_explicit_prepared_deadline_expires_without_running_command(self):
+        identifier, prepared = self.prepare("p", "touch should-not-run", prepared_timeout_seconds=1)
+        self.assertEqual(prepared["receipt"]["prepared_timeout_seconds"], 1)
+        result = self.until(identifier, lambda row: row["quiet"])
+        self.assertEqual(result["state"], "cancelled")
+        self.assertEqual(result["result"]["reason"], "start gate not opened")
+        self.assertFalse((self.root / "should-not-run").exists())
+        with self.assertRaisesRegex(RuntimeError, "not a verified waiting supervisor"):
+            self.go(identifier)
+
+    def test_prepared_wait_does_not_consume_command_runtime_timeout(self):
+        identifier, _ = self.prepare("q", "printf ran > completed", timeout=0.2, prepared_timeout_seconds=2)
+        time.sleep(0.4)
+        self.assertEqual(self.call(identifier, "status")["state"], "prepared")
+        self.go(identifier)
+        self.assertEqual(self.until(identifier, lambda row: row["quiet"])["state"], "succeeded")
+        self.assertEqual((self.root / "completed").read_text(), "ran")
+
+    def test_prepared_deadline_default_long_override_and_invalid_values(self):
+        _, default = self.prepare("r", "true")
+        self.assertEqual(default["receipt"]["prepared_timeout_seconds"], 120)
+        _, queued = self.prepare("s", "true", prepared_timeout_seconds=7200)
+        self.assertEqual(queued["receipt"]["prepared_timeout_seconds"], 7200)
+        for value in (None, 0, 0.5, -1, True, 86401, float("inf"), float("nan"), "120"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "prepared_timeout_seconds"):
+                self.call("job-invalid-timeout", "prepare", spec={"cwd":str(self.root), "command":"true",
+                          "env":{}, "timeout_seconds":10, "prepared_timeout_seconds":value})
+
     def test_stop_before_go_never_executes_and_unknown_receipt_is_not_free(self):
         identifier, _ = self.prepare("a", "touch should-not-exist")
         self.call(identifier, "stop", force=True)

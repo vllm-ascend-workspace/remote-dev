@@ -155,6 +155,11 @@ by both the MCP dispatcher and the CLI `--input-json` path):
   options. Missing scripts or failed initialization prevent the user command.
   Normal Bash startup (including BASH_ENV and SSH .bashrc behavior) is retained;
   arbitrary dynamic initialization is never cached.
+- Managed callers using `processes.control(..., "prepare", spec=...)` can set
+  `prepared_timeout_seconds` (default 120, between 1 and 86400 seconds) for their
+  bounded queue/activation wait. Expiration cancels the unopened gate without
+  running user code. Command `timeout_seconds` starts after activation; a lease
+  heartbeat does not implicitly extend the remote prepared deadline.
 - Tool arguments outside the published schema, native aliases and registered
   endpoint selectors are rejected before execution. MCP `remote.bash` uses
   `yield_time_ms` and continuation through `session_id`; `wait=True` is an SDK

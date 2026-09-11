@@ -39,6 +39,11 @@ Last updated: 2026-09-12 (connection lifecycle, control capacity and runtime she
 - Removed the redundant CI `validate --local-only` step (compileall and schema
   assertions already exercised by tests). Platform tests and clean wheel
   installation remain required.
+- A managed-group follow-up adds `spec.prepared_timeout_seconds`, a separate
+  1–86400 second gate wait (default 120). The affected Linux worker/control/
+  session suite passes 43 tests, including expiry without command execution,
+  a prepared wait longer than the command timeout followed by successful
+  activation, and default/long/invalid timeout contracts.
 
 ## Version 0.6 validation (2026-09-11)
 
