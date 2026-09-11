@@ -309,3 +309,25 @@ Parser and client parity tests: 46 passed, 13 platform skips, 41 subtests. Fresh
 subprocess guards cover all 19 tool help paths plus parser failures, rejecting
 execution imports, sockets and child processes and checking for home-directory
 side effects. These are client feedback measurements, not SSH or NPU results.
+
+## Connection feedback (2026-09-11)
+
+Ten alternating pairs on a Windows client and one Linux SSH endpoint compared
+three separate related read-only queries with one request gathering the same
+OS/cwd/Python facts. Native independent connections were used in both arms.
+Median total latency was 13.768 versus 4.601 seconds (67% lower); sample p95
+was 14.167 versus 4.740 seconds. At ten samples p95 is the sample maximum;
+this is exploratory endpoint-specific evidence, not a general network SLA.
+Returned facts matched in every pair. The new diagnostic batches those facts
+in its one fixed request, without importing model/device libraries.
+
+Three real diagnostic probes succeeded. Total SSH duration ranged 4.587-4.818
+seconds, TCP milestone 0.300-0.584 seconds, and authentication milestone
+2.891-3.170 seconds. The fixed remote facts query took about 0.012 ms;
+stream drain/exit took 5.7-7.1 ms. Milestones are local receive timestamps,
+not packet-level measurements. Unknown transfer/decode time in traced mode is
+not fabricated. Raw private endpoint identities remain in local receipts.
+
+Mocked/local-pipe tests cover successful and timed-out transport, milestone
+ordering, output preservation, absent phase information, fixed-probe batching,
+and no business-command replay. These tests do not establish NPU behavior.

@@ -198,6 +198,7 @@ def remote_bash(
         extra={
             "exit_code": completed.returncode,
             "connection": {**ssh_details(endpoint, timeout_ms),
+                           "timings": completed.timings,
                            "remote_outcome": "unknown" if completed.timed_out or completed.returncode == 255 else "reported"},
             "timed_out": completed.timed_out,
             "command_preview": command[:500],
