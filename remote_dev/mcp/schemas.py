@@ -254,7 +254,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "remote.artifact_pull": schema({"remote_path": {"type": "string"}, "local_dir": {"type": "string"}}, ["remote_path"]),
     "remote.artifact_push": schema({"local_path": {"type": "string"}, "remote_path": {"type": "string"}}, ["local_path", "remote_path"]),
     "remote.context_snapshot": schema({"live_probe": {"type": "boolean", "default": True}}),
-    "remote.probe": schema({}),
+    "remote.probe": schema({"diagnose_connection": {"type": "boolean", "default": False, "description": "Compare SSH connections with a fixed read-only probe; never replays a business command."}}),
 }
 
 ALIASES: dict[str, str] = {name.replace(".", "_"): name for name in TOOL_SCHEMAS}

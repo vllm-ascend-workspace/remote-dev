@@ -11,6 +11,10 @@ os.environ.setdefault("REMOTE_DEV_SESSION_ID", f"mcp-{os.getpid()}-{uuid.uuid4()
 
 from remote_dev import package_version
 from remote_dev.mcp.tools import call_tool, list_resources, list_tools, read_resource
+from remote_dev.runtime import process_identity, runtime_status
+
+LOADED_RUNTIME = process_identity("vaws-remote-dev")
+LOADED_VERSION = package_version()
 
 
 def encode_payload(payload: dict[str, Any]) -> bytes:
@@ -55,7 +59,7 @@ def handle(message: dict[str, Any], *, framed: bool = False) -> None:
                         "tools": {},
                         "resources": {},
                     },
-                    "serverInfo": {"name": "remote-dev", "version": package_version()},
+                    "serverInfo": {"name": "remote-dev", "version": LOADED_VERSION},
                 },
                 framed=framed,
             )
@@ -69,6 +73,7 @@ def handle(message: dict[str, Any], *, framed: bool = False) -> None:
             if not isinstance(arguments, dict):
                 raise ValueError("tools/call arguments must be an object")
             payload = call_tool(name, arguments)
+            payload["result"]["runtime"] = runtime_status(LOADED_RUNTIME)
             result(
                 request_id,
                 {

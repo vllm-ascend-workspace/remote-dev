@@ -88,7 +88,16 @@ def _duration_ms(start: float) -> int:
     return int(round((time.monotonic() - start) * 1000))
 
 
-def remote_probe(endpoint: Endpoint, *, timeout_ms: int = 120000) -> dict[str, Any]:
+def remote_probe(endpoint: Endpoint, *, timeout_ms: int = 120000, diagnose_connection: bool = False) -> dict[str, Any]:
+    if diagnose_connection:
+        from remote_dev.diagnostics import diagnose_ssh
+        diagnosis = diagnose_ssh(endpoint, timeout_ms=timeout_ms)
+        snapshot = write_context_snapshot(endpoint, {"connection": diagnosis})
+        result = make_result(tool="remote.probe", target=endpoint.to_result_target(),
+                             outcome="failed" if diagnosis["status"] == "unavailable" else "success",
+                             status=diagnosis["status"], summary="Read-only SSH connection diagnostic.",
+                             refs=snapshot["refs"], next=diagnosis["next"], extra={"connection": diagnosis})
+        return {"text": result["summary"], "result": result}
     started = utc_now_iso()
     start = time.monotonic()
     data = run_remote_python(endpoint, REMOTE_PROBE_PY, {"root": endpoint.root}, timeout_ms=timeout_ms)

@@ -14,6 +14,7 @@ from remote_dev.result import make_result, new_invocation_id, utc_now_iso
 from .runtime_env import runtime_env_lines
 from .ssh_transport import run_script
 from .state_store import atomic_write_json, atomic_write_text, new_log_dir
+from remote_dev.diagnostics import ssh_details
 
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -196,6 +197,8 @@ def remote_bash(
         refs={"stdout": str(stdout_path), "stderr": str(stderr_path), "metadata": str(result_path)},
         extra={
             "exit_code": completed.returncode,
+            "connection": {**ssh_details(endpoint, timeout_ms),
+                           "remote_outcome": "unknown" if completed.timed_out or completed.returncode == 255 else "reported"},
             "timed_out": completed.timed_out,
             "command_preview": command[:500],
             "environment": {"runtime_env": runtime_enabled, "runtime_env_file": endpoint.runtime_env_file, "env_keys": sorted(env), "timeout_ms": timeout_ms},
