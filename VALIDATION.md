@@ -293,3 +293,5 @@ portable schemas documented above; endpoint validation remains server-enforced.
 - `ascend-memory-profiling` was not run end-to-end because profiling collection
   already covered real profiler artifacts, and the memory-profiling collision
   risk is now covered by local run-dir regression tests.
+
+Runtime feedback coverage: `tests/test_diagnostics.py` checks read-only mux comparison, explicit direct HTTP, HTTP 502 classification, URL diagnostic redaction, and immutable startup identity across installation changes. Transport fixtures remain local; these tests do not establish an Ascend runtime result.

@@ -424,3 +424,20 @@ See [DESIGN.md](DESIGN.md) for the architecture and
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Runtime feedback and connection checks
+
+MCP responses report the process-start package identity separately from the
+currently installed distribution. A `restart_required` status means the native
+client must restart that MCP server; changing installed files does not reload it.
+The source commit is unknown when distribution metadata does not provide it.
+
+`remote-dev probe --host HOST --port PORT --diagnose-connection` runs a fixed,
+read-only SSH probe. After a failed multiplexed probe it compares an independent
+connection, and may suggest `ssh_mux=false`. It never replays the business command
+or changes global SSH configuration. Foreground bash results expose the actual
+connection mode and timeout. A timeout or exit 255 leaves remote outcome unknown.
+
+`remote_dev.diagnostics.open_http` selects `direct` or `environment` proxy use
+per call. Its companion diagnostics strip URL credentials and query parameters,
+and distinguish HTTP status from DNS, timeout and connection errors.

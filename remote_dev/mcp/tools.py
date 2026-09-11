@@ -312,5 +312,5 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
         return remote_context_snapshot(endpoint, timeout_ms=timeout_ms, live_probe=bool(args.get("live_probe", True)))
     if name == "remote.probe":
         assert endpoint is not None
-        return remote_probe(endpoint, timeout_ms=timeout_ms)
+        return remote_probe(endpoint, timeout_ms=timeout_ms, diagnose_connection=bool(args.get("diagnose_connection", False)))
     raise KeyError(f"unknown remote-dev tool: {name}")

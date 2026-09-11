@@ -243,7 +243,7 @@ def build_parser(tool: str) -> argparse.ArgumentParser:
     elif tool == "context_snapshot":
         parser.add_argument("--no-live-probe", action="store_true")
     elif tool == "probe":
-        pass
+        parser.add_argument("--diagnose-connection", action="store_true")
     return parser
 
 
@@ -365,7 +365,7 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
         return remote_context_snapshot(endpoint, timeout_ms=timeout_ms, live_probe=not bool(data.get("no_live_probe", args.no_live_probe)))
     if tool == "probe":
         assert endpoint is not None
-        return remote_probe(endpoint, timeout_ms=timeout_ms)
+        return remote_probe(endpoint, timeout_ms=timeout_ms, diagnose_connection=bool(data.get("diagnose_connection", args.diagnose_connection)))
     raise ValueError(f"unsupported tool: {tool}")
 
 
