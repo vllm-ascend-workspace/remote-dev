@@ -295,3 +295,17 @@ portable schemas documented above; endpoint validation remains server-enforced.
   risk is now covered by local run-dir regression tests.
 
 Runtime feedback coverage: `tests/test_diagnostics.py` checks read-only mux comparison, explicit direct HTTP, HTTP 502 classification, URL diagnostic redaction, and immutable startup identity across installation changes. Transport fixtures remain local; these tests do not establish an Ascend runtime result.
+
+## CLI feedback (2026-09-11)
+
+On Windows/Python 3.13.12, 20 alternating baseline/candidate fresh-process samples
+against `34a460d` measured root-help median 189 to 161 ms (p95 203 to 173 ms),
+read-help 178 to 152 ms, invalid options 191 to 163 ms, and missing endpoints
+177 to 151 ms. Both revisions used source worktrees and identical dependencies.
+Output and exit codes matched; generated result metadata was excluded from the
+structured endpoint-error comparison. OS caches were not reset.
+
+Parser and client parity tests: 46 passed, 13 platform skips, 41 subtests. Fresh
+subprocess guards cover all 19 tool help paths plus parser failures, rejecting
+execution imports, sockets and child processes and checking for home-directory
+side effects. These are client feedback measurements, not SSH or NPU results.
