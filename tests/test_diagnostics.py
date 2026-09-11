@@ -1,3 +1,5 @@
+import os
+import pytest
 from unittest.mock import patch
 import socket
 import urllib.error
@@ -9,6 +11,7 @@ from remote_dev.diagnostics import diagnose_ssh, http_connection, http_failure, 
 from remote_dev.runtime import process_identity, runtime_status
 
 
+@pytest.mark.skipif(os.name == "nt", reason="ControlMaster is unsupported by Win32 OpenSSH")
 def test_mux_probe_never_replays_caller_command():
     endpoint = resolve_endpoint({"host": "192.0.2.1", "port": 22, "root": "/", "ssh_mux": True})
     with patch("remote_dev.diagnostics.run_script", side_effect=[

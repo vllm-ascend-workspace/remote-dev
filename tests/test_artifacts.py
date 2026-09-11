@@ -49,7 +49,7 @@ class ArtifactTests(unittest.TestCase):
         endpoint = Endpoint(host="1.2.3.4", port=46000)
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "target.txt"
-            target.write_text("secret\n", encoding="utf-8")
+            (target).write_bytes(("secret\n").encode("utf-8"))
             link = Path(tmp) / "link.txt"
             link.symlink_to(target)
             payload = artifact_ops.remote_artifact_push(
@@ -67,7 +67,7 @@ class ArtifactTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 local = Path(tmp) / "artifact.txt"
-                local.write_text("payload\n", encoding="utf-8")
+                (local).write_bytes(("payload\n").encode("utf-8"))
                 expected = artifact_ops._sha256_file(local)
 
                 def fake_run_bytes(_endpoint, command, *, stdin=None, timeout_ms=None):

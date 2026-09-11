@@ -140,6 +140,10 @@ def read_line_messages() -> int:
 
 
 def main() -> int:
+    if os.name == "nt":
+        for stream in (sys.stdin, sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8")
     try:
         peeked = sys.stdin.buffer.peek(16)
     except AttributeError:

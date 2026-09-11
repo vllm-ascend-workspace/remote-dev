@@ -58,6 +58,13 @@ def run_grep(payload: dict, *, path_env: str | None = None) -> dict:
 
 
 class NormalizeArgumentsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        patcher = mock.patch.dict(os.environ, {"REMOTE_DEV_STATE_DIR": temporary.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_read_aliases_fold_into_canonical_fields(self) -> None:
         args = normalize_arguments("remote.read", {"path": "/a/b.py", "line_offset": -50, "n_lines": 40})
         self.assertEqual(args, {"file_path": "/a/b.py", "offset": -50, "limit": 40})
@@ -222,6 +229,8 @@ class RemoteGrepParityTests(unittest.TestCase):
         (hidden / "c.py").write_text("alpha in hidden\n", encoding="utf-8")
 
     def grep(self, path_env: str | None = None, **overrides) -> dict:
+        if os.name == "nt" and shutil.which("rg") is None:
+            self.skipTest("native Windows search fixture requires ripgrep")
         payload = {"op": "grep", "root": str(self.tree), "cwd": str(self.tree), "path": str(self.tree), "pattern": "alpha"}
         payload.update(overrides)
         return run_grep(payload, path_env=path_env)
@@ -229,7 +238,8 @@ class RemoteGrepParityTests(unittest.TestCase):
     def grep_fallback_path(self) -> str:
         # A PATH containing grep but not rg forces the POSIX fallback branch.
         grep = shutil.which("grep")
-        assert grep, "grep must exist on this host"
+        if not grep:
+            self.skipTest("POSIX grep fallback requires a local grep executable")
         link_dir = self.tree / "bin"
         link_dir.mkdir(exist_ok=True)
         link = link_dir / "grep"
@@ -237,15 +247,22 @@ class RemoteGrepParityTests(unittest.TestCase):
             link.symlink_to(grep)
         return str(link_dir)
 
+    def search_paths(self):
+        # The grep-only symlink/PATH fixture emulates a POSIX remote host.
+        # Native Windows still exercises rg even when that fixture is unavailable.
+        yield None
+        if os.name != "nt" and shutil.which("grep"):
+            yield self.grep_fallback_path()
+
     def test_case_insensitive_content(self) -> None:
-        for env in (None, self.grep_fallback_path()):
+        for env in self.search_paths():
             data = self.grep(env, output_mode="content", case_insensitive=True)
             self.assertEqual(data["status"], "ok")
             joined = "\n".join(data["matches"])
             self.assertIn("Alpha", joined)
 
     def test_context_lines(self) -> None:
-        for env in (None, self.grep_fallback_path()):
+        for env in self.search_paths():
             data = self.grep(env, output_mode="content", pattern="beta", context_lines=1)
             joined = "\n".join(data["matches"])
             self.assertIn("Alpha", joined)
@@ -273,9 +290,10 @@ class RemoteGrepParityTests(unittest.TestCase):
         self.assertEqual(default["matches"], [])
         included = self.grep(None, output_mode="content", case_insensitive=True, pattern="alpha in hidden", include_ignored=True)
         self.assertTrue(any("c.py" in line for line in included["matches"]))
-        fallback = self.grep(self.grep_fallback_path(), output_mode="content", case_insensitive=True, pattern="alpha in hidden", include_ignored=True)
-        self.assertTrue(any("c.py" in line for line in fallback["matches"]))
-        self.assertTrue(any("gitignore" in warning for warning in fallback["warnings"]))
+        if os.name != "nt" and shutil.which("grep"):
+            fallback = self.grep(self.grep_fallback_path(), output_mode="content", case_insensitive=True, pattern="alpha in hidden", include_ignored=True)
+            self.assertTrue(any("c.py" in line for line in fallback["matches"]))
+            self.assertTrue(any("gitignore" in warning for warning in fallback["warnings"]))
 
     def test_count_and_count_matches_are_semantically_distinct(self) -> None:
         # Distinguishing input: one line holds two matches of the pattern.
@@ -283,11 +301,11 @@ class RemoteGrepParityTests(unittest.TestCase):
         # rg --count-matches) counts *matches*.
         multi = self.tree / "multi.txt"
         multi.write_text("aa\nbb\n", encoding="utf-8")
-        for env in (None, self.grep_fallback_path()):
+        for env in self.search_paths():
             lines = self.grep(env, output_mode="count", pattern="a", glob="multi.txt")
             matches = self.grep(env, output_mode="count_matches", pattern="a", glob="multi.txt")
-            self.assertEqual(lines["matches"], [f"{multi}:1"], f"env={env}")
-            self.assertEqual(matches["matches"], [f"{multi}:2"], f"env={env}")
+            self.assertEqual([row.replace("\\", "/") for row in lines["matches"]], [f"{multi.as_posix()}:1"], f"env={env}")
+            self.assertEqual([row.replace("\\", "/") for row in matches["matches"]], [f"{multi.as_posix()}:2"], f"env={env}")
             self.assertEqual(matches["total_matches"], 2, f"env={env}")
             self.assertIsNone(lines["total_matches"], f"env={env}")
 
@@ -454,6 +472,7 @@ class InteractiveJobTests(unittest.TestCase):
         self.assertIn("not running", payload["text"])
 
 
+@unittest.skipIf(os.name == "nt", "remote Linux worker requires fcntl and FIFO semantics")
 class WorkerStdinActionTests(unittest.TestCase):
     """The worker's stdin control action is exercised locally (macOS-safe):
     job_status is stubbed, the FIFO and EOF marker are real filesystem objects.

@@ -98,7 +98,7 @@ class GlobCompatibilityTests(unittest.TestCase):
 
     def test_plain_glob_stays_under_explicit_nested_base_from_unrelated_cwd(self) -> None:
         data = self.load_ok(self.run_glob(self.nested, "*.txt"))
-        relpaths = {row["relpath"] for row in data["matches"]}
+        relpaths = {Path(row["relpath"]).as_posix() for row in data["matches"]}
         self.assertEqual(relpaths, {"keep.txt"})
         row = data["matches"][0]
         self.assertEqual(Path(row["path"]), self.nested / "keep.txt")
@@ -109,7 +109,7 @@ class GlobCompatibilityTests(unittest.TestCase):
 
     def test_recursive_glob_includes_direct_and_nested_txt(self) -> None:
         data = self.load_ok(self.run_glob(self.nested, "**/*.txt"))
-        relpaths = {row["relpath"] for row in data["matches"]}
+        relpaths = {Path(row["relpath"]).as_posix() for row in data["matches"]}
         self.assertEqual(relpaths, {"keep.txt", "deep/buried.txt"})
         paths = {row["path"] for row in data["matches"]}
         self.assertEqual(paths, {str(self.nested / "keep.txt"), str(self.nested / "deep" / "buried.txt")})
@@ -125,11 +125,11 @@ class GlobCompatibilityTests(unittest.TestCase):
         (base / "skip.py").write_text("skip\n", encoding="utf-8")
 
         plain = self.load_ok(self.run_glob(base, "*.txt"))
-        self.assertEqual({row["relpath"] for row in plain["matches"]}, {"hit.txt"})
+        self.assertEqual({Path(row["relpath"]).as_posix() for row in plain["matches"]}, {"hit.txt"})
         self.assertEqual(Path(plain["matches"][0]["path"]), base / "hit.txt")
 
         recursive = self.load_ok(self.run_glob(base, "**/*.txt"))
-        self.assertEqual({row["relpath"] for row in recursive["matches"]}, {"hit.txt", "inner/deep.txt"})
+        self.assertEqual({Path(row["relpath"]).as_posix() for row in recursive["matches"]}, {"hit.txt", "inner/deep.txt"})
         for row in recursive["matches"]:
             self.assertEqual(Path(row["path"]), base / row["relpath"])
             self.assertIn("base [literal]", row["path"])
@@ -149,7 +149,7 @@ class GlobCompatibilityTests(unittest.TestCase):
 
         listing = self.load_ok(self.run_glob(base, "*"))
         self.assertFalse(listing["truncated"])
-        relpaths = [row["relpath"] for row in listing["matches"]]
+        relpaths = [Path(row["relpath"]).as_posix() for row in listing["matches"]]
         self.assertEqual(relpaths, ["newest.txt", "mid_dir", "oldest.txt"])
 
         newest_row, mid_row, oldest_row = listing["matches"]
@@ -191,7 +191,7 @@ class GlobCompatibilityTests(unittest.TestCase):
         self.assertIn("root_dir", binding.stderr)
 
         data = self.load_ok(self.run_glob(self.nested, "**/*.txt", shim=True))
-        self.assertEqual({row["relpath"] for row in data["matches"]}, {"keep.txt", "deep/buried.txt"})
+        self.assertEqual({Path(row["relpath"]).as_posix() for row in data["matches"]}, {"keep.txt", "deep/buried.txt"})
         for row in data["matches"]:
             self.assertEqual(Path(row["path"]), self.nested / row["relpath"])
 

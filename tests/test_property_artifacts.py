@@ -13,6 +13,7 @@ that serve (and optionally corrupt) bytes from that tree.
 from __future__ import annotations
 
 import hashlib
+import os
 import shlex
 import subprocess
 import sys
@@ -113,6 +114,7 @@ def mutate(gen: Gen, root: Path, files: dict[str, bytes]) -> tuple[str, dict[str
     return kind, updated
 
 
+@unittest.skipIf(os.name == "nt", "in-process remote manifest uses Linux filesystem paths")
 class ManifestProperties(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -349,6 +351,7 @@ def corruption(gen: Gen) -> Any:
     return lambda data: b"" if data else b"\x00"
 
 
+@unittest.skipIf(os.name == "nt", "fake transport maps remote POSIX roots to local Linux roots")
 class TransferProperties(unittest.TestCase):
     def test_pull_never_lands_a_file_whose_bytes_disagree_with_the_manifest(self) -> None:
         def body(gen: Gen, _index: int) -> None:

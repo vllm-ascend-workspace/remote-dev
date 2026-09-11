@@ -195,14 +195,14 @@ class ExecutorModel:
         for rel, content in self.files.items():
             target = root / rel
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            (target).write_bytes((content).encode("utf-8"))
 
     def snapshot(self) -> dict[str, bytes]:
         return {rel: content.encode("utf-8") for rel, content in self.files.items()}
 
 
 def tree_files(root: Path) -> dict[str, bytes]:
-    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
 
 
 def generate_valid_op(gen: Gen, model: ExecutorModel, tag: str) -> dict[str, Any]:
@@ -334,7 +334,7 @@ class CodexExecutorProperties(unittest.TestCase):
 
     def test_zero_ops_and_repeated_ops_are_handled_without_side_effects(self) -> None:
         root = self._root(0)
-        (root / "a.py").write_text("L1 x\nL2 y\n", encoding="utf-8")
+        (root / "a.py").write_bytes(("L1 x\nL2 y\n").encode("utf-8"))
         before = snapshot_tree(root)
         data = self._run(root, [])
         self.assertEqual(data["status"], "applied")
@@ -347,13 +347,13 @@ class CodexExecutorProperties(unittest.TestCase):
         self.assertEqual(data["status"], "applied")
         self.assertEqual((root / "a.py").read_text(encoding="utf-8"), "L1 z\nL2 w\n")
 
-    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores directory permissions")
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), "requires POSIX directory mode enforcement")
     def test_commit_failure_rolls_back_files_written_earlier_in_the_same_commit(self) -> None:
         root = self._root(1)
         (root / "ok").mkdir()
         (root / "locked").mkdir()
-        (root / "ok" / "a.py").write_text("a1\n", encoding="utf-8")
-        (root / "locked" / "b.py").write_text("b1\n", encoding="utf-8")
+        (root / "ok" / "a.py").write_bytes(("a1\n").encode("utf-8"))
+        (root / "locked" / "b.py").write_bytes(("b1\n").encode("utf-8"))
         before = snapshot_tree(root)
         os.chmod(root / "locked", 0o500)
         try:
@@ -367,7 +367,7 @@ class CodexExecutorProperties(unittest.TestCase):
         self.assertEqual(snapshot_tree(root), before)
         self.assertIn("ok/a.py", " ".join(data["rollback_status"]["restored"]))
 
-    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores directory permissions")
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), "requires POSIX directory mode enforcement")
     def test_rollback_report_does_not_list_untouched_files_as_failed(self) -> None:
         """``restore`` rewrote every touched path, so an unwritable
         directory made the unchanged file there look like a rollback
@@ -375,8 +375,8 @@ class CodexExecutorProperties(unittest.TestCase):
         root = self._root(6)
         (root / "ok").mkdir()
         (root / "locked").mkdir()
-        (root / "ok" / "a.py").write_text("a1\n", encoding="utf-8")
-        (root / "locked" / "b.py").write_text("b1\n", encoding="utf-8")
+        (root / "ok" / "a.py").write_bytes(("a1\n").encode("utf-8"))
+        (root / "locked" / "b.py").write_bytes(("b1\n").encode("utf-8"))
         before = snapshot_tree(root)
         os.chmod(root / "locked", 0o500)
         try:
@@ -390,7 +390,7 @@ class CodexExecutorProperties(unittest.TestCase):
         self.assertEqual(snapshot_tree(root), before)
         self.assertEqual(data["rollback_status"]["failed"], [])
 
-    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores directory permissions")
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), "requires POSIX directory mode enforcement")
     def test_rollback_removes_directories_created_during_failed_commit(self) -> None:
         """``restore`` unlinked files it created but kept directories
         that ``atomic_write`` made via ``mkdir(parents=True)``. Drop
@@ -398,7 +398,7 @@ class CodexExecutorProperties(unittest.TestCase):
         residue."""
         root = self._root(2)
         (root / "locked").mkdir()
-        (root / "locked" / "b.py").write_text("b1\n", encoding="utf-8")
+        (root / "locked" / "b.py").write_bytes(("b1\n").encode("utf-8"))
         before = snapshot_tree(root)
         os.chmod(root / "locked", 0o500)
         try:
@@ -422,7 +422,7 @@ class CodexExecutorProperties(unittest.TestCase):
         After: ``ONE\\nTWO\\n``, or the executor refuses."""
         root = self._root(3)
         (root / "sub").mkdir()
-        (root / "a.py").write_text("one\ntwo\n", encoding="utf-8")
+        (root / "a.py").write_bytes(("one\ntwo\n").encode("utf-8"))
         data = self._run(root, [
             {"kind": "update", "path": "a.py", "hunks": [{"old": "one\n", "new": "ONE\n"}]},
             {"kind": "update", "path": "sub/../a.py", "hunks": [{"old": "two\n", "new": "TWO\n"}]},
@@ -441,7 +441,7 @@ class CodexExecutorProperties(unittest.TestCase):
         the executor refuses."""
         root = self._root(4)
         source = "def first():\n    return 1\n\ndef second():\n    return 1\n"
-        (root / "a.py").write_text(source, encoding="utf-8")
+        (root / "a.py").write_bytes((source).encode("utf-8"))
         ops = parse_codex_patch("*** Begin Patch\n*** Update File: a.py\n@@ def second():\n-    return 1\n+    return 2\n*** End Patch\n")
         self.assertEqual(ops[0]["hunks"][0].get("anchor"), "def second():")
         data = self._run(root, ops)
@@ -454,7 +454,7 @@ class CodexExecutorProperties(unittest.TestCase):
         insertion was applied at offset 0 and reported as ``applied``.
         Refuse it as ambiguous instead."""
         root = self._root(5)
-        (root / "a.py").write_text("one\ntwo\n", encoding="utf-8")
+        (root / "a.py").write_bytes(("one\ntwo\n").encode("utf-8"))
         data = self._run(root, [{"kind": "update", "path": "a.py", "hunks": [{"old": "", "new": "INSERTED\n"}]}])
         self.assertNotEqual(data["status"], "applied", "context-free hunk must be rejected, not prepended")
         self.assertEqual((root / "a.py").read_text(encoding="utf-8"), "one\ntwo\n")
@@ -513,6 +513,7 @@ class UnifiedDiffProperties(unittest.TestCase):
         self.assertEqual(parse_unified_patch_paths(patch), ["x.py"])
 
     @unittest.skipUnless(shutil.which("git") and shutil.which("bash"), "needs git and bash")
+    @unittest.skipIf(os.name == "nt", "executes remote Bash/git against local POSIX fixture paths")
     def test_unified_apply_is_all_or_nothing_through_the_real_script(self) -> None:
         endpoint_host = DOC_HOSTS[0]
 
@@ -536,12 +537,12 @@ class UnifiedDiffProperties(unittest.TestCase):
                     after[new_path] = "".join(unique_lines(gen, gen.integer(1, 3), "n"))
                 for path, content in before.items():
                     (repo / path).parent.mkdir(parents=True, exist_ok=True)
-                    (repo / path).write_text(content, encoding="utf-8")
+                    (repo / path).write_bytes((content).encode("utf-8"))
                 patch = self._unified(before, after)
                 corrupt = gen.boolean(0.5)
                 if corrupt:
                     victim = gen.choice(sorted(before))
-                    (repo / victim).write_text("DRIFTED\n", encoding="utf-8")
+                    (repo / victim).write_bytes(("DRIFTED\n").encode("utf-8"))
                 snapshot_before = snapshot_tree(repo)
                 endpoint = Endpoint(host=endpoint_host, port=46000, root=str(repo), cwd=str(repo))
 

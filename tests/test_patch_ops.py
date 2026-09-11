@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 import subprocess
 import sys
@@ -117,7 +118,7 @@ class PatchOpsTests(unittest.TestCase):
             root = Path(tmp)
             source = root / "old.py"
             target = root / "new.py"
-            source.write_text("old\n", encoding="utf-8")
+            (source).write_bytes(("old\n").encode("utf-8"))
             payload = {
                 "root": str(root),
                 "cwd": str(root),
@@ -145,7 +146,7 @@ class PatchOpsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "sub").mkdir()
-            (root / "a.py").write_text("one\ntwo\n", encoding="utf-8")
+            (root / "a.py").write_bytes(("one\ntwo\n").encode("utf-8"))
             payload = {
                 "root": str(root),
                 "cwd": str(root),
@@ -202,8 +203,8 @@ class PatchOpsTests(unittest.TestCase):
             root = Path(tmp)
             first = root / "a.py"
             second = root / "b.py"
-            first.write_text("old a\n", encoding="utf-8")
-            second.write_text("old b\n", encoding="utf-8")
+            (first).write_bytes(("old a\n").encode("utf-8"))
+            (second).write_bytes(("old b\n").encode("utf-8"))
             payload = {
                 "root": str(root),
                 "cwd": str(root),
@@ -230,7 +231,7 @@ class PatchOpsTests(unittest.TestCase):
             root = Path(tmp)
             target = root / "target.py"
             new_file = root / "new.py"
-            target.write_text("old\n", encoding="utf-8")
+            (target).write_bytes(("old\n").encode("utf-8"))
             payload = {
                 "root": str(root),
                 "cwd": str(root),
@@ -258,8 +259,8 @@ class PatchOpsTests(unittest.TestCase):
             source = root / "old.py"
             moved = root / "new.py"
             other = root / "other.py"
-            source.write_text("old\n", encoding="utf-8")
-            other.write_text("other\n", encoding="utf-8")
+            (source).write_bytes(("old\n").encode("utf-8"))
+            (other).write_bytes(("other\n").encode("utf-8"))
             payload = {
                 "root": str(root),
                 "cwd": str(root),
@@ -282,6 +283,7 @@ class PatchOpsTests(unittest.TestCase):
             self.assertFalse(moved.exists())
             self.assertEqual(other.read_text(encoding="utf-8"), "other\n")
 
+    @unittest.skipIf(os.name == "nt", "executes remote Bash/git against local POSIX fixture paths")
     def test_unified_patch_records_before_sha_and_diffstat(self) -> None:
         original_runner = patch_ops.run_script
         try:
@@ -289,7 +291,7 @@ class PatchOpsTests(unittest.TestCase):
                 repo = Path(tmp)
                 (repo / ".git").mkdir()
                 target = repo / "a.py"
-                target.write_text("old\n", encoding="utf-8")
+                (target).write_bytes(("old\n").encode("utf-8"))
                 expected_before = hashlib.sha256(target.read_bytes()).hexdigest()
                 script_endpoint = Endpoint(host="1.2.3.4", port=46000, root=str(repo), cwd=str(repo))
                 from remote_dev.core.ssh_transport import RemoteCompleted
@@ -315,6 +317,7 @@ class PatchOpsTests(unittest.TestCase):
         finally:
             patch_ops.run_script = original_runner  # type: ignore[assignment]
 
+    @unittest.skipIf(os.name == "nt", "executes remote Bash/git against local POSIX fixture paths")
     def test_unified_patch_rejects_symlink_target_before_git_apply(self) -> None:
         original_runner = patch_ops.run_script
         try:
@@ -322,7 +325,7 @@ class PatchOpsTests(unittest.TestCase):
                 repo = Path(tmp)
                 real = repo / "real.py"
                 link = repo / "link.py"
-                real.write_text("old\n", encoding="utf-8")
+                (real).write_bytes(("old\n").encode("utf-8"))
                 link.symlink_to(real)
                 endpoint = Endpoint(host="1.2.3.4", port=46000, root=str(repo), cwd=str(repo))
                 from remote_dev.core.ssh_transport import RemoteCompleted

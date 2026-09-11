@@ -326,15 +326,14 @@ def run_script(endpoint: Endpoint, script: str, *, timeout_ms: int | None = None
     try:
         proc = subprocess.run(
             [*ssh_base_cmd(endpoint), "bash", "-s"],
-            input=script,
+            # A text-mode stdin rewrites LF to CRLF on Windows, corrupting
+            # shell options, heredocs and Python payloads on the Linux peer.
+            input=script.encode("utf-8"),
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=timeout,
             check=False,
         )
-        return RemoteCompleted(proc.returncode, proc.stdout or "", proc.stderr or "")
+        return RemoteCompleted(proc.returncode, _decode_stream(proc.stdout), _decode_stream(proc.stderr))
     except subprocess.TimeoutExpired as exc:
         stdout = _decode_stream(exc.stdout)
         stderr = _decode_stream(exc.stderr)
@@ -1193,7 +1192,7 @@ def open_local_forward(
         "errors": "replace",
     }
     if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     else:
         popen_kwargs["start_new_session"] = True
     try:
