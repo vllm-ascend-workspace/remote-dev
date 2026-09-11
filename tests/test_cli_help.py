@@ -86,26 +86,19 @@ sys.addaudithook(audit)
                 self.assertEqual(write.call_args.kwargs["file_path"], "/tmp/example")
                 self.assertTrue(write.call_args.kwargs["overwrite"])
 
-    def test_cli_payload_maps_ssh_mux_keepalive_and_long_stream_flags(self) -> None:
+    def test_cli_keeps_transport_policy_out_of_developer_tools(self) -> None:
         from remote_dev.cli import build_parser, endpoint_payload
 
         parser = build_parser("probe")
-        args = parser.parse_args(["--host", "192.0.2.10", "--port", "22", "--no-ssh-mux", "--keepalive"])
-        payload = endpoint_payload(args)
-        self.assertIs(payload["ssh_mux"], False)
-        self.assertIs(payload["keepalive"], True)
-        stream_args = parser.parse_args(["--host", "192.0.2.10", "--port", "22", "--long-stream"])
-        stream_payload = endpoint_payload(stream_args)
-        self.assertIs(stream_payload["ssh_mux"], False)
-        self.assertIs(stream_payload["keepalive"], True)
         default_args = parser.parse_args(["--host", "192.0.2.10", "--port", "22"])
         default_payload = endpoint_payload(default_args)
         self.assertNotIn("ssh_mux", default_payload)
         self.assertNotIn("keepalive", default_payload)
-        with self.assertRaises(ValueError) as raised:
-            endpoint_payload(parser.parse_args(["--host", "192.0.2.10", "--port", "22", "--ssh-mux", "--long-stream"]))
-        self.assertIn("rc=0", str(raised.exception))
-        self.assertIn("first-option-wins", str(raised.exception))
+        for flag in ("--ssh-mux", "--no-ssh-mux", "--keepalive", "--long-stream"):
+            with self.subTest(flag=flag):
+                result = _cli("probe", "--host", "192.0.2.10", "--port", "22", flag)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("unrecognized arguments", result.stderr)
 
     def test_cli_endpoint_flags_are_explicit_only(self) -> None:
         proc = _cli("bash", "--help")
@@ -119,13 +112,9 @@ sys.addaudithook(audit)
             "--alias",
             "--selector",
             "--runtime-env-file",
-            "--ssh-mux",
-            "--no-ssh-mux",
-            "--keepalive",
-            "--long-stream",
         ):
             self.assertIn(flag, proc.stdout)
-        for legacy in ("--session-id", "--session-file", "--machine"):
+        for legacy in ("--session-id", "--session-file", "--machine", "--ssh-mux", "--no-ssh-mux", "--keepalive", "--long-stream"):
             self.assertNotIn(legacy, proc.stdout)
 
     def test_cli_selector_without_resolver_is_endpoint_required(self) -> None:

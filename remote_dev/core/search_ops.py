@@ -593,7 +593,7 @@ def remote_grep(
         target=endpoint.to_result_target(),
         outcome="success" if status == "ok" else "failed",
         status=status,
-        summary=f"RemoteGrep found {len(matches)} matches.",
+        summary=f"RemoteGrep found {len(matches)} matches." if status == "ok" else f"RemoteGrep failed ({status}).",
         started_at=started,
         duration_ms=_duration_ms(start),
         preview={"matches": visible_matches, "truncated": bool(data.get("truncated", False)) or text_truncated},
@@ -601,6 +601,8 @@ def remote_grep(
         extra={"matches": visible_matches, "engine": data.get("engine"), "output_mode": output_mode, "offset": offset, "total_matches": data.get("total_matches"), "truncated": bool(data.get("truncated", False)) or text_truncated, "error": data.get("error")},
     )
     text = compact_text("\n".join(visible_matches) + ("\n<truncated>\n" if data.get("truncated") or text_truncated else "\n"))
+    if status != "ok":
+        text = result["summary"] + "\n" + str(data.get("error") or "Search failed.") + "\n" + text.lstrip()
     return {"text": text, "result": result}
 
 

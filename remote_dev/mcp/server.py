@@ -49,6 +49,22 @@ def error(request_id: Any, code: int, message: str, data: Any | None = None, *, 
     send(payload, framed=framed)
 
 
+def tool_text(payload: dict[str, Any]) -> str:
+    """Keep failures actionable for clients that only consume MCP text."""
+    text = str(payload.get("text") or "")
+    details = payload.get("result") or {}
+    if details.get("outcome") in {"success", "cancelled"}:
+        return text
+    status = str(details.get("status") or details.get("outcome") or "failed")
+    parts = [f"Remote tool failed ({status})."]
+    for value in (details.get("summary"), details.get("error")):
+        if value and str(value) not in text:
+            parts.append(str(value))
+    if text.strip():
+        parts.append(text.rstrip())
+    return "\n".join(parts) + "\n"
+
+
 def handle(message: dict[str, Any], *, framed: bool = False) -> None:
     method = message.get("method")
     request_id = message.get("id")
@@ -83,7 +99,7 @@ def handle(message: dict[str, Any], *, framed: bool = False) -> None:
             result(
                 request_id,
                 {
-                    "content": [{"type": "text", "text": payload.get("text", "")}],
+                    "content": [{"type": "text", "text": tool_text(payload)}],
                     "structuredContent": payload.get("result", {}),
                     "isError": payload.get("result", {}).get("outcome") not in {"success", "cancelled"},
                 },
