@@ -17,7 +17,7 @@ class PackageVersionContractTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["result"]["serverInfo"]["name"], "remote-dev")
         self.assertEqual(payload["result"]["serverInfo"]["version"], package_version())
-        self.assertEqual(payload["result"]["serverInfo"]["version"], "0.5.1")
+        self.assertEqual(payload["result"]["serverInfo"]["version"], "0.6.0")
 
 
 if __name__ == "__main__":

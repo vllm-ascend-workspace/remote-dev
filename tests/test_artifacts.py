@@ -74,7 +74,7 @@ class ArtifactTests(unittest.TestCase):
                     payload = artifact_ops.remote_artifact_push(endpoint, local_path=str(local), remote_path="/srv/artifact.txt")
             self.assertEqual(payload["result"]["outcome"], "success")
             item, path = stream.push.call_args.args
-            self.assertEqual(path, local)
+            self.assertEqual(path, local.resolve())
             self.assertEqual(item["sha256"], expected)
             self.assertEqual(item["path"], "/srv/artifact.txt")
             factory.assert_called_once_with(endpoint, "push", 1, 120000)
