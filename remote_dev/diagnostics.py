@@ -1,6 +1,8 @@
 """Explicit connection diagnostics; never replay a caller's business command."""
 from __future__ import annotations
 
+import json
+import math
 import socket
 import urllib.error
 import urllib.parse
@@ -8,6 +10,28 @@ import urllib.request
 from dataclasses import replace
 
 from remote_dev.core.ssh_transport import _uses_shared_mux, run_script
+
+# One fixed read-only request gathers related facts without model imports.
+# This protocol is not a wrapper around an arbitrary caller command.
+CONNECTION_PROBE_SCRIPT = """python3 - <<'REMOTE_DEV_PROBE'
+import json, os, platform, sys, time
+started = time.perf_counter()
+facts = {"system": platform.system(), "cwd": os.getcwd(), "python": sys.version.split()[0]}
+elapsed = (time.perf_counter() - started) * 1000
+print(json.dumps({"marker": "remote-dev-connection-ok", "facts": facts, "remote_execution_ms": elapsed}))
+REMOTE_DEV_PROBE
+"""
+
+
+def _probe_payload(stdout):
+    for line in reversed(stdout.splitlines()):
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and value.get("marker") == "remote-dev-connection-ok":
+            return value
+    return {}
 
 
 def ssh_details(endpoint, timeout_ms=None) -> dict:
@@ -24,10 +48,21 @@ def diagnose_ssh(endpoint, *, timeout_ms=10000) -> dict:
     for target in (endpoint, replace(endpoint, ssh_mux=False)):
         if probes and (probes[0]["ok"] or not _uses_shared_mux(endpoint)):
             break
-        result = run_script(target, "printf 'remote-dev-connection-ok\\n'", timeout_ms=budget)
+        result = run_script(target, CONNECTION_PROBE_SCRIPT, timeout_ms=budget, trace_connection=True)
+        payload = _probe_payload(result.stdout)
+        timings = dict(result.timings)
+        remote_ms = payload.get("remote_execution_ms")
+        if (result.returncode == 0 and not result.timed_out and isinstance(remote_ms, (int, float))
+                and not isinstance(remote_ms, bool) and math.isfinite(remote_ms) and remote_ms >= 0):
+            timings["remote_execution_ms"] = round(remote_ms, 3)
+            ssh_ms = timings.get("ssh_process_ms")
+            known_ms = remote_ms + (timings.get("connection_ms") or 0) + (timings.get("drain_and_exit_ms") or 0)
+            if isinstance(ssh_ms, (int, float)) and ssh_ms >= known_ms:
+                timings["unattributed_ssh_ms"] = round(ssh_ms - known_ms, 3)
         probes.append({**ssh_details(target, budget), "exit_code": result.returncode,
                        "timed_out": result.timed_out,
-                       "ok": result.returncode == 0 and "remote-dev-connection-ok" in result.stdout,
+                       "ok": result.returncode == 0 and not result.timed_out and bool(payload),
+                       "timings": timings, "facts": payload.get("facts", {}),
                        "stderr": result.stderr[-1000:]})
     recovered = len(probes) == 2 and probes[1]["ok"]
     return {"probes": probes, "business_command_replayed": False,

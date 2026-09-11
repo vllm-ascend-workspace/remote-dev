@@ -31,6 +31,18 @@ server (`remote-dev server`) and mirrored one-to-one by CLI subcommands.
 Help and parser errors do not import execution backends or contact endpoints.
 The selected operation loads its implementation after argument parsing.
 
+`remote-dev probe --host <host> --diagnose-connection` sends one fixed read-only
+probe for OS, working directory and Python version. It reports local preparation,
+SSH process duration, received TCP/authentication milestones, remote probe
+execution and final stream drain/exit timing. Connection time includes client
+startup and authentication; TCP time is a subset, not an additional phase.
+Absent milestones and pure transfer time remain unknown. The unattributed
+remainder includes channel/Python startup and transport overhead. Verbose SSH
+lines are interpreted locally and excluded from the returned diagnostic stderr.
+On a failed shared connection, the fixed probe may compare an independent
+connection. It never retries an arbitrary business command. Ordinary bash
+results also include transport timings without enabling verbose SSH tracing.
+
 Runtime requirements: Python 3.9+ and an `ssh` client. No third-party
 packages. Nothing here needs GPU/NPU hardware; the remote host only needs
 `bash`, `python3`, and (for `remote.apply_patch` unified diffs) `git`.

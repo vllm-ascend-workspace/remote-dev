@@ -93,6 +93,7 @@ class RemoteCompleted:
     stdout: str
     stderr: str
     timed_out: bool = False
+    timings: dict[str, float | None] = field(default_factory=dict)
 
 
 def _control_master_options(identity_file: str | None = None) -> list[str]:
@@ -321,23 +322,94 @@ def stream_ssh_command(endpoint: Endpoint, script: str, *, timeout_ms: int | Non
     return [*ssh_base_cmd(endpoint), "bash", "-c", shlex.quote(stream_remote_payload(script, timeout_ms))]
 
 
-def run_script(endpoint: Endpoint, script: str, *, timeout_ms: int | None = None) -> RemoteCompleted:
+def run_script(endpoint: Endpoint, script: str, *, timeout_ms: int | None = None,
+               trace_connection: bool = False) -> RemoteCompleted:
+    started = time.perf_counter()
     timeout = None if timeout_ms is None else timeout_ms / 1000
+    command = [*ssh_base_cmd(endpoint), "bash", "-s"]
+    payload = script.encode("utf-8")
+    prepared = time.perf_counter()
+    if trace_connection:
+        # Used by the fixed diagnostic probe only. Ordinary command stderr and
+        # process execution retain their existing blocking transport path.
+        if len(payload) > 4096:
+            raise ValueError("connection trace is restricted to small diagnostic probes")
+        command.insert(1, "-v")
+        return _run_traced_script(command, payload, timeout_ms, started, prepared)
     try:
         proc = subprocess.run(
-            [*ssh_base_cmd(endpoint), "bash", "-s"],
+            command,
             # A text-mode stdin rewrites LF to CRLF on Windows, corrupting
             # shell options, heredocs and Python payloads on the Linux peer.
-            input=script.encode("utf-8"),
+            input=payload,
             capture_output=True,
             timeout=timeout,
             check=False,
         )
-        return RemoteCompleted(proc.returncode, _decode_stream(proc.stdout), _decode_stream(proc.stderr))
+        code, stdout, stderr, timed_out = proc.returncode, proc.stdout, proc.stderr, False
     except subprocess.TimeoutExpired as exc:
-        stdout = _decode_stream(exc.stdout)
-        stderr = _decode_stream(exc.stderr)
-        return RemoteCompleted(None, stdout, stderr, timed_out=True)
+        code, stdout, stderr, timed_out = None, exc.stdout, exc.stderr, True
+    finished = time.perf_counter()
+    stdout, stderr = _decode_stream(stdout), _decode_stream(stderr)
+    decoded = time.perf_counter()
+    timings = {"prepare_ms": round((prepared - started) * 1000, 3),
+               "ssh_process_ms": round((finished - prepared) * 1000, 3),
+               "decode_ms": round((decoded - finished) * 1000, 3),
+               "total_ms": round((decoded - started) * 1000, 3),
+               # subprocess.run cannot distinguish handshake, remote execution
+               # and transfer. Explicit probes may add a remote command timer.
+               "connection_ms": None, "remote_execution_ms": None, "transfer_ms": None}
+    return RemoteCompleted(code, stdout, stderr, timed_out=timed_out, timings=timings)
+
+
+def _run_traced_script(command, payload, timeout_ms, started, prepared):
+    milestones = {}
+
+    def observe(channel, text):
+        now = time.perf_counter()
+        if channel == "stderr":
+            if "debug1: Connection established." in text:
+                milestones.setdefault("tcp_connected", now)
+            if text.startswith("Authenticated to ") or "Authentication succeeded (" in text:
+                milestones.setdefault("authenticated", now)
+        elif text:
+            milestones.setdefault("first_output", now)
+            milestones["last_output"] = now
+
+    proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, bufsize=0)
+    try:
+        try:
+            proc.stdin.write(payload)
+        except BrokenPipeError:
+            pass  # Read the SSH error and exit code below.
+        finally:
+            proc.stdin.close()
+        result = _read_attached(proc, timeout_ms=timeout_ms, forward_prefix="", output=None,
+                                on_output=observe, capture=True)
+    except BaseException:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+        raise
+    finished = time.perf_counter()
+    timings = {"prepare_ms": round((prepared - started) * 1000, 3),
+               "ssh_process_ms": round((finished - prepared) * 1000, 3),
+               "total_ms": round((finished - started) * 1000, 3),
+               "connection_ms": None, "tcp_connect_ms": None,
+               "remote_execution_ms": None, "transfer_ms": None,
+               "decode_ms": None, "drain_and_exit_ms": None}
+    for key, name in (("tcp_connected", "tcp_connect_ms"), ("authenticated", "connection_ms")):
+        if key in milestones:
+            timings[name] = round((milestones[key] - prepared) * 1000, 3)
+    if "last_output" in milestones:
+        timings["drain_and_exit_ms"] = round((finished - milestones["last_output"]) * 1000, 3)
+    result.timings = timings
+    # Verbose OpenSSH lines include local identity paths. Keep ordinary errors
+    # but return only the interpreted timing milestones from the debug trace.
+    result.stderr = "\n".join(line for line in result.stderr.splitlines()
+                              if not line.startswith(("debug1:", "debug2:", "debug3:", "Authenticated to ")))
+    return result
 
 
 def run_stream(

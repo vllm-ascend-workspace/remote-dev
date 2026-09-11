@@ -1,4 +1,8 @@
 import os
+import json
+import subprocess
+import sys
+import time
 import pytest
 from unittest.mock import patch
 import socket
@@ -7,7 +11,7 @@ import urllib.request
 
 from remote_dev.core.endpoint import resolve_endpoint
 from remote_dev.core.ssh_transport import RemoteCompleted
-from remote_dev.diagnostics import diagnose_ssh, http_connection, http_failure, open_http
+from remote_dev.diagnostics import CONNECTION_PROBE_SCRIPT, diagnose_ssh, http_connection, http_failure, open_http
 from remote_dev.runtime import process_identity, runtime_status
 
 
@@ -16,20 +20,73 @@ def test_mux_probe_never_replays_caller_command():
     endpoint = resolve_endpoint({"host": "192.0.2.1", "port": 22, "root": "/", "ssh_mux": True})
     with patch("remote_dev.diagnostics.run_script", side_effect=[
         RemoteCompleted(255, "", "timeout", timed_out=True),
-        RemoteCompleted(0, "remote-dev-connection-ok\n", "", timed_out=False),
+        RemoteCompleted(0, json.dumps({"marker": "remote-dev-connection-ok"}), "", timed_out=False),
     ]) as run:
         result = diagnose_ssh(endpoint)
     assert result["status"] == "independent_connection_works"
     assert result["business_command_replayed"] is False
     assert run.call_args_list[1].args[0].ssh_mux is False
-    assert all(call.args[1] == "printf 'remote-dev-connection-ok\\n'" for call in run.call_args_list)
+    assert all(call.args[1] == CONNECTION_PROBE_SCRIPT for call in run.call_args_list)
 
 
 def test_successful_probe_needs_no_second_connection():
     endpoint = resolve_endpoint({"host": "192.0.2.1", "port": 22})
-    with patch("remote_dev.diagnostics.run_script", return_value=RemoteCompleted(0, "remote-dev-connection-ok", "", False)) as run:
+    with patch("remote_dev.diagnostics.run_script", return_value=RemoteCompleted(0, json.dumps({"marker": "remote-dev-connection-ok"}), "", False)) as run:
         assert diagnose_ssh(endpoint)["status"] == "ok"
     assert run.call_count == 1
+
+
+def test_probe_reports_observed_time_and_leaves_connection_transfer_unknown():
+    endpoint = resolve_endpoint({"host": "192.0.2.1", "port": 22, "ssh_mux": False})
+    payload = {"marker": "remote-dev-connection-ok", "remote_execution_ms": 2.5,
+               "facts": {"system": "Linux", "python": "3.12", "cwd": "/"}}
+    completed = RemoteCompleted(0, json.dumps(payload), "", timings={
+        "ssh_process_ms": 120.0, "connection_ms": None, "transfer_ms": None})
+    with patch("remote_dev.diagnostics.run_script", return_value=completed):
+        result = diagnose_ssh(endpoint)
+    probe = result["probes"][0]
+    assert probe["facts"] == payload["facts"]
+    assert probe["timings"]["remote_execution_ms"] == 2.5
+    assert probe["timings"]["unattributed_ssh_ms"] == 117.5
+    assert probe["timings"]["connection_ms"] is None
+    assert probe["timings"]["transfer_ms"] is None
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_script_transport_times_success_and_timeout_without_changing_output(timeout):
+    from remote_dev.core.ssh_transport import run_script
+    endpoint = resolve_endpoint({"host": "192.0.2.1", "port": 22, "ssh_mux": False})
+    kwargs = ({"side_effect": subprocess.TimeoutExpired("ssh", 1, output=b"partial", stderr=b"detail")}
+              if timeout else {"return_value": subprocess.CompletedProcess([], 7, b"partial", b"detail")})
+    with patch("remote_dev.core.ssh_transport.subprocess.run", **kwargs):
+        result = run_script(endpoint, "printf test", timeout_ms=1000)
+    assert (result.stdout, result.stderr, result.timed_out) == ("partial", "detail", timeout)
+    assert result.returncode == (None if timeout else 7)
+    assert all(result.timings[key] >= 0 for key in ("prepare_ms", "ssh_process_ms", "decode_ms", "total_ms"))
+    assert result.timings["connection_ms"] is None
+    assert result.timings["remote_execution_ms"] is None
+
+
+def test_trace_milestones_use_received_events_and_preserve_ordinary_error():
+    from remote_dev.core.ssh_transport import _run_traced_script
+    script = """import sys, time
+sys.stdin.buffer.read()
+print('debug1: Connection established.', file=sys.stderr, flush=True)
+time.sleep(.03)
+print('Authenticated to example.test using publickey.', file=sys.stderr, flush=True)
+time.sleep(.03)
+print('probe result', flush=True)
+print('ordinary error', file=sys.stderr, flush=True)
+time.sleep(.03)
+"""
+    started = time.perf_counter()
+    result = _run_traced_script([sys.executable, "-c", script], b"probe", 5000, started, started)
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == ["probe result"]
+    assert result.stderr == "ordinary error"
+    assert 0 <= result.timings["tcp_connect_ms"] <= result.timings["connection_ms"] <= result.timings["ssh_process_ms"]
+    assert result.timings["drain_and_exit_ms"] >= 0
+    assert result.timings["transfer_ms"] is None
 
 
 def test_http_direct_is_explicit_and_errors_are_not_model_attribution():
