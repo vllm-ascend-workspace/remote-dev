@@ -46,6 +46,17 @@ Runtime requirements: Python 3.9+ and an `ssh` client. No third-party
 packages. Nothing here needs GPU/NPU hardware; the remote host only needs
 `bash`, `python3`, and (for `remote.apply_patch` unified diffs) `git`.
 
+The same public API runs from Windows, macOS and Linux clients. Attached SSH
+streams and local forwards launch literal argv under an owned local process
+group: a Windows Job Object is assigned before the child starts; POSIX uses an
+independent session. Timeout and close include inherited children even after
+SSH itself exits, and preserve available UTF-8 output. The internal launcher
+accepts native cwd and an environment overlay; it does not interpret shell
+syntax or translate Windows/WSL paths. The remote command still runs in Bash
+on its Linux endpoint. Local SSH cleanup does not prove remote process quiet;
+managed remote jobs use their supervisor's stop and quiet receipt. A POSIX
+child that deliberately creates a separate session is outside the local group.
+
 ## Install and start the MCP server
 
 From a git ref (no local checkout required):

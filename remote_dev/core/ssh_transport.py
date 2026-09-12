@@ -7,7 +7,6 @@ import os
 import queue
 import select
 import shlex
-import signal
 import socket
 import subprocess
 import sys
@@ -20,6 +19,7 @@ from typing import Any, TextIO
 
 from .endpoint import Endpoint
 from .errors import RemoteExecutionError
+from .local_process import OwnedProcess
 
 # ControlMaster socket directory. Consumers that already keep an OpenSSH mux
 # directory for their own tooling can point remote-dev at it so both share
@@ -44,7 +44,7 @@ REMOTE_TIMEOUT_GRACE_SECONDS = 5
 # promptly, large enough that a quiet-but-alive stream is not spun on.
 # POSIX uses ``select`` on pipes; Windows uses reader threads (select cannot
 # wait on subprocess pipes there).
-STREAM_SELECT_SLICE_SECONDS = 5.0
+STREAM_SELECT_SLICE_SECONDS = 0.1
 
 # Keepalive for endpoints that set the ``keepalive`` mechanism flag.
 # Conditional: see ``_keepalive_options``. Hour-scale streams go through
@@ -384,22 +384,17 @@ def _run_traced_script(command, payload, timeout_ms, started, prepared):
             milestones.setdefault("first_output", now)
             milestones["last_output"] = now
 
-    proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, bufsize=0)
-    try:
+    with OwnedProcess(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE, bufsize=0) as owner:
+        proc = owner.process
         try:
             proc.stdin.write(payload)
         except BrokenPipeError:
             pass  # Read the SSH error and exit code below.
         finally:
             proc.stdin.close()
-        result = _read_attached(proc, timeout_ms=timeout_ms, forward_prefix="", output=None,
+        result = _read_attached(owner, timeout_ms=timeout_ms, forward_prefix="", output=None,
                                 on_output=observe, capture=True)
-    except BaseException:
-        if proc.poll() is None:
-            proc.kill()
-        proc.wait(timeout=5)
-        raise
     finished = time.perf_counter()
     timings = {"prepare_ms": round((prepared - started) * 1000, 3),
                "ssh_process_ms": round((finished - prepared) * 1000, 3),
@@ -484,18 +479,18 @@ def run_stream(
     """
     dest = sys.stderr if output is None and merge_stderr else output
     cmd = stream_ssh_command(endpoint, None, timeout_ms=timeout_ms)
-    proc = subprocess.Popen(
+    payload = script.encode("utf-8")
+    owner = OwnedProcess(
         cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
         bufsize=0,
     )
+    proc = owner.process
     # Upload concurrently with output draining: a script larger than pipe
     # capacity must not stall progress or bypass the reader's local deadline.
     # Binary writes preserve LF on native Windows.
-    payload = script.encode("utf-8")
-
     def upload() -> None:
         try:
             view = memoryview(payload)
@@ -510,10 +505,10 @@ def run_stream(
             _close_pipe(proc.stdin)
 
     writer = threading.Thread(target=upload, daemon=True, name="remote-dev-stream-upload")
-    writer.start()
     try:
+        writer.start()
         return _read_attached(
-            proc,
+            owner,
             timeout_ms=timeout_ms,
             forward_prefix=forward_prefix,
             output=dest,
@@ -521,7 +516,9 @@ def run_stream(
             capture=not merge_stderr,
         )
     finally:
-        writer.join(timeout=1)
+        owner.stop()
+        if writer.ident is not None:
+            writer.join(timeout=1)
 
 
 _STREAM_READ_BYTES = 4096
@@ -634,6 +631,12 @@ class _AttachedPipes:
                 leftover.append((fd, None))
         return leftover
 
+    def finish_readers(self) -> None:
+        """After owned descendants stop, let Windows enqueue the final bytes."""
+        deadline = time.monotonic() + 1.0
+        for thread in self._threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
 
 @dataclass
 class _StreamChannel:
@@ -702,26 +705,6 @@ def _flush_channel_lines(
         channel.pending = ""
 
 
-def _reap_process(proc: subprocess.Popen[bytes], *, timeout_s: float | None = 2.0) -> int | None:
-    if proc.poll() is not None:
-        return proc.returncode
-    try:
-        return proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        return None
-
-
-def _kill_and_reap(proc: subprocess.Popen[bytes]) -> int | None:
-    if proc.poll() is None:
-        proc.kill()
-    if proc.poll() is not None:
-        return proc.returncode
-    try:
-        return proc.wait(timeout=2.0)
-    except subprocess.TimeoutExpired:
-        return proc.poll()
-
-
 def _close_pipe(stream: Any) -> None:
     if stream is None:
         return
@@ -732,7 +715,7 @@ def _close_pipe(stream: Any) -> None:
 
 
 def _read_attached(
-    proc: subprocess.Popen[bytes],
+    owner: OwnedProcess,
     *,
     timeout_ms: int | None,
     forward_prefix: str,
@@ -747,6 +730,7 @@ def _read_attached(
     ``capture=False`` is the historical merged mode (forward live, leave
     ``RemoteCompleted.stdout`` empty).
     """
+    proc = owner.process
     assert proc.stdout is not None
     channels = [_StreamChannel(name="stdout", fd=proc.stdout.fileno())]
     if proc.stderr is not None and proc.stderr is not proc.stdout:
@@ -786,6 +770,15 @@ def _read_attached(
             )
 
     def timed_out_result() -> RemoteCompleted:
+        # Killing the owner closes inherited handles too. Drain bytes already
+        # produced before finalizing UTF-8 decoders, even after the deadline.
+        pipes.finish_readers()
+        for fd, chunk in pipes.drain(open_fds):
+            if chunk:
+                channel = by_fd[fd]
+                _flush_channel_lines(channel, text=channel.decoder.decode(chunk),
+                                     forward_prefix=forward_prefix, output=output,
+                                     on_output=on_output, capture=capture, final=False)
         finalize_open_channels()
         stderr = timeout_message
         if capture:
@@ -825,7 +818,7 @@ def _read_attached(
         while True:
             wait = remaining_wait()
             if wait is not None and wait <= 0:
-                _kill_and_reap(proc)
+                owner.stop()
                 return timed_out_result()
             if not open_fds:
                 # Pipes have closed. Wait until the real deadline (or forever
@@ -848,12 +841,12 @@ def _read_attached(
                     )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    _kill_and_reap(proc)
+                    owner.stop()
                     return timed_out_result()
                 try:
                     returncode = proc.wait(timeout=remaining)
                 except subprocess.TimeoutExpired:
-                    _kill_and_reap(proc)
+                    owner.stop()
                     return timed_out_result()
                 return RemoteCompleted(
                     returncode,
@@ -888,9 +881,15 @@ def _read_attached(
                         capture=capture,
                         final=False,
                     )
+                if proc.poll() is not None:
+                    owner.stop()
                 continue
             if proc.poll() is None:
                 continue
+            # Parent exit does not close descriptors inherited by a proxy child.
+            # Stop the owned local group before draining or closing its pipes.
+            owner.stop()
+            pipes.finish_readers()
             drained = pipes.drain(open_fds)
             for fd, chunk in drained:
                 channel = by_fd[fd]
@@ -936,28 +935,9 @@ def _read_attached(
                 captured_stderr() if capture else "",
             )
     finally:
+        owner.stop()
+        pipes.finish_readers()
         close_pipes()
-        if proc.poll() is None:
-            _kill_and_reap(proc)
-
-
-def _read_stream(
-    proc: subprocess.Popen[bytes],
-    *,
-    timeout_ms: int | None,
-    forward_prefix: str,
-    output: TextIO,
-    on_output: Callable[[str, str], None] | None = None,
-) -> RemoteCompleted:
-    """Merged-stream wrapper around :func:`_read_attached` for existing tests."""
-    return _read_attached(
-        proc,
-        timeout_ms=timeout_ms,
-        forward_prefix=forward_prefix,
-        output=output,
-        on_output=on_output,
-        capture=False,
-    )
 
 
 def run_bytes(
@@ -1128,44 +1108,6 @@ def local_forward_ssh_command(
     )
 
 
-def _kill_windows_tree(pid: int, *, force: bool) -> None:
-    argv = ["taskkill", "/PID", str(pid), "/T"]
-    if force:
-        argv.append("/F")
-    try:
-        subprocess.run(argv, capture_output=True, check=False)
-    except OSError:
-        pass
-
-
-def _stop_process_group(proc: subprocess.Popen[Any], *, timeout_s: float = 5.0) -> int:
-    if proc.poll() is not None:
-        return _rewrite_forward_exit(proc.returncode)
-    if os.name == "nt":
-        _kill_windows_tree(proc.pid, force=False)
-        try:
-            return _rewrite_forward_exit(proc.wait(timeout=timeout_s))
-        except subprocess.TimeoutExpired:
-            _kill_windows_tree(proc.pid, force=True)
-            try:
-                return _rewrite_forward_exit(proc.wait(timeout=timeout_s))
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                return _rewrite_forward_exit(proc.wait(timeout=timeout_s))
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        proc.terminate()
-    try:
-        return _rewrite_forward_exit(proc.wait(timeout=timeout_s))
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            proc.kill()
-        return _rewrite_forward_exit(proc.wait(timeout=timeout_s))
-
-
 class LocalForward:
     """Handle for one local→remote SSH port forward.
 
@@ -1178,7 +1120,7 @@ class LocalForward:
     def __init__(
         self,
         *,
-        proc: subprocess.Popen[Any],
+        owner: OwnedProcess,
         local_host: str,
         local_port: int,
         remote_host: str,
@@ -1188,7 +1130,8 @@ class LocalForward:
         self.local_port = local_port
         self.remote_host = remote_host
         self.remote_port = remote_port
-        self._proc = proc
+        self._owner = owner
+        self._proc = owner.process
         self._stderr = ""
         self._stderr_read = False
         self._closed = False
@@ -1223,6 +1166,7 @@ class LocalForward:
         while time.monotonic() < deadline:
             rc = self._proc.poll()
             if rc is not None:
+                self._owner.stop()
                 stderr = self._consume_stderr()
                 rewritten = _rewrite_forward_exit(rc)
                 detail = f"rc={rewritten}"
@@ -1248,9 +1192,9 @@ class LocalForward:
         if self._closed:
             rc = self._proc.poll()
             return RemoteCompleted(_rewrite_forward_exit(rc), "", self._stderr)
-        self._closed = True
-        rc = _stop_process_group(self._proc)
+        rc = _rewrite_forward_exit(self._owner.stop(force=False))
         stderr = self._consume_stderr()
+        self._closed = True
         return RemoteCompleted(rc, "", stderr)
 
     def __enter__(self) -> LocalForward:
@@ -1300,16 +1244,12 @@ def open_local_forward(
         "encoding": "utf-8",
         "errors": "replace",
     }
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-    else:
-        popen_kwargs["start_new_session"] = True
     try:
-        proc = subprocess.Popen(cmd, **popen_kwargs)
+        owner = OwnedProcess(cmd, **popen_kwargs)
     except FileNotFoundError as exc:
         raise RemoteExecutionError(f"required local command not found: {cmd[0]}") from exc
     handle = LocalForward(
-        proc=proc,
+        owner=owner,
         local_host=local_host,
         local_port=chosen_port,
         remote_host=remote_host,
