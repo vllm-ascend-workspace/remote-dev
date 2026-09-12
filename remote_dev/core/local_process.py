@@ -51,30 +51,46 @@ class OwnedProcess:
                 process.wait(timeout=5)
             raise
 
-    def stop(self, *, force: bool = True, timeout: float = 5.0) -> int:
+    def _signal_group(self, sig: int) -> None:
+        if self.process.returncode is not None:
+            # Popen has already reaped our leader. A PID visible now belongs to
+            # another process; a late forward.close() must not signal its group.
+            # Original surviving descendants retain the PGID with no leader PID.
+            try:
+                os.getpgid(self.process.pid)
+            except ProcessLookupError:
+                pass
+            else:
+                return
+        try:
+            os.killpg(self.process.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    def stop(self, *, force: bool = True, timeout: float = 5.0) -> int | None:
         if self._closed:
             return self.process.returncode
         if self._job is not None:
-            self._job.stop(timeout)
-            result = self.process.wait(timeout=timeout)
-            self._job.close()
+            try:
+                self._job.stop(timeout)
+                result = self.process.wait(timeout=timeout)
+            finally:
+                # KILL_ON_JOB_CLOSE remains effective even if observation or
+                # wait fails. Do not leak the handle or reuse a closed job while
+                # unwinding an exception. The original failure still propagates.
+                self._job.close()
+                self._closed = True
         else:
             # Never use parent liveness as proof that its group is empty.
             # A proxy child can outlive SSH while still holding an output pipe.
-            try:
-                os.killpg(self.process.pid, signal.SIGKILL if force else signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            self._signal_group(signal.SIGKILL if force else signal.SIGTERM)
             if not force:
                 try:
                     self.process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     pass
                 # The parent may already have exited while a child ignores TERM.
-                try:
-                    os.killpg(self.process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                self._signal_group(signal.SIGKILL)
             result = self.process.wait(timeout=timeout)
         self._closed = True
         return result

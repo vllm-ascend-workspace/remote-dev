@@ -167,3 +167,32 @@ def test_forward_startup_failure_stops_children_before_reading_stderr(tmp_path):
                                              8000, ready_timeout_s=3)
     assert time.monotonic() - started < 4
     assert_tree_stopped(tmp_path)
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX process group identity')
+def test_reused_reaped_parent_pid_is_never_signalled():
+    with OwnedProcess([sys.executable, '-c', 'pass'], stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL) as owner:
+        assert owner.process.wait(timeout=3) == 0
+        # Deterministically inject PID reuse; forcing real OS PID recycling
+        # would be slow and could endanger unrelated processes on the runner.
+        with mock.patch.object(os, 'getpgid', return_value=owner.process.pid), \
+                mock.patch.object(os, 'killpg') as signal_group:
+            assert owner.stop(force=False) == 0
+        signal_group.assert_not_called()
+
+
+@pytest.mark.parametrize('failure', ['job', 'wait'])
+def test_windows_job_handle_closes_when_stop_or_wait_fails(failure):
+    owner = OwnedProcess.__new__(OwnedProcess)
+    owner._closed = False
+    owner._job = mock.Mock()
+    owner.process = mock.Mock(returncode=None)
+    operation = owner._job.stop if failure == 'job' else owner.process.wait
+    operation.side_effect = TimeoutError('injected local stop failure')
+    with pytest.raises(TimeoutError, match='injected local stop failure'):
+        owner.stop()
+    owner._job.close.assert_called_once_with()
+    # Finally/context cleanup cannot retry a closed handle and mask the error.
+    owner.stop()
+    owner._job.close.assert_called_once_with()
