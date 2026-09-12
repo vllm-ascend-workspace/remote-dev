@@ -54,7 +54,7 @@ def test_same_endpoint_coalesces_without_blocking_other_endpoint(pool):
     with ThreadPoolExecutor(max_workers=4) as executor:
         first = executor.submit(invoke, endpoint)
         assert opening.wait(2)
-        second = executor.submit(invoke, endpoint)
+        second = executor.submit(invoke, replace(endpoint, root="/sibling"))
         fast = executor.submit(invoke, replace(endpoint, host="fast.example"))
         try:
             assert fast.result(timeout=2)["host"] == "fast.example"
@@ -71,6 +71,10 @@ def test_idle_lru_is_evicted_without_interrupting_active_requests(pool):
     with mock.patch.object(rpc, "_POOL_LIMIT", 2), ThreadPoolExecutor(max_workers=1) as executor:
         active = executor.submit(invoke, endpoint, {"entered": entered, "release": release})
         assert entered.wait(2)
+        # Completing a sibling-root call must not make the shared transport
+        # idle while the first root's request still owns its active reference.
+        invoke(replace(endpoint, root="/sibling"))
+        active_connection = next(iter(rpc._pool.values())).connection
         idle = replace(endpoint, host="idle.example")
         invoke(idle)
         idle_connection = next(item.connection for item in rpc._pool.values() if item.connection.endpoint == idle)
@@ -79,6 +83,7 @@ def test_idle_lru_is_evicted_without_interrupting_active_requests(pool):
                 invoke(replace(endpoint, host=f"new-{index}.example"))
             assert len(rpc._pool) == 2
             assert idle_connection.closed
+            assert not active_connection.closed
             assert not active.done()
         finally:
             release.set()
