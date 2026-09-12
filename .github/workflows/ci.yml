@@ -33,10 +33,17 @@ jobs:
         run: python -m pip install -e ".[test]"
       - name: Unit tests
         # Mocked transports and temporary state only; no SSH server, no hardware.
-        run: python -m pytest --junitxml=contracts.xml
+        run: python -m pytest --durations=20 --junitxml=contracts.xml
       - name: Publish failing test details
         if: failure()
         run: python tests/ci_failure_summary.py contracts.xml
+      - name: Preserve test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contracts-${{ matrix.os }}-${{ matrix.python }}
+          path: contracts.xml
+          retention-days: 7
 
   client-portability:
     name: Client portability (${{ matrix.os }}, Python ${{ matrix.python }})
@@ -46,7 +53,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
-        python: ["3.9", "3.12"]
+        # Minimum Python is checked on Linux; native OS behavior uses the
+        # same current interpreter rather than repeating the whole matrix.
+        python: ["3.12"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -60,10 +69,17 @@ jobs:
         # No SSH server. These prove the local macOS/Windows client path:
         # pipe readers, process-group stop, control() JSON stdin shipping,
         # and ordinary job wrappers. Linux worker tests skip off Linux.
-        run: python -m pytest -q tests --junitxml=client-portability.xml
+        run: python -m pytest -q tests --durations=20 --junitxml=client-portability.xml
       - name: Publish failing test details
         if: failure()
         run: python tests/ci_failure_summary.py client-portability.xml
+      - name: Preserve test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-portability-${{ matrix.os }}-${{ matrix.python }}
+          path: client-portability.xml
+          retention-days: 7
 
   wheel:
     name: Wheel install (P14)
