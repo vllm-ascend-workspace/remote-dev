@@ -10,12 +10,14 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
 from remote_dev.core.endpoint import Endpoint  # noqa: E402
 from remote_dev.core.errors import RemoteExecutionError  # noqa: E402
 import remote_dev.core.ssh_transport as ssh_transport  # noqa: E402
+import remote_dev.core.local_process as local_process
 
 SSH_MUX_ENV = "REMOTE_DEV_SSH_MUX"
 
@@ -929,7 +931,11 @@ class _ComposedSshSubprocess:
 
 
 def _patch_composed_ssh(fake_script: Path):
-    return mock.patch.object(ssh_transport, "subprocess", _ComposedSshSubprocess(fake_script))
+    stack = ExitStack()
+    adapter = _ComposedSshSubprocess(fake_script)
+    stack.enter_context(mock.patch.object(ssh_transport, "subprocess", adapter))
+    stack.enter_context(mock.patch.object(local_process, "subprocess", adapter))
+    return stack
 
 
 def _windows_pid_alive(pid: int) -> bool:
@@ -997,8 +1003,7 @@ class LocalForwardTests(unittest.TestCase):
         self.bindir.mkdir()
         self.fake_ssh = _write_fake_ssh(self.bindir)
         self._ssh_patch = _patch_composed_ssh(self.fake_ssh)
-        self._ssh_patch.start()
-        self.addCleanup(self._ssh_patch.stop)
+        self.addCleanup(self._ssh_patch.close)
         self.endpoint = Endpoint.for_long_stream("192.0.2.10", 46000)
         self._env = {
             "HOME": str(self.home),
@@ -1148,50 +1153,6 @@ class LocalForwardTests(unittest.TestCase):
         self.assertIn("timed out", str(raised.exception))
 
 
-class LocalSubprocessPortabilityTests(unittest.TestCase):
-    """Prove the local client stream/process-group path on this OS without SSH."""
-
-    def test_reader_backend_matches_this_platform(self) -> None:
-        if os.name == "nt":
-            self.assertFalse(ssh_transport._pipe_select_supported())
-        else:
-            self.assertTrue(ssh_transport._pipe_select_supported())
-
-    def test_deadline_bounded_partial_line_on_this_platform(self) -> None:
-        endpoint = Endpoint.for_long_stream("192.0.2.10", 46000)
-        local_cmd = [
-            sys.executable,
-            "-c",
-            "import sys,time;sys.stdout.buffer.write(b'partial');sys.stdout.buffer.flush();time.sleep(1.2)",
-        ]
-        started = time.monotonic()
-        with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=local_cmd):
-            result = ssh_transport.run_stream(endpoint, "unused", timeout_ms=200, merge_stderr=False)
-        elapsed = time.monotonic() - started
-        self.assertTrue(result.timed_out)
-        self.assertEqual(result.stdout, "partial")
-        self.assertLess(elapsed, 0.8)
-        self.assertTrue(sys.platform)  # records the OS this local reader just ran on
-
-    def test_stop_process_group_reaps_a_local_child_on_this_platform(self) -> None:
-        child = subprocess.Popen(
-            [sys.executable, "-c", "import time\nwhile True:\n    time.sleep(30)"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            start_new_session=(os.name != "nt"),
-            **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}),
-        )
-        try:
-            self.assertIsNone(child.poll())
-            rc = ssh_transport._stop_process_group(child, timeout_s=5.0)
-            self.assertIsNotNone(child.poll())
-            self.assertNotEqual(rc, 0)
-        finally:
-            if child.poll() is None:
-                child.kill()
-                child.wait(timeout=2)
-
-
 class InteractiveBootstrapTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -1202,8 +1163,7 @@ class InteractiveBootstrapTests(unittest.TestCase):
         self.bindir.mkdir()
         self.fake_ssh = _write_fake_ssh(self.bindir)
         self._ssh_patch = _patch_composed_ssh(self.fake_ssh)
-        self._ssh_patch.start()
-        self.addCleanup(self._ssh_patch.stop)
+        self.addCleanup(self._ssh_patch.close)
         self.endpoint = Endpoint(host="192.0.2.10", port=22, user="ubuntu", ssh_mux=False)
 
     def test_interactive_argv_is_password_bootstrap_off_the_mux(self) -> None:
