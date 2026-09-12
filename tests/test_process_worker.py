@@ -320,10 +320,38 @@ class ProcessWorkerTests(unittest.TestCase):
         self.go(identifier)
         event.set()
         row = self.worker.control_job({"root": str(self.root), "job_id": identifier,
-            "action": "exchange", "stdout_offset": 0, "stderr_offset": 0, "yield_time_ms": 30000}, self.source, event)
+            "action": "exchange", "stdout_offset": 0, "stderr_offset": 0,
+            "wait_for_exit": True, "yield_time_ms": 30000}, self.source, event)
         self.assertEqual(row["state"], "cancelled")
         self.assertTrue(row["quiet"])
         self.assertTrue(row["cancellation_requested"])
+
+    def test_synchronous_capture_waits_past_early_output_until_exit(self):
+        identifier = "job-sync-capture"
+        self.identifiers.append(identifier)
+        code = "import sys,time; print('early',flush=True); time.sleep(.2); print('end')"
+        started = time.monotonic()
+        row = self.call(identifier, "launch", spec={"command": shlex.quote(sys.executable)+" -c "+shlex.quote(code),
+                        "cwd": str(self.root), "env": {}, "timeout_seconds": 10}, authorization={"token": "test"},
+                        stdout_offset=0, stderr_offset=0, max_bytes=32768, shared_budget=True,
+                        wait_for_exit=True, yield_time_ms=1000)
+        self.assertGreaterEqual(time.monotonic()-started, .2)
+        self.assertEqual(row["stdout"], "early\nend\n")
+        self.assertEqual(row["result"]["exit_code"], 0)
+        self.assertTrue(row["result"]["descendants_drained"])
+
+    def test_synchronous_capture_still_yields_and_reports_command_timeout(self):
+        identifier = "job-sync-yield"
+        self.identifiers.append(identifier)
+        row = self.call(identifier, "launch", spec={"command": "printf early; sleep 30",
+                        "cwd": str(self.root), "env": {}, "timeout_seconds": .4}, authorization={"token": "test"},
+                        stdout_offset=0, stderr_offset=0, max_bytes=32768, shared_budget=True,
+                        wait_for_exit=True, yield_time_ms=200)
+        self.assertEqual(row["stdout"], "early")
+        self.assertFalse(row["quiet"])
+        terminal = self.until(identifier, lambda row: row["quiet"])
+        self.assertEqual(terminal["state"], "timeout")
+        self.assertTrue(terminal["result"]["descendants_drained"])
 
     def test_shared_budget_counts_invalid_utf8_expansion_without_losing_bytes(self):
         code = "import os; os.write(1,b'\\xff'*9+'你好'.encode()); os.write(2,'世界'.encode())"

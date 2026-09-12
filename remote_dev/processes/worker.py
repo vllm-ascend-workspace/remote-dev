@@ -454,7 +454,9 @@ def control_job(request, source, cancel_event=None):
                 if path.exists() and path.stat().st_size > int(request.get(stream + "_offset") or 0):
                     available = True
                     break
-            if available:
+            # Synchronous SDK capture already waits for completion. Returning
+            # on early output only adds a second round trip to observe exit.
+            if available and not request.get("wait_for_exit"):
                 break
             time.sleep(min(0.02, max(0, deadline - time.monotonic())))
         if cancel_event is not None and cancel_event.is_set():
