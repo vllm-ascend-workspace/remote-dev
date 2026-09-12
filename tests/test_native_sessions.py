@@ -67,6 +67,7 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(parameters["spec"]["interactive"])
         self.assertFalse(parameters["spec"]["tty"])
         self.assertEqual(parameters["yield_time_ms"], 10000)
+        self.assertFalse(parameters["wait_for_exit"])
         self.assertEqual(result["session_id"], identifier)
 
     def test_completed_launch_has_consistent_final_observation(self):
@@ -199,6 +200,7 @@ class SessionTests(unittest.TestCase):
         self.done, self.stdout = True, b"x" * 40000
         result = self.start(wait=True, max_output_tokens=64)
         self.assertFalse(self.calls[0][3]["spec"]["interactive"])
+        self.assertTrue(all(call[3]["wait_for_exit"] for call in self.calls))
         self.assertEqual([call[2] for call in self.calls], ["launch", "exchange", "exchange"])
         self.assertEqual(Path(result["refs"]["stdout"]).read_bytes(), self.stdout)
         self.assertEqual(len(result["preview"]["stdout"]), 128)

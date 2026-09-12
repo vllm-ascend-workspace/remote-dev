@@ -423,6 +423,9 @@ Python consumers needing a completed result call `remote_bash(..., wait=True)`.
 This waits and drains full log refs through the same supervisor, with stdin
 closed unless a PTY is requested. Coordinator retains its separate
 `prepare`/authorized `go` gate for managed execution.
+Synchronous capture waits past early output until completion or the existing
+yield deadline, avoiding an extra round trip just to observe a short command's
+exit. Preview budgets, durable output cursors and cancellation remain the same.
 
 Two more transport primitives close the remaining SSH-option gaps. They are
 library APIs, not MCP tools, and they do not accept extra `-o` strings.

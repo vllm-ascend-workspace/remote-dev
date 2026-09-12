@@ -244,6 +244,7 @@ def start_remote_job(
         try:
             row = control(endpoint, job_id, "launch", spec=spec, authorization=record["authorization"],
                           stdout_offset=0, stderr_offset=0, max_bytes=budget, shared_budget=True,
+                          wait_for_exit=wait,
                           yield_time_ms=_yield_ms(yield_time_ms, 10000))
             _save_output(record, path, row)
             first_output = {name: str(row.get(name) or "") for name in ("stdout", "stderr")}
@@ -251,7 +252,8 @@ def start_remote_job(
                 if row.get("state") in {"absent", "lost", "unknown"} or row.get("unknown"):
                     break
                 row = control(endpoint, job_id, "exchange", **record["stdin_cursors"],
-                              max_bytes=MAX_INCREMENTAL_READ_BYTES, shared_budget=True, yield_time_ms=1000)
+                              max_bytes=MAX_INCREMENTAL_READ_BYTES, shared_budget=True,
+                              wait_for_exit=True, yield_time_ms=1000)
                 _save_output(record, path, row)
                 for name in ("stdout", "stderr"):
                     left = max(0, budget - sum(len(body.encode("utf-8")) for body in first_output.values()))

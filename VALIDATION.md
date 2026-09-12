@@ -4,6 +4,16 @@ Last updated: 2026-09-12 (connection lifecycle, control capacity and runtime she
 
 ## Version 0.7 validation (2026-09-12)
 
+- Synchronous SDK capture waits past early output until completion or the
+  existing yield deadline, retaining preview limits and complete durable logs.
+  Final-change checks: 27 native Windows session/job tests; 50 WSL worker,
+  session and job tests plus 9 subtests. These cover cancellation, command
+  timeout, early output, yield deadlines and UTF-8 output cursors.
+  Three alternating small-command pairs on one warmed Windows-to-Linux RPC
+  connection reduced control calls from two to one: baseline median 0.802 s
+  (0.729–1.230), candidate 0.532 s (0.498–0.956). Ranges overlap; this is
+  endpoint-specific evidence, not an absolute latency guarantee.
+
 - Hosted Windows Python 3.9/3.12 exposed equal monotonic timer ticks in the
   pool's LRU selection. A completion-order counter now breaks this ambiguity
   without changing idle-expiry deadlines. A fixed-clock regression confirms
