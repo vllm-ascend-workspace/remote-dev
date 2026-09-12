@@ -7,6 +7,7 @@ ENDPOINT_PROPS: dict[str, Any] = {
     "host": {"type": "string"},
     "port": {"type": "integer"},
     "user": {"type": "string", "default": "root"},
+    "container": {"type": "string", "description": "Existing Docker container name or ID on the SSH host. All tools operate inside it; results return a full ID for reuse without another name lookup. No provisioning or managed allocation."},
     "root": {"type": "string", "default": "/"},
     "cwd": {"type": "string"},
     "runtime_env": {"type": "boolean", "default": True},

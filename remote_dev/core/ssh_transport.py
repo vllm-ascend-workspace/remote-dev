@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .endpoint import Endpoint
+from .container_endpoint import pin_container_endpoint, pinned_endpoint
 from .errors import RemoteExecutionError
 from .local_process import OwnedProcess
 
@@ -280,7 +281,31 @@ def _ssh_cmd(endpoint: Endpoint, option_tokens: Sequence[str] = ()) -> list[str]
 
 
 def ssh_base_cmd(endpoint: Endpoint) -> list[str]:
+    if endpoint.container:
+        raise RemoteExecutionError("ssh_base_cmd is a host-only argv prefix; use ssh_command for a container endpoint")
     return _ssh_cmd(endpoint)
+
+
+def ssh_command(endpoint: Endpoint, *remote_tokens: str) -> list[str]:
+    """Build a complete SSH command, executing only inside a selected container.
+
+    Tokens use OpenSSH's quoting convention for one command argv. For shell
+    syntax supply ``bash -c`` and a quoted script. Container argv is parsed and
+    re-quoted so operators or expansions can never escape into the host shell.
+    Container execution preserves Docker's configured user and environment.
+    """
+    endpoint = pin_container_endpoint(endpoint)
+    if not endpoint.container:
+        return [*ssh_base_cmd(endpoint), *remote_tokens]
+    if not remote_tokens:
+        raise RemoteExecutionError("container SSH command requires an explicit remote command")
+    from dataclasses import replace
+    host = replace(endpoint, container=None, container_selector=None)
+    argv = shlex.split(" ".join(remote_tokens))
+    if not argv:
+        raise RemoteExecutionError("container SSH command requires an explicit remote command")
+    command = shlex.join(["docker", "exec", "-i", endpoint.container, *argv])
+    return [*ssh_base_cmd(host), command]
 
 
 def stream_remote_payload(script: str, timeout_ms: int | None) -> str:
@@ -313,6 +338,7 @@ def _require_independent_stream(endpoint: Endpoint) -> None:
         raise RemoteExecutionError(STREAM_MUX_REFUSAL)
 
 
+@pinned_endpoint
 def stream_ssh_command(endpoint: Endpoint, script: str | None, *, timeout_ms: int | None = None) -> list[str]:
     """Argv for an attached live-stream SSH invocation.
 
@@ -326,15 +352,16 @@ def stream_ssh_command(endpoint: Endpoint, script: str | None, *, timeout_ms: in
         if timeout_ms is not None and timeout_ms > 0:
             margin = max(int(timeout_ms / 1000) - REMOTE_TIMEOUT_GRACE_SECONDS, 1)
             remote = f"timeout --preserve-status {margin}s bash -ls"
-        return [*ssh_base_cmd(endpoint), remote]
-    return [*ssh_base_cmd(endpoint), "bash", "-c", shlex.quote(stream_remote_payload(script, timeout_ms))]
+        return ssh_command(endpoint, remote)
+    return ssh_command(endpoint, "bash", "-c", shlex.quote(stream_remote_payload(script, timeout_ms)))
 
 
+@pinned_endpoint
 def run_script(endpoint: Endpoint, script: str, *, timeout_ms: int | None = None,
                trace_connection: bool = False) -> RemoteCompleted:
     started = time.perf_counter()
     timeout = None if timeout_ms is None else timeout_ms / 1000
-    command = [*ssh_base_cmd(endpoint), "bash", "-s"]
+    command = ssh_command(endpoint, "bash", "-s")
     payload = script.encode("utf-8")
     prepared = time.perf_counter()
     if trace_connection:
@@ -415,6 +442,7 @@ def _run_traced_script(command, payload, timeout_ms, started, prepared):
     return result
 
 
+@pinned_endpoint
 def run_stream(
     endpoint: Endpoint,
     script: str,
@@ -940,6 +968,7 @@ def _read_attached(
         close_pipes()
 
 
+@pinned_endpoint
 def run_bytes(
     endpoint: Endpoint,
     remote_command: str,
@@ -949,7 +978,7 @@ def run_bytes(
 ) -> subprocess.CompletedProcess[bytes]:
     timeout = None if timeout_ms is None else timeout_ms / 1000
     return subprocess.run(
-        [*ssh_base_cmd(endpoint), f"bash -c {shlex.quote(remote_command)}"],
+        ssh_command(endpoint, f"bash -c {shlex.quote(remote_command)}"),
         input=stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -968,6 +997,7 @@ raise SystemExit(result.returncode)
 """
 
 
+@pinned_endpoint
 def run_rpc_script(endpoint: Endpoint, script: str, *, timeout_ms: int | None = None,
                    mutation: bool = False) -> RemoteCompleted:
     """Bounded package scripts over RPC, including scoped cancellation.
@@ -981,6 +1011,7 @@ def run_rpc_script(endpoint: Endpoint, script: str, *, timeout_ms: int | None = 
                            timed_out=bool(row.get("timed_out")), cancelled=bool(row.get("cancelled")))
 
 
+@pinned_endpoint
 def run_remote_python(
     endpoint: Endpoint,
     code: str,
@@ -1074,6 +1105,8 @@ def _as_long_stream(endpoint: Endpoint) -> Endpoint:
         kind=endpoint.kind,
         alias=endpoint.alias,
         source=endpoint.source,
+        container=endpoint.container,
+        container_selector=endpoint.container_selector,
     )
 
 
@@ -1091,6 +1124,8 @@ def local_forward_ssh_command(
     keepalives, ``ExitOnForwardFailure=yes``, and ``-N``. Callers cannot
     inject extra ``-o`` strings.
     """
+    if endpoint.container:
+        raise RemoteExecutionError("container endpoints do not support SSH port forwarding; use an explicit host endpoint and a reachable published port")
     endpoint = _as_long_stream(endpoint)
     local_host = _validate_forward_host(local_host, field="local_host")
     remote_host = _validate_forward_host(remote_host, field="remote_host")
@@ -1222,6 +1257,8 @@ def open_local_forward(
     is not ``None``, the local port must accept connections before this
     returns.
     """
+    if endpoint.container:
+        raise RemoteExecutionError("container endpoints do not support SSH port forwarding; use an explicit host endpoint and a reachable published port")
     endpoint = _as_long_stream(endpoint)
     local_host = _validate_forward_host(local_host, field="local_host")
     remote_host = _validate_forward_host(remote_host, field="remote_host")
@@ -1274,6 +1311,8 @@ def interactive_ssh_command(
     Refuses a multiplexed endpoint. Does not accept extra ``-o`` strings.
     This is first-contact bootstrap, not a general PTY facility.
     """
+    if endpoint.container:
+        raise RemoteExecutionError("interactive bootstrap does not support container endpoints; use remote_bash with tty=True for a container PTY")
     if _uses_shared_mux(endpoint):
         raise RemoteExecutionError(INTERACTIVE_MUX_REFUSAL)
     timeout_s = max(1, int(endpoint.connect_timeout_ms / 1000))

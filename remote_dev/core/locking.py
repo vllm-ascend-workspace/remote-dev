@@ -73,14 +73,21 @@ def record_lock(path: Path):
 
 
 def mutation_lock(endpoint):
+    from .container_endpoint import pin_container_endpoint
     from .state_store import state_root
-    key = hashlib.sha256(f"{endpoint.user}@{endpoint.host}:{endpoint.port}".encode()).hexdigest()
+    endpoint = pin_container_endpoint(endpoint)
+    coordinate = f"{endpoint.user}@{endpoint.host}:{endpoint.port}"
+    if endpoint.container:
+        coordinate += "|container=" + endpoint.container
+    key = hashlib.sha256(coordinate.encode()).hexdigest()
     return record_lock(state_root() / "locks" / key)
 
 
 def serialize_mutation(function):
     @functools.wraps(function)
     def invoke(endpoint, *args, **kwargs):
+        from .container_endpoint import pin_container_endpoint
+        endpoint = pin_container_endpoint(endpoint, timeout_ms=kwargs.get("timeout_ms"))
         with mutation_lock(endpoint):
             return function(endpoint, *args, **kwargs)
     return invoke

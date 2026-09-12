@@ -15,7 +15,7 @@ import importlib
 import importlib.util
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -53,6 +53,12 @@ class Endpoint:
     kind: str = "direct-endpoint"
     alias: str | None = None
     source: dict[str, Any] | None = None
+    container: str | None = None
+    container_selector: str | None = None
+
+    def __post_init__(self):
+        from .container_endpoint import validate_container
+        validate_container(self.container)
 
     @classmethod
     def for_long_stream(cls, host: str, port: int, **kwargs: Any) -> Endpoint:
@@ -93,7 +99,8 @@ class Endpoint:
 
     @property
     def endpoint_key(self) -> str:
-        return f"{self.user}@{self.host}:{self.port}|root={self.root}"
+        key = f"{self.user}@{self.host}:{self.port}|root={self.root}"
+        return key + f"|container={self.container}" if self.container else key
 
     @property
     def endpoint_id(self) -> str:
@@ -115,6 +122,10 @@ class Endpoint:
         }
         if self.runtime_env_file:
             payload["runtime_env_file"] = self.runtime_env_file
+        if self.container:
+            payload["container"] = self.container
+        if self.container_selector:
+            payload["container_selector"] = self.container_selector
         if self.alias:
             payload["alias"] = self.alias
         if self.source:
@@ -240,6 +251,7 @@ def _direct_endpoint(payload: dict[str, Any]) -> Endpoint:
         kind=str(payload.get("kind") or "direct-endpoint"),
         alias=str(payload["alias"]) if payload.get("alias") else None,
         source=payload.get("source") if isinstance(payload.get("source"), dict) else None,
+        container=payload.get("container"),
     )
 
 
@@ -429,6 +441,8 @@ def _endpoint_from_resolver(entry: RegisteredResolver, payload: dict[str, Any]) 
     if resolved is None:
         return None
     if isinstance(resolved, Endpoint):
+        if payload.get("container") is not None:
+            return replace(resolved, container=payload["container"], container_selector=None)
         return resolved
     if not isinstance(resolved, dict):
         raise EndpointError(f"endpoint resolver {entry.name!r} returned {type(resolved).__name__}; expected dict, Endpoint, or None")
@@ -448,6 +462,7 @@ def _endpoint_from_resolver(entry: RegisteredResolver, payload: dict[str, Any]) 
             "connect_timeout_ms",
             "ssh_mux",
             "keepalive",
+            "container",
         )
         and value is not None
     }

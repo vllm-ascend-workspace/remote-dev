@@ -27,6 +27,7 @@ def add_endpoint_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
     parser.add_argument("--user", default=None)
+    parser.add_argument("--container", help="Existing Docker container name or ID on the SSH host; results return its fixed full ID.")
     parser.add_argument("--root", default=None)
     parser.add_argument("--cwd", "--workdir", dest="cwd", default=None, help="Working directory (--workdir is the Codex exec_command habit).")
     parser.add_argument("--runtime-env", dest="runtime_env", action="store_true", default=None)
@@ -61,6 +62,7 @@ def endpoint_payload(args: argparse.Namespace) -> dict[str, Any]:
         "host",
         "port",
         "user",
+        "container",
         "root",
         "cwd",
         "runtime_env",

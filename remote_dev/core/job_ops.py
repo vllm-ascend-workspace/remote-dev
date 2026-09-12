@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from remote_dev.core.endpoint import DEFAULT_CWD, DEFAULT_ROOT, Endpoint
+from remote_dev.core.container_endpoint import FULL_CONTAINER_ID, pinned_endpoint
 from remote_dev.core.errors import RemoteExecutionError
 from remote_dev.core.preview import MAX_JOB_TAIL_LINES, MAX_TEXT_CHARS, compact_text
 from remote_dev.core.locking import record_lock
@@ -77,7 +78,10 @@ def _record_cwd(target: dict[str, Any]) -> str:
 def _endpoint_from_record(record: dict[str, Any]) -> Endpoint:
     target = record.get("connection") or record.get("target", {})
     fields = Endpoint.__dataclass_fields__
-    return Endpoint(**{key: value for key, value in target.items() if key in fields})
+    endpoint = Endpoint(**{key: value for key, value in target.items() if key in fields})
+    if endpoint.container and not FULL_CONTAINER_ID.fullmatch(endpoint.container):
+        raise ValueError("job record lacks a fixed full container ID; refusing to resolve a replacement by name")
+    return endpoint
 
 
 
@@ -210,6 +214,7 @@ def _session_result(endpoint, record, path, row, *, tool, started, start, budget
     return {"text": text, "result": result}
 
 
+@pinned_endpoint
 def start_remote_job(
     endpoint: Endpoint, *, command: str, cwd: str | None = None,
     env: dict[str, str] | None = None, timeout_ms: int | None = None,
@@ -270,6 +275,7 @@ def start_remote_job(
     return _session_result(endpoint, record, path, row, tool="remote.bash", started=started, start=start, budget=budget)
 
 
+@pinned_endpoint
 def remote_job_status(endpoint: Endpoint | None, *, job_id: str) -> dict[str, Any]:
     endpoint, record, _record_path = _load_record(endpoint, job_id)
     started = utc_now_iso()
@@ -302,6 +308,7 @@ def remote_job_status(endpoint: Endpoint | None, *, job_id: str) -> dict[str, An
     return {"text": f"Remote job {job_id}: {status}\n", "result": result}
 
 
+@pinned_endpoint
 def remote_job_tail(endpoint: Endpoint | None, *, job_id: str, lines: int = 80, stream: str = "both") -> dict[str, Any]:
     endpoint, record, _record_path = _load_record(endpoint, job_id)
     started = utc_now_iso()
@@ -372,6 +379,7 @@ def _output_budget_bytes(max_output_tokens: int | None) -> int:
     return max(4, min(MAX_INCREMENTAL_READ_BYTES, int(max_output_tokens) * 2))
 
 
+@pinned_endpoint
 def remote_job_stdin(endpoint: Endpoint | None, *, job_id: str, chars: str | None = None,
                      eof: bool = False, yield_time_ms: int | None = None,
                      max_output_tokens: int | None = None) -> dict[str, Any]:
@@ -412,6 +420,7 @@ def remote_job_stdin(endpoint: Endpoint | None, *, job_id: str, chars: str | Non
     return _session_result(endpoint, record, path, row, tool="remote.job_stdin", started=started, start=start, budget=budget)
 
 
+@pinned_endpoint
 def remote_job_stop(endpoint: Endpoint | None, *, job_id: str, force: bool = False) -> dict[str, Any]:
     endpoint, record, _record_path = _load_record(endpoint, job_id)
     started = utc_now_iso()

@@ -26,6 +26,9 @@ facts (`remote.probe`, `remote.context_snapshot`).
 Layer B is the shared substrate:
 
 - endpoint identity and explicit resolution (`remote_dev.core.endpoint`)
+- existing Docker container coordinates (`core.container_endpoint`): resolve a
+  name to a running full ID through the host's existing RPC, then freeze that ID
+  before operation records or concurrency checks; full IDs need no lookup
 - resolver plugin interface for consumer-owned selectors (same module)
 - binary SSH stdio RPC pooling on Windows and POSIX (`core.rpc_transport`),
   with request ids, bounded code caches, scoped cancellation, concurrent
@@ -48,6 +51,16 @@ Layer B is the shared substrate:
 - concurrent MCP server and resources with eight ordinary workers/32 slots and
   two reserved control workers/eight slots (`remote_dev.mcp`); remote RPC uses
   the same split; JSON lines and Content-Length frames share one dispatcher
+
+`ssh_command` is the shared complete-command constructor. Container operations
+invoke `docker exec -i <full-id>` for the existing Python RPC worker, binary
+artifact worker, Bash scripts and streams. No container daemon/SSH server,
+separate supervisor, dependency installer or managed resource authority is added.
+Host-only prefixes, interactive bootstrap and port forwarding reject container
+endpoints before launching a process. RPC-created PTYs remain inside the container.
+Container IDs partition local state, mutation locks and connection pools; retained
+job records never re-resolve a mutable name. New explicit names are fresh Docker
+selections, so no TTL, background watcher or invalidation protocol is needed.
 
 Layer C is whatever the consumer builds on top: workflow skills, session
 managers, coordinators. It lives in the consumer's repository and talks to

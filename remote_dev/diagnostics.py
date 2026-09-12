@@ -10,6 +10,7 @@ import urllib.request
 from dataclasses import replace
 
 from remote_dev.core.ssh_transport import _uses_shared_mux, run_script
+from remote_dev.core.container_endpoint import pinned_endpoint
 
 # One fixed read-only request gathers related facts without model imports.
 # This protocol is not a wrapper around an arbitrary caller command.
@@ -40,6 +41,7 @@ def ssh_details(endpoint, timeout_ms=None) -> dict:
             "timeout_ms": timeout_ms}
 
 
+@pinned_endpoint
 def diagnose_ssh(endpoint, *, timeout_ms=10000) -> dict:
     if timeout_ms <= 0:
         raise ValueError("diagnostic timeout_ms must be positive")

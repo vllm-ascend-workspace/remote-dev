@@ -4,6 +4,7 @@ import time
 from typing import Any
 
 from .endpoint import Endpoint
+from .container_endpoint import pinned_endpoint
 from .errors import PathPolicyError
 from .path_policy import join_under_root
 from .preview import MAX_GREP_MATCHES, MAX_LINE_CHARS, MAX_TEXT_CHARS, compact_text
@@ -471,6 +472,7 @@ def _compact_matches(matches: list[Any]) -> tuple[list[str], bool]:
     return visible, truncated or len(visible) < len(matches)
 
 
+@pinned_endpoint
 def remote_glob(
     endpoint: Endpoint,
     *,
@@ -521,6 +523,7 @@ def remote_glob(
     return {"text": text, "result": result}
 
 
+@pinned_endpoint
 def remote_grep(
     endpoint: Endpoint,
     *,

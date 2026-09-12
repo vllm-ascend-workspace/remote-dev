@@ -46,6 +46,52 @@ Runtime requirements: Python 3.9+ and an `ssh` client. No third-party
 packages. Nothing here needs GPU/NPU hardware; the remote host only needs
 `bash`, `python3`, and (for `remote.apply_patch` unified diffs) `git`.
 
+## Work inside an existing container
+
+Add `container` to an ordinary SSH host endpoint. Read, edit, search, patch,
+commands, jobs and artifacts then operate inside that existing Docker container:
+
+```json
+{"host":"lab-host","port":22,"container":"repro-case","cwd":"/work/vllm","command":"bash /work/start-case.sh"}
+```
+
+The CLI accepts the same coordinate as `--container repro-case`. No session,
+registration, source copy or environment preparation is needed. `user` remains
+the SSH user; `docker exec` retains the container's configured user and environment.
+The existing container must be running with Python 3 and, for shell commands,
+Bash. Jobs also require a writable endpoint `root` for their existing scratch
+files; a non-root container user can select a writable code root. Docker access
+comes from the SSH account. Missing requirements are errors;
+remote-dev does not install packages, start/restart containers or provide managed
+device/port allocation. A container already exposing SSH can still use its direct
+SSH endpoint without the `container` field.
+
+Your startup script is the command, unchanged. Use `runtime_env_file` only when
+you want an environment script sourced before that command. Knowledge and managed
+execution systems are independent optional consumers, never prerequisites.
+
+Names and short IDs are resolved by one read-only Docker inspect per operation.
+The returned `target.container` is the full Docker ID; `target.container_selector`
+preserves the supplied name/short ID for display. Reusing the returned full ID
+avoids further inspect calls. Every stage of an operation, job receipt, read ledger
+and pooled connection uses this fixed ID. A new name-based operation can select a
+replacement container; an old job reference always retains its old ID. There is
+no name cache, implicit host fallback or replay after an uncertain submission.
+Read-before-write concurrency checks remain optional and scoped to that ID.
+
+For a container PTY use `remote.bash` with `tty=true`. The low-level interactive
+bootstrap and SSH local-forward helpers explicitly reject container endpoints;
+forward a reachable published port through an explicit host endpoint instead.
+`ssh_base_cmd` is a host-only prefix; Python consumers constructing complete
+commands use `ssh_command`. A consumer composing several operations can call
+`core.container_endpoint.pin_container_endpoint` once and reuse its returned
+Endpoint. Ordinary SSH operations perform no Docker lookup.
+
+Workers and owned job logs retain the existing remote-dev scratch files. Stopping
+a job stops only its identified process family, never the container or unrelated
+processes. Arbitrary side effects in the user's command remain that command's
+behavior.
+
 The same public API runs from Windows, macOS and Linux clients. Attached SSH
 streams and local forwards launch literal argv under an owned local process
 group: a Windows Job Object is assigned before the child starts; POSIX uses an
