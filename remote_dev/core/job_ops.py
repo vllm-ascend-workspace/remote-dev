@@ -65,7 +65,9 @@ def _job_command(endpoint: Endpoint, command: str, runtime_enabled: bool) -> str
     preamble = runtime_env_lines(endpoint, runtime_enabled)
     if not preamble:
         return command
-    return "; ".join([*preamble, f"bash -c {shlex.quote(command)}"])
+    # Parse the user's command after initialization, in the same shell. This
+    # preserves runtime functions/options and avoids a second SSH .bashrc load.
+    return "\n".join([*preamble, f"eval -- {shlex.quote(command)}"])
 
 
 def _record_cwd(target: dict[str, Any]) -> str:
@@ -374,14 +376,36 @@ def remote_job_stdin(endpoint: Endpoint | None, *, job_id: str, chars: str | Non
     endpoint, record, path = _load_record(endpoint, job_id)
     started, start = utc_now_iso(), time.monotonic()
     budget = _output_budget_bytes(max_output_tokens)
+    delay = _yield_ms(yield_time_ms, 250 if chars or eof else 1000)
+    # A long observation must not hold the local cursor lock: otherwise a
+    # waiting poll also blocks stdin, consuming the reserved control workers.
+    # Snapshot the cursor, wait unlocked, then commit only against that snapshot.
+    observed = None
+    if delay > 250:
+        with record_lock(path):
+            snapshot = json.loads(path.read_text(encoding="utf-8")).get("stdin_cursors", {})
+        observed = control(endpoint, job_id, "exchange", data=chars or "", eof=bool(eof),
+                           stdout_offset=int(snapshot.get("stdout_offset") or 0),
+                           stderr_offset=int(snapshot.get("stderr_offset") or 0),
+                           max_bytes=budget, shared_budget=True, yield_time_ms=delay)
     with record_lock(path):
         record = json.loads(path.read_text(encoding="utf-8"))
         cursors = record.get("stdin_cursors", {})
-        row = control(endpoint, job_id, "exchange", data=chars or "", eof=bool(eof),
-                      stdout_offset=int(cursors.get("stdout_offset") or 0),
-                      stderr_offset=int(cursors.get("stderr_offset") or 0),
-                      max_bytes=budget, shared_budget=True,
-                      yield_time_ms=_yield_ms(yield_time_ms, 250 if chars or eof else 1000))
+        if observed is not None and cursors == snapshot:
+            row = observed
+        else:
+            row = control(endpoint, job_id, "exchange", data="" if observed is not None else chars or "",
+                          eof=False if observed is not None else bool(eof),
+                          stdout_offset=int(cursors.get("stdout_offset") or 0),
+                          stderr_offset=int(cursors.get("stderr_offset") or 0),
+                          max_bytes=budget, shared_budget=True, yield_time_ms=0 if observed is not None else delay)
+            if observed is not None:
+                # Input was submitted once, before the cursor conflict. Preserve
+                # its acknowledgement; only the output observation is repeated.
+                for key in ("accepted", "written", "written_chars", "eof", "eof_deferred",
+                            "stdin_buffer_full", "retryable", "reason", "cancellation_requested"):
+                    if key in observed:
+                        row[key] = observed[key]
         _save_output(record, path, row)
     return _session_result(endpoint, record, path, row, tool="remote.job_stdin", started=started, start=start, budget=budget)
 

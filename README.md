@@ -141,10 +141,34 @@ by both the MCP dispatcher and the CLI `--input-json` path):
   metadata is separate. Unreturned bytes remain at the cursor; full decoded
   logs accumulate in local refs as pages are consumed.
 - Developer calls reuse one binary SSH stdio connection on Windows and POSIX,
-  independently of OpenSSH ControlMaster. MCP processes up to eight calls
-  concurrently and accepts cancellation while another call waits. Source caches,
-  queued requests and endpoint connections are bounded. A lost reply is an
-  unknown outcome and is never automatically replayed.
+  independently of OpenSSH ControlMaster. Concurrent first calls to the same
+  endpoint share startup; different endpoints do not hold a global startup lock.
+  The 32-connection pool evicts idle LRU entries automatically and expires idle
+  connections after five minutes (reaped within another minute). Busy connections
+  are never evicted; capacity waits respect cancellation and the request deadline.
+  Both MCP and remote RPC reserve two workers/eight slots for status, stop, tail
+  and short stdin exchanges, alongside eight ordinary workers/32 slots. Long
+  waits cannot consume that control capacity. A lost reply remains an unknown
+  outcome and is never automatically replayed.
+- Explicit `runtime_env_file` runs once per command in that command's Bash
+  process, preserving functions, non-exported variables, PATH order and shell
+  options. Missing scripts or failed initialization prevent the user command.
+  Normal Bash startup (including BASH_ENV and SSH .bashrc behavior) is retained;
+  arbitrary dynamic initialization is never cached.
+- Managed callers using `processes.control(..., "prepare", spec=...)` can set
+  `prepared_timeout_seconds` (default 120, between 1 and 86400 seconds) for their
+  bounded queue/activation wait. Expiration cancels the unopened gate without
+  running user code. Command `timeout_seconds` starts after activation; a lease
+  heartbeat does not implicitly extend the remote prepared deadline.
+- Tool arguments outside the published schema, native aliases and registered
+  endpoint selectors are rejected before execution. MCP `remote.bash` uses
+  `yield_time_ms` and continuation through `session_id`; `wait=True` is an SDK
+  option and is rejected on the MCP surface.
+- Developer MCP and CLI tools choose pooled connections and keepalives
+  internally. Their endpoint arguments no longer include `ssh_mux`,
+  `keepalive` or `--long-stream`; low-level Python transport callers retain
+  `Endpoint` policy and `Endpoint.for_long_stream`. MCP failure text includes
+  the status and recovery detail for clients that do not read structured results.
 - Reads scan in bounded memory. `verify_content=false` (CLI
   `--no-verify-content`) stops after a positive-offset log window and omits the
   hash/read ledger; the default retains a full hash and exact line count for
@@ -168,9 +192,10 @@ remote-dev resolves endpoints from explicit fields and nothing else:
 | `runtime_env_file`   | unset                | Remote profile script (`REMOTE_DEV_RUNTIME_ENV_FILE`)|
 | `identity_file`      | unset                | SSH private key                                      |
 | `connect_timeout_ms` | `10000`              | SSH connect timeout                                  |
-| `ssh_mux`            | process default      | Per-endpoint ControlMaster; see multiplexing below   |
-| `keepalive`          | `false`              | ServerAlive probes (mechanism; not "long stream")    |
 | `alias`              | unset                | Name from the endpoint alias files                   |
+
+The Python `Endpoint` API additionally accepts `ssh_mux` and `keepalive`
+for low-level transport callers; these are not developer-tool arguments.
 
 Resolution order in `remote_dev.core.endpoint.resolve_endpoint`:
 
@@ -320,14 +345,16 @@ remote-dev bash --selector lab=gpu-1 --command 'nproc'
 | `REMOTE_DEV_SSH_MUX`            | Process-wide SSH multiplexing *default* on POSIX: unset or `1` uses the shared ControlMaster; `0` forces independent connections; other values error. Native Windows has no Client ControlMaster (Win32-OpenSSH); ordinary connections already use the independent triple and do not need this flag. `ssh_mux=True` / `REMOTE_DEV_SSH_MUX=1` on native Windows is a capability error. An endpoint's `ssh_mux` overrides the process default on POSIX. |
 | `REMOTE_DEV_SESSION_ID`         | Read-ledger scope when no client id is given              |
 
-`REMOTE_DEV_SSH_MUX` is the process-wide default and is read without changing
+For low-level Python SSH calls, `REMOTE_DEV_SSH_MUX` is the process-wide
+default and is read without changing
 global SSH configuration or the shared ControlMaster socket. Leave it unset or
 set it to `1` to keep today's shared-mux path, including the per-identity
-`ControlPath` suffix. Set it to exact `0` in a CLI process that must not join
+`ControlPath` suffix. Set it to exact `0` in a Python process that must not join
 the shared master (`ControlMaster=no`, `ControlPath=none`, `ControlPersist=no`
 on every SSH invocation from that process that does not set `ssh_mux`).
 Accepted values are unset, `1`, and `0`; any other value is a configuration
-error. Ordinary POSIX serving and parity calls keep the default shared mux.
+error. Developer MCP/CLI operations use their own pooled independent
+connections with keepalives, regardless of this low-level default.
 Native Windows CLI and MCP pipes use UTF-8. Shell script uploads preserve LF
 bytes, and nested artifact paths use POSIX separators on the Linux peer.
 
@@ -335,7 +362,7 @@ On native Windows the transport chooses independent connections by itself
 because Win32-OpenSSH does not implement Client ControlMaster; do not set
 `ssh_mux=true` or `REMOTE_DEV_SSH_MUX=1` there.
 
-A single process may do both at once. Set `ssh_mux=false` (CLI `--no-ssh-mux`)
+A single Python process may do both at once. Set `ssh_mux=false`
 on the endpoints that must stay off the shared master, and leave the rest on
 the default. This is not optional for long-lived connections such as
 `ssh -N -L` tunnels: ControlMaster delegates `-N` forwards to the mux master
@@ -345,7 +372,7 @@ ineffective, so the independent triple has to be chosen before the command is
 built. `ControlMaster=no` alone is not enough — a client can still attach to
 an existing `ControlPath`.
 
-`keepalive=true` (CLI `--keepalive`) adds `ServerAliveInterval=30` and
+Low-level `keepalive=true` adds `ServerAliveInterval=30` and
 `ServerAliveCountMax=10`. That is a mechanism flag, orthogonal to mux, and
 conditional rather than always-on: a slow multi-hour stream otherwise dies
 to an idle timeout somewhere in the path, but attaching ServerAlive to short
@@ -355,7 +382,7 @@ ControlMaster (the master owns the TCP connection; first-option-wins).
 Hour-scale streams and `ssh -N -L` tunnels use one named entry point:
 `Endpoint.for_long_stream(host, port, ...)`. It always sets `ssh_mux=False`
 and `keepalive=True` and cannot be half-configured (`ssh_mux=True` is
-refused). CLI `--long-stream` does the same. `run_stream` /
+refused). `run_stream` /
 `stream_ssh_command` refuse any endpoint that would still attach to a
 ControlMaster — the silent failure this project recorded is rc=0 with the
 tunnel gone, so a docstring is not a control.
@@ -366,6 +393,9 @@ both sides (remote `timeout --preserve-status` plus a local deadline-bounded
 reader: `select` on POSIX, reader threads on native Windows). It returns
 `RemoteCompleted` (`returncode`, not `exit_code`) and does not emit
 `remote-dev.result.v1`. It is not `remote.job_*`.
+Scripts travel through binary stdin instead of command-line arguments, so
+large generated scripts work on native Windows. Upload and output draining
+run concurrently under the same local timeout.
 
 Detached background work uses one process implementation:
 `remote_dev.processes.control(endpoint, job_id, action, **parameters)`.

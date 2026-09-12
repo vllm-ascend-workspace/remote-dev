@@ -69,26 +69,36 @@ sys.addaudithook(audit)
                 self.assertEqual(help_proc.returncode, 0, help_proc.stderr)
                 self.assertIn("usage:", help_proc.stdout)
 
-    def test_cli_payload_maps_ssh_mux_keepalive_and_long_stream_flags(self) -> None:
+    def test_cli_consumes_local_input_files_before_tool_argument_validation(self) -> None:
+        from unittest import mock
+        from remote_dev import cli
+        from remote_dev.mcp import tools
+        with tempfile.TemporaryDirectory() as directory:
+            content = Path(directory) / "content.txt"
+            content.write_text("file body", encoding="utf-8")
+            arguments = Path(directory) / "arguments.json"
+            arguments.write_text(json.dumps({"file_path": "/tmp/example", "overwrite": True}), encoding="utf-8")
+            args = cli.build_parser("write").parse_args(["--host", "example.invalid", "--port", "22",
+                "--content-file", str(content), "--input-json", str(arguments)])
+            with mock.patch.object(tools, "remote_write", return_value={"ok": True}) as write:
+                self.assertEqual(cli.run_tool("write", args), {"ok": True})
+                self.assertEqual(write.call_args.kwargs["content"], "file body")
+                self.assertEqual(write.call_args.kwargs["file_path"], "/tmp/example")
+                self.assertTrue(write.call_args.kwargs["overwrite"])
+
+    def test_cli_keeps_transport_policy_out_of_developer_tools(self) -> None:
         from remote_dev.cli import build_parser, endpoint_payload
 
         parser = build_parser("probe")
-        args = parser.parse_args(["--host", "192.0.2.10", "--port", "22", "--no-ssh-mux", "--keepalive"])
-        payload = endpoint_payload(args)
-        self.assertIs(payload["ssh_mux"], False)
-        self.assertIs(payload["keepalive"], True)
-        stream_args = parser.parse_args(["--host", "192.0.2.10", "--port", "22", "--long-stream"])
-        stream_payload = endpoint_payload(stream_args)
-        self.assertIs(stream_payload["ssh_mux"], False)
-        self.assertIs(stream_payload["keepalive"], True)
         default_args = parser.parse_args(["--host", "192.0.2.10", "--port", "22"])
         default_payload = endpoint_payload(default_args)
         self.assertNotIn("ssh_mux", default_payload)
         self.assertNotIn("keepalive", default_payload)
-        with self.assertRaises(ValueError) as raised:
-            endpoint_payload(parser.parse_args(["--host", "192.0.2.10", "--port", "22", "--ssh-mux", "--long-stream"]))
-        self.assertIn("rc=0", str(raised.exception))
-        self.assertIn("first-option-wins", str(raised.exception))
+        for flag in ("--ssh-mux", "--no-ssh-mux", "--keepalive", "--long-stream"):
+            with self.subTest(flag=flag):
+                result = _cli("probe", "--host", "192.0.2.10", "--port", "22", flag)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("unrecognized arguments", result.stderr)
 
     def test_cli_endpoint_flags_are_explicit_only(self) -> None:
         proc = _cli("bash", "--help")
@@ -102,13 +112,9 @@ sys.addaudithook(audit)
             "--alias",
             "--selector",
             "--runtime-env-file",
-            "--ssh-mux",
-            "--no-ssh-mux",
-            "--keepalive",
-            "--long-stream",
         ):
             self.assertIn(flag, proc.stdout)
-        for legacy in ("--session-id", "--session-file", "--machine"):
+        for legacy in ("--session-id", "--session-file", "--machine", "--ssh-mux", "--no-ssh-mux", "--keepalive", "--long-stream"):
             self.assertNotIn(legacy, proc.stdout)
 
     def test_cli_selector_without_resolver_is_endpoint_required(self) -> None:

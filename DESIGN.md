@@ -45,8 +45,9 @@ Layer B is the shared substrate:
 - local record locks and a shared remote mutation lock across file tools,
   patches and artifact commits; concurrent reads remain independent
 - Claude/Codex hook guards (`remote_dev.hooks`)
-- concurrent MCP server and resources with eight workers and 32 admitted calls
-  (`remote_dev.mcp`); JSON lines and Content-Length frames share one dispatcher
+- concurrent MCP server and resources with eight ordinary workers/32 slots and
+  two reserved control workers/eight slots (`remote_dev.mcp`); remote RPC uses
+  the same split; JSON lines and Content-Length frames share one dispatcher
 
 Layer C is whatever the consumer builds on top: workflow skills, session
 managers, coordinators. It lives in the consumer's repository and talks to

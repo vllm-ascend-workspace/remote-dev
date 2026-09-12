@@ -13,7 +13,7 @@ from typing import Any
 os.environ.setdefault("REMOTE_DEV_SESSION_ID", f"mcp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
 
 from remote_dev import package_version
-from remote_dev.mcp.tools import call_tool, list_resources, list_tools, read_resource
+from remote_dev.mcp.tools import call_tool, canonical_name, list_resources, list_tools, read_resource
 from remote_dev.runtime import process_identity, runtime_status
 
 LOADED_RUNTIME = process_identity("vaws-remote-dev")
@@ -47,6 +47,22 @@ def error(request_id: Any, code: int, message: str, data: Any | None = None, *, 
     if data is not None:
         payload["error"]["data"] = data
     send(payload, framed=framed)
+
+
+def tool_text(payload: dict[str, Any]) -> str:
+    """Keep failures actionable for clients that only consume MCP text."""
+    text = str(payload.get("text") or "")
+    details = payload.get("result") or {}
+    if details.get("outcome") in {"success", "cancelled"}:
+        return text
+    status = str(details.get("status") or details.get("outcome") or "failed")
+    parts = [f"Remote tool failed ({status})."]
+    for value in (details.get("summary"), details.get("error")):
+        if value and str(value) not in text:
+            parts.append(str(value))
+    if text.strip():
+        parts.append(text.rstrip())
+    return "\n".join(parts) + "\n"
 
 
 def handle(message: dict[str, Any], *, framed: bool = False) -> None:
@@ -83,7 +99,7 @@ def handle(message: dict[str, Any], *, framed: bool = False) -> None:
             result(
                 request_id,
                 {
-                    "content": [{"type": "text", "text": payload.get("text", "")}],
+                    "content": [{"type": "text", "text": tool_text(payload)}],
                     "structuredContent": payload.get("result", {}),
                     "isError": payload.get("result", {}).get("outcome") not in {"success", "cancelled"},
                 },
@@ -105,6 +121,8 @@ class Dispatcher:
     def __init__(self):
         self.executor = ThreadPoolExecutor(max_workers=8)
         self.capacity = threading.BoundedSemaphore(32)
+        self.control_executor = ThreadPoolExecutor(max_workers=2)
+        self.control_capacity = threading.BoundedSemaphore(8)
         self.lock = threading.Lock()
         self.pending = {}
 
@@ -120,11 +138,23 @@ class Dispatcher:
             handle(message, framed=framed)
             return
         identifier = message.get("id")
+        params = message.get("params") or {}
+        arguments = params.get("arguments") or {}
+        name = params.get("name")
+        name = canonical_name(name) if isinstance(name, str) else None
+        short_control = name in {"remote.job_status", "remote.job_tail", "remote.job_stop"}
+        if name == "remote.job_stdin":
+            delay = arguments.get("yield_time_ms")
+            if delay is None:
+                delay = 250 if arguments.get("chars") or arguments.get("eof") else 1000
+            short_control = type(delay) in (int, float) and 0 <= delay <= 250
+        capacity = self.control_capacity if short_control else self.capacity
+        executor = self.control_executor if short_control else self.executor
         with self.lock:
             if identifier in self.pending:
                 error(identifier, -32600, "request id is already running", framed=framed)
                 return
-            if not self.capacity.acquire(blocking=False):
+            if not capacity.acquire(blocking=False):
                 error(identifier, -32000, "request capacity exhausted; not executed", framed=framed)
                 return
             event = threading.Event()
@@ -139,14 +169,15 @@ class Dispatcher:
             finally:
                 with self.lock:
                     self.pending.pop(identifier, None)
-                self.capacity.release()
-        self.executor.submit(execute)
+                capacity.release()
+        executor.submit(execute)
 
     def close(self):
         with self.lock:
             for event in self.pending.values():
                 event.set()
         self.executor.shutdown(wait=True)
+        self.control_executor.shutdown(wait=True)
 
 
 def dispatch(message, framed=False):

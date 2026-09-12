@@ -6,7 +6,7 @@ from typing import Any
 
 from remote_dev.core.artifact_ops import remote_artifact_manifest, remote_artifact_pull, remote_artifact_push
 from remote_dev.core.context_snapshot import remote_context_snapshot, remote_probe
-from remote_dev.core.endpoint import has_selector, resolve_endpoint
+from remote_dev.core.endpoint import has_selector, resolve_endpoint, selector_fields
 from remote_dev.core.file_ops import remote_edit, remote_ls, remote_multi_edit, remote_read, remote_write
 from remote_dev.core.job_ops import endpoint_from_job_record, remote_job_stdin, require_job_id, remote_job_status, remote_job_stop, remote_job_tail
 from remote_dev.core.patch_ops import remote_apply_patch
@@ -21,7 +21,7 @@ from remote_dev.core.state_store import (
     read_text_if_exists,
     state_root,
 )
-from remote_dev.mcp.schemas import ALIASES, TOOL_SCHEMAS, normalize_arguments
+from remote_dev.mcp.schemas import ALIASES, PARAM_ALIASES, TOOL_SCHEMAS, normalize_arguments
 from remote_dev.processes import control
 
 ENDPOINT_ID_RE = re.compile(r"^[0-9a-f]{16}$")
@@ -214,6 +214,15 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     name = canonical_name(name)
     if name not in TOOL_SCHEMAS:
         raise KeyError(f"unknown remote-dev tool: {name}")
+    allowed = set(TOOL_SCHEMAS[name]["properties"]) | set(PARAM_ALIASES.get(name, {})) | set(selector_fields())
+    # The common timeout applies to the file/search/artifact operations too.
+    allowed.update({"timeout", "timeout_ms"})
+    unknown = set(args) - allowed
+    if unknown:
+        hint = ""
+        if name == "remote.bash" and "wait" in unknown:
+            hint = "; use yield_time_ms and continue with session_id; wait=True is only a Python SDK option"
+        raise ValueError(f"{name} received unsupported argument(s): {', '.join(sorted(unknown))}{hint}")
     args = normalize_arguments(name, args)
     endpoint = None
     # Job tools can locate their endpoint from the local job record, so they
@@ -225,9 +234,6 @@ def call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
         _require(args, "job_id", name, "session_id")
     if name == "remote.bash":
         assert endpoint is not None
-        removed = {"run_in_background", "interactive"}.intersection(args)
-        if removed:
-            raise ValueError("remote.bash uses automatic writable sessions; remove " + ", ".join(sorted(removed)) + "; use yield_time_ms=0 to return immediately")
         command_timeout = args.get("timeout_ms", args.get("timeout"))
         return remote_bash(
             endpoint,

@@ -313,13 +313,20 @@ def _require_independent_stream(endpoint: Endpoint) -> None:
         raise RemoteExecutionError(STREAM_MUX_REFUSAL)
 
 
-def stream_ssh_command(endpoint: Endpoint, script: str, *, timeout_ms: int | None = None) -> list[str]:
+def stream_ssh_command(endpoint: Endpoint, script: str | None, *, timeout_ms: int | None = None) -> list[str]:
     """Argv for an attached live-stream SSH invocation.
 
     Refuses a multiplexed endpoint. Use :meth:`Endpoint.for_long_stream`
-    or pass ``ssh_mux=False``.
+    or pass ``ssh_mux=False``. ``script=None`` reads the script from binary
+    stdin, avoiding client and remote command-line length limits.
     """
     _require_independent_stream(endpoint)
+    if script is None:
+        remote = "bash -s"
+        if timeout_ms is not None and timeout_ms > 0:
+            margin = max(int(timeout_ms / 1000) - REMOTE_TIMEOUT_GRACE_SECONDS, 1)
+            remote = f"timeout --preserve-status {margin}s bash -ls"
+        return [*ssh_base_cmd(endpoint), remote]
     return [*ssh_base_cmd(endpoint), "bash", "-c", shlex.quote(stream_remote_payload(script, timeout_ms))]
 
 
@@ -456,7 +463,7 @@ def run_stream(
     Silent-hang handling: ``timeout_ms`` is enforced two ways at once.
 
     1. Remote-side kill. The command is wrapped in
-       ``timeout --preserve-status <s>s bash -lc …`` so an unresponsive
+       ``timeout --preserve-status <s>s bash -ls`` so an unresponsive
        remote process is killed at the source even when it has stopped
        producing output. A five-second grace margin lets the remote timeout
        fire first. ``--preserve-status`` keeps a successful command's real
@@ -476,21 +483,45 @@ def run_stream(
     mux master and the client exits rc=0, which looks like success.
     """
     dest = sys.stderr if output is None and merge_stderr else output
-    cmd = stream_ssh_command(endpoint, script, timeout_ms=timeout_ms)
+    cmd = stream_ssh_command(endpoint, None, timeout_ms=timeout_ms)
     proc = subprocess.Popen(
         cmd,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
         bufsize=0,
     )
-    return _read_attached(
-        proc,
-        timeout_ms=timeout_ms,
-        forward_prefix=forward_prefix,
-        output=dest,
-        on_output=on_output,
-        capture=not merge_stderr,
-    )
+    # Upload concurrently with output draining: a script larger than pipe
+    # capacity must not stall progress or bypass the reader's local deadline.
+    # Binary writes preserve LF on native Windows.
+    payload = script.encode("utf-8")
+
+    def upload() -> None:
+        try:
+            view = memoryview(payload)
+            while view:
+                written = proc.stdin.write(view[:65536])
+                if not written:
+                    break
+                view = view[written:]
+        except (BrokenPipeError, OSError):
+            pass  # The reader reports SSH exit status and stderr.
+        finally:
+            _close_pipe(proc.stdin)
+
+    writer = threading.Thread(target=upload, daemon=True, name="remote-dev-stream-upload")
+    writer.start()
+    try:
+        return _read_attached(
+            proc,
+            timeout_ms=timeout_ms,
+            forward_prefix=forward_prefix,
+            output=dest,
+            on_output=on_output,
+            capture=not merge_stderr,
+        )
+    finally:
+        writer.join(timeout=1)
 
 
 _STREAM_READ_BYTES = 4096

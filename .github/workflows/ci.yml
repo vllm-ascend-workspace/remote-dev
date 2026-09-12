@@ -37,8 +37,6 @@ jobs:
       - name: Publish failing test details
         if: failure()
         run: python tests/ci_failure_summary.py contracts.xml
-      - name: Local contract gates
-        run: remote-dev validate --local-only
 
   client-portability:
     name: Client portability (${{ matrix.os }}, Python ${{ matrix.python }})

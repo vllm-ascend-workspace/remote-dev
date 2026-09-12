@@ -50,7 +50,7 @@ class RpcTests(unittest.TestCase):
         self.assertEqual(first["value"], value)
         self.assertEqual(second["value"], value)
         self.assertEqual([first["calls"], second["calls"]], [1, 2])
-        connection = next(iter(rpc_transport._pool.values()))
+        connection = next(iter(rpc_transport._pool.values())).connection
         self.assertEqual(len(connection.sent_codes), 1)
         self.assertTrue(second["transport"]["connection_reused"])
 
@@ -67,7 +67,7 @@ class RpcTests(unittest.TestCase):
             source = CONTROL + "\n# version " + str(index)
             row = rpc_transport.request(self.endpoint, "control", source, {"value": index})
             self.assertEqual(row["value"], index)
-        connection = next(iter(rpc_transport._pool.values()))
+        connection = next(iter(rpc_transport._pool.values())).connection
         self.assertEqual(len(connection.sent_codes), 32)
         self.assertEqual(self.request({"value": "reloaded"})["value"], "reloaded")
 
@@ -124,7 +124,7 @@ print(json.dumps({'status':'ok'}))
 
     def test_disconnect_reports_unknown_outcome_without_replay(self):
         self.request({})
-        connection = next(iter(rpc_transport._pool.values()))
+        connection = next(iter(rpc_transport._pool.values())).connection
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(self.request, {"wait": True})
             time.sleep(0.1)
@@ -155,3 +155,30 @@ print(json.dumps({'status':'ok'}))
         self.assertEqual(failed["exit_code"], 7)
         invalid = ssh_transport.run_remote_python(self.endpoint, "print('plain text')", {})
         self.assertIn("non-JSON", invalid["error"])
+
+    def test_control_requests_have_capacity_when_all_normal_slots_are_waiting(self):
+        self.request({})
+        connection = next(iter(rpc_transport._pool.values())).connection
+        cancelled = threading.Event()
+        def wait():
+            with request_context(cancelled):
+                return self.request({"action": "launch", "wait": True})
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            futures = [pool.submit(wait) for _ in range(32)]
+            try:
+                deadline = time.monotonic() + 3
+                while len(connection.pending) < 32 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(len(connection.pending), 32)
+                started = time.monotonic()
+                for action in ("status", "stop", "stdin", "tail"):
+                    self.assertEqual(self.request({"action": action})["state"], "succeeded")
+                self.assertLess(time.monotonic() - started, 2)
+                self.assertFalse(any(future.done() for future in futures))
+            finally:
+                cancelled.set()
+            for future in futures:
+                try:
+                    future.result(timeout=5)
+                except RemoteExecutionError as exc:
+                    self.assertIn("cancelled before execution", str(exc))

@@ -578,6 +578,35 @@ class LiveStreamTests(unittest.TestCase):
     def setUp(self) -> None:
         self.endpoint = Endpoint.for_long_stream("192.0.2.10", 46000)
 
+    def test_stream_large_script_uses_binary_stdin_and_drains_live_output(self) -> None:
+        import hashlib
+        script = ("# unicode \u4e2d\u6587\n" * 50000) + "echo done\n"
+        expected = hashlib.sha256(script.encode("utf-8")).hexdigest()
+        code = (
+            "import hashlib,sys;sys.stdout.write('progress\\n');sys.stdout.flush();"
+            "data=sys.stdin.buffer.read();print(hashlib.sha256(data).hexdigest())"
+        )
+        with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=[sys.executable, "-c", code]) as command:
+            result = ssh_transport.run_stream(self.endpoint, script, timeout_ms=5000, merge_stderr=False)
+        self.assertIsNone(command.call_args.args[1])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["progress", expected])
+        self.assertFalse(result.timed_out)
+
+    def test_stream_upload_deadline_when_peer_never_reads_stdin(self) -> None:
+        with mock.patch.object(ssh_transport, "stream_ssh_command", return_value=[sys.executable, "-c", "import time;time.sleep(30)"]):
+            started = time.monotonic()
+            result = ssh_transport.run_stream(self.endpoint, "#" * 1000000, timeout_ms=200, merge_stderr=False)
+        self.assertTrue(result.timed_out)
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_stream_stdin_command_preserves_remote_timeout_and_independence(self) -> None:
+        argv = ssh_transport.stream_ssh_command(self.endpoint, None, timeout_ms=120000)
+        self.assertEqual(argv[-1], "timeout --preserve-status 115s bash -ls")
+        self.assertEqual(_option_map(argv)["ControlMaster"], "no")
+        self.assertEqual(_option_map(argv)["ControlPath"], "none")
+        self.assertEqual(_option_map(argv)["ServerAliveInterval"], "30")
+
     def test_run_stream_wraps_remote_timeout_and_forwards_live_output(self) -> None:
         # Would fail on main: run_stream / stream_ssh_command do not exist,
         # and run_script only returns after the command finishes.

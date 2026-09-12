@@ -40,6 +40,7 @@ STDIN_BUFFER_CAP = 262144
 STDIN_WRITE_CHUNK = getattr(select, "PIPE_BUF", 512)
 # States in which a job may still append to its logs.
 LIVE_JOB_STATES = frozenset({"prepared", "running", "uncertain"})
+DEFAULT_PREPARED_TIMEOUT_SECONDS = 120
 
 
 def _utf8_incomplete_tail(chunk):
@@ -247,9 +248,9 @@ def worker(directory):
     if interactive:
         fifo_fd = os.open(directory / "stdin.pipe", os.O_RDONLY | os.O_NONBLOCK)
     atomic_json(directory / "supervisor-ready.json", {"pid": os.getpid()})
-    deadline = time.time() + 120
+    deadline = time.monotonic() + spec.get("prepared_timeout_seconds", DEFAULT_PREPARED_TIMEOUT_SECONDS)
     while not (directory / "go.json").exists():
-        if (directory / "stop.json").exists() or time.time() >= deadline:
+        if (directory / "stop.json").exists() or time.monotonic() >= deadline:
             if fifo_fd is not None:
                 os.close(fifo_fd)
             atomic_json(directory / "result.json", {"state": "cancelled", "reason": "start gate not opened", "descendants_drained": True})
@@ -484,6 +485,9 @@ def control_job(request, source, cancel_event=None):
             timeout_seconds = spec.get("timeout_seconds")
             if timeout_seconds is not None and (type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 86400):
                 raise ValueError("jobs require timeout_seconds None or a number in (0, 86400]")
+            prepared_timeout = spec.get("prepared_timeout_seconds", DEFAULT_PREPARED_TIMEOUT_SECONDS)
+            if type(prepared_timeout) not in (int, float) or not 1 <= prepared_timeout <= 86400:
+                raise ValueError("jobs require prepared_timeout_seconds a number in [1, 86400]")
             if any(not ENV_NAME_RE.fullmatch(key) or key.startswith(JOB_ENV_PREFIX) for key in spec["env"]):
                 raise ValueError("invalid or reserved environment variable")
             for flag in ("interactive", "tty"):
@@ -520,6 +524,7 @@ def control_job(request, source, cancel_event=None):
                 raise RuntimeError("waiting supervisor has no verified process identity")
             atomic_json(directory / "receipt.json", {**identity, "boot_id": boot_id(), "marker": marker,
                                                       "supervision": "subreaper", "job_id": identifier,
+                                                      "prepared_timeout_seconds": prepared_timeout,
                                                       "prepared_at": time.time()})
             deadline = time.monotonic() + 5
             while not (directory / "supervisor-ready.json").exists():

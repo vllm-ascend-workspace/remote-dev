@@ -36,40 +36,6 @@ def add_endpoint_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--connect-timeout-ms", type=int)
     parser.add_argument("--alias", help="Endpoint alias from the endpoint alias files.")
     parser.add_argument(
-        "--ssh-mux",
-        dest="ssh_mux",
-        action="store_true",
-        default=None,
-        help="Use the shared ControlMaster for this endpoint (overrides REMOTE_DEV_SSH_MUX).",
-    )
-    parser.add_argument(
-        "--no-ssh-mux",
-        dest="ssh_mux",
-        action="store_false",
-        help=(
-            "Force an independent SSH connection for this endpoint "
-            "(ControlMaster=no, ControlPath=none, ControlPersist=no). "
-            "Required for long-lived tunnels and hour-scale streams."
-        ),
-    )
-    parser.add_argument(
-        "--keepalive",
-        dest="keepalive",
-        action="store_true",
-        default=None,
-        help="Add ServerAliveInterval/CountMax. Mechanism flag; hour-scale streams should use --long-stream.",
-    )
-    parser.add_argument(
-        "--long-stream",
-        dest="long_stream",
-        action="store_true",
-        default=None,
-        help=(
-            "Independent SSH connection plus keepalive "
-            "(same as Endpoint.for_long_stream). Cannot be combined with --ssh-mux."
-        ),
-    )
-    parser.add_argument(
         "--selector",
         action="append",
         metavar="KEY=VALUE",
@@ -102,23 +68,10 @@ def endpoint_payload(args: argparse.Namespace) -> dict[str, Any]:
         "identity_file",
         "connect_timeout_ms",
         "alias",
-        "ssh_mux",
-        "keepalive",
     ):
         value = getattr(args, key, None)
         if value is not None:
             payload[key] = value
-    if getattr(args, "long_stream", None):
-        if payload.get("ssh_mux") is True:
-            raise ValueError(
-                "--long-stream cannot be combined with --ssh-mux: ControlMaster "
-                "delegates -N forwards to the mux master and the client exits "
-                "rc=0 immediately, tearing the tunnel down. OpenSSH "
-                "first-option-wins makes a later ControlMaster=no override "
-                "ineffective. Use --long-stream alone (or Endpoint.for_long_stream)."
-            )
-        payload["ssh_mux"] = False
-        payload["keepalive"] = True
     payload.update(parse_selectors(getattr(args, "selector", None)))
     return payload
 
@@ -266,6 +219,9 @@ def run_tool(tool: str, args: argparse.Namespace) -> dict[str, Any]:
         data["limit"] = data["head_limit"]
     if "no_live_probe" in data:
         data["live_probe"] = not data.pop("no_live_probe")
+    # These flags are consumed by the CLI itself, not remote tool arguments.
+    for key in ("input_json", "selector", "long_stream", "content_file", "patch_file", "edits_json", "head_limit"):
+        data.pop(key, None)
     # JSON aliases override CLI defaults before the canonical dispatcher sees
     # them; otherwise an argparse default could shadow an explicit alias.
     explicit = normalize_arguments(f"remote.{tool}", load_input_json(args.input_json)) if args.input_json else {}

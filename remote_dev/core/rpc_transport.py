@@ -8,6 +8,7 @@ from __future__ import annotations
 import atexit
 from collections import OrderedDict
 import contextlib
+import itertools
 import hashlib
 import json
 import queue
@@ -15,7 +16,7 @@ import shlex
 import subprocess
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .cancellation import current_event
@@ -173,8 +174,99 @@ class RpcConnection:
                 stream.close()
 
 
+@dataclass
+class _Entry:
+    connection: object = None
+    active: int = 0
+    last_used: float = 0
+    use_order: int = 0
+
+
 _pool = {}
-_pool_lock = threading.Lock()
+_use_order = itertools.count(1)
+_pool_lock = threading.Condition()
+_POOL_LIMIT = 32
+_IDLE_SECONDS = 300
+_reaper_started = False
+
+
+def _idle_connections(now):
+    expired = [key for key, entry in _pool.items()
+               if entry.connection is not None and not entry.active
+               and now - entry.last_used >= _IDLE_SECONDS]
+    return [_pool.pop(key).connection for key in expired]
+
+
+def _reap_idle():
+    while True:
+        with _pool_lock:
+            _pool_lock.wait(timeout=min(60, _IDLE_SECONDS))
+            connections = _idle_connections(time.monotonic())
+            if connections:
+                _pool_lock.notify_all()
+        for connection in connections:
+            connection.close()
+
+
+def _acquire(endpoint, key, deadline):
+    global _reaper_started
+    event = current_event()
+    while True:
+        retired = None
+        with _pool_lock:
+            if event is not None and event.is_set():
+                raise RemoteExecutionError("SSH RPC cancelled while waiting for a connection; request was not sent")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RemoteExecutionError("SSH RPC connection capacity wait timed out; request was not sent")
+            entry = _pool.get(key)
+            if entry is not None and entry.connection is not None:
+                connection = entry.connection
+                if not connection.closed and connection.proc.poll() is None:
+                    entry.active += 1
+                    return entry
+                # A failed transport cannot service its existing requests. They
+                # retain their entry until finally; replacement never replays them.
+                retired = _pool.pop(key).connection
+                entry = None
+            if entry is None:
+                if len(_pool) >= _POOL_LIMIT:
+                    idle = [(item.use_order, candidate) for candidate, item in _pool.items()
+                            if item.connection is not None and not item.active]
+                    if idle:
+                        _, candidate = min(idle)
+                        retired = _pool.pop(candidate).connection
+                    else:
+                        _pool_lock.wait(timeout=min(0.05, remaining))
+                        continue
+                entry = _Entry(active=1)
+                _pool[key] = entry  # Reserve before opening, coalescing this key.
+                if not _reaper_started:
+                    threading.Thread(target=_reap_idle, daemon=True).start()
+                    _reaper_started = True
+            else:
+                _pool_lock.wait(timeout=min(0.05, remaining))
+                continue
+        # Neither SSH process startup nor shutdown holds the global pool lock.
+        try:
+            if retired is not None:
+                retired.close()
+            connection = RpcConnection(endpoint)
+        except BaseException:
+            with _pool_lock:
+                if _pool.get(key) is entry:
+                    _pool.pop(key)
+                _pool_lock.notify_all()
+            raise
+        with _pool_lock:
+            registered = _pool.get(key) is entry
+            if registered:
+                entry.connection = connection
+            _pool_lock.notify_all()
+        if not registered:
+            connection.close()
+            raise RemoteExecutionError("SSH RPC pool closed before submission; request was not sent")
+        return entry
 
 
 def request(endpoint, kind, source, payload, *, timeout_ms=45000):
@@ -182,22 +274,30 @@ def request(endpoint, kind, source, payload, *, timeout_ms=45000):
     # two identities on the same host do not silently borrow a connection.
     key = (endpoint.host, endpoint.port, endpoint.user, endpoint.identity_file,
            endpoint.root, endpoint.connect_timeout_ms)
-    with _pool_lock:
-        connection = _pool.get(key)
-        if connection is None or connection.closed or connection.proc.poll() is not None:
-            if connection is None and len(_pool) >= 32:
-                raise RemoteExecutionError("SSH RPC endpoint capacity exhausted; close unused connections first")
-            if connection is not None:
-                connection.close()
-            connection = RpcConnection(endpoint)
-            _pool[key] = connection
-    return connection.request(kind, source, payload, timeout_ms)
+    started = time.monotonic()
+    entry = _acquire(endpoint, key, started + (timeout_ms or 45000) / 1000)
+    acquired = time.monotonic()
+    try:
+        remaining_ms = None if timeout_ms is None else timeout_ms - int((acquired-started)*1000)
+        if remaining_ms is not None and remaining_ms <= 0:
+            raise RemoteExecutionError("SSH RPC connection wait timed out; request was not sent")
+        result = entry.connection.request(kind, source, payload, remaining_ms)
+        if kind == "control" and isinstance(result, dict):
+            result["transport"]["pool_wait_ms"] = round((acquired-started)*1000)
+        return result
+    finally:
+        with _pool_lock:
+            entry.active -= 1
+            entry.last_used = time.monotonic()
+            entry.use_order = next(_use_order)
+            _pool_lock.notify_all()
 
 
 def close_connections():
     with _pool_lock:
-        connections = list(_pool.values())
+        connections = [entry.connection for entry in _pool.values() if entry.connection is not None]
         _pool.clear()
+        _pool_lock.notify_all()
     for connection in connections:
         connection.close()
 

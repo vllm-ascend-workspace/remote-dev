@@ -1,6 +1,55 @@
 # Remote-Dev Validation Record
 
-Last updated: 2026-09-11 (native session and transport implementation).
+Last updated: 2026-09-12 (connection lifecycle, control capacity and runtime shell).
+
+## Version 0.7 validation (2026-09-12)
+
+- Hosted Windows Python 3.9/3.12 exposed equal monotonic timer ticks in the
+  pool's LRU selection. A completion-order counter now breaks this ambiguity
+  without changing idle-expiry deadlines. A fixed-clock regression confirms
+  that reusing an entry protects it from eviction; the 17 affected pool/RPC
+  tests pass on Windows Python 3.9/3.13 and WSL Python 3.13.
+
+- WSL full suite: 428 passed, 2 skipped, 174 subtests passed. Native Windows
+  full suite: 353 passed, 89 skipped, 146 subtests passed. The pool tests
+  cover concurrent first calls, unrelated endpoint progress during slow open
+  and close, forty sequential endpoint replacements without evicting active
+  requests, bounded wait/cancellation and idle expiration.
+- Saturation tests fill all 32 ordinary RPC slots and confirm status, stop,
+  tail and stdin can use reserved workers. The MCP test uses the actual
+  underscore wire name. Long output waits release the cursor lock; concurrent
+  input and output consumption cannot duplicate input or replay consumed bytes.
+- Real Bash tests retain runtime functions, non-exported variables, PATH order,
+  pipefail/nounset/errexit and command exit status. Initialization happens on
+  every command; BASH_ENV runs once in the applicable Bash startup mode.
+  Missing/failed explicit runtime scripts prevent user-command execution.
+- Installed 0.7.0 wheels on native Windows Python 3.9 and WSL Python 3.12 passed
+  four-container SDK tests for runtime functions/PATH/cwd/env, pipeline exit
+  codes, real PTY input, cancellation and quiet owned-job completion. Eight
+  alternating baseline/candidate short-command samples per endpoint gave
+  medians around 0.50 s on Windows and 0.52–0.53 s on WSL. These containers
+  have inexpensive startup; timing differences were within noise.
+- Four Windows-to-host paired runs also passed. Median baseline/candidate
+  milliseconds were 2545/1501, 714/494, 707/493 and 831/497; removing the extra
+  runtime Bash startup saves measurable time where host startup scripts cost
+  time. One initial scratch-directory setup returned no directory and was
+  repeated as an independent scratch probe; the successful endpoint rerun is
+  recorded separately. No submitted business job was replayed.
+- The baseline comparison substitutes only the 0.6 runtime command wrapper
+  inside the installed SDK, retaining the connection and supervisor. It does
+  not skip Bash initialization. Performance depends on the endpoint startup
+  scripts; there is no general absolute-latency guarantee.
+- Unsupported tool arguments (including MCP `wait`) now fail before endpoint
+  resolution or execution. CLI-local input-file flags are consumed before the
+  same validation; native aliases and registered endpoint selectors remain valid.
+- Removed the redundant CI `validate --local-only` step (compileall and schema
+  assertions already exercised by tests). Platform tests and clean wheel
+  installation remain required.
+- A managed-group follow-up adds `spec.prepared_timeout_seconds`, a separate
+  1–86400 second gate wait (default 120). The affected Linux worker/control/
+  session suite passes 43 tests, including expiry without command execution,
+  a prepared wait longer than the command timeout followed by successful
+  activation, and default/long/invalid timeout contracts.
 
 ## Version 0.6 validation (2026-09-11)
 
