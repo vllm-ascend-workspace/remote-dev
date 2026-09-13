@@ -7,6 +7,8 @@
     "host": {"type": "string"},
     "port": {"type": "integer"},
     "user": {"type": "string", "default": "root"},
+    "container": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$", "description": "Existing Docker container name or ID; execution and retained state use its resolved full ID."},
+    "container_selector": {"type": "string", "description": "Result metadata preserving the original name or short ID; not an additional selector."},
     "root": {"type": "string", "default": "/"},
     "cwd": {"type": "string"},
     "runtime_env": {"type": "boolean", "default": true},

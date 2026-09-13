@@ -21,17 +21,19 @@ from pathlib import Path
 
 from .cancellation import current_event
 from .errors import RemoteExecutionError
+from .container_endpoint import pin_container_endpoint
 
 
 class RpcConnection:
     def __init__(self, endpoint):
-        from .ssh_transport import ssh_base_cmd
+        from .ssh_transport import ssh_command
+        endpoint = pin_container_endpoint(endpoint)
         source = (Path(__file__).parents[1] / "processes" / "rpc_worker.py").read_text(encoding="utf-8")
         helper = (Path(__file__).parents[1] / "processes" / "mutation.py").read_text(encoding="utf-8")
         source = source.replace("# REMOTE_DEV_MUTATION_LOCK", helper)
         transport_endpoint = replace(endpoint, ssh_mux=False, keepalive=True)
         self.proc = subprocess.Popen(
-            [*ssh_base_cmd(transport_endpoint), "python3 -u -c " + shlex.quote(source)],
+            ssh_command(transport_endpoint, "python3 -u -c " + shlex.quote(source)),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.write_lock = threading.Lock()
@@ -272,11 +274,13 @@ def _acquire(endpoint, key, deadline):
 def request(endpoint, kind, source, payload, *, timeout_ms=45000):
     # The transport has no working-tree state: each operation carries its own
     # root/cwd, and the worker resolves job paths within that request's root.
-    # Share the authenticated SSH channel across roots, keeping authentication
-    # and connection-timeout choices separate. Code caches are source-digest
-    # keyed; job receipts, locks and cancellation remain per request/job.
+    # Share the authenticated SSH channel across roots within one fixed
+    # container (or the host), keeping authentication and connection-timeout
+    # choices separate. Code caches are source-digest keyed; job receipts,
+    # locks and cancellation remain per request/job.
+    endpoint = pin_container_endpoint(endpoint, timeout_ms=timeout_ms)
     key = (endpoint.host, endpoint.port, endpoint.user, endpoint.identity_file,
-           endpoint.connect_timeout_ms)
+           endpoint.connect_timeout_ms, endpoint.container)
     started = time.monotonic()
     entry = _acquire(endpoint, key, started + (timeout_ms or 45000) / 1000)
     acquired = time.monotonic()

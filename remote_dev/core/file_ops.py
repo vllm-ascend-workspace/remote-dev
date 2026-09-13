@@ -5,6 +5,7 @@ from typing import Any
 from .locking import serialize_mutation
 
 from .endpoint import Endpoint
+from .container_endpoint import pinned_endpoint
 from .errors import PathPolicyError
 from .path_policy import assert_under_root, join_under_root
 from .preview import MAX_LINE_CHARS, MAX_READ_LINES, compact_text
@@ -322,6 +323,7 @@ def _status_to_outcome(status: str) -> str:
     return "failed"
 
 
+@pinned_endpoint
 def remote_read(
     endpoint: Endpoint,
     *,
@@ -386,6 +388,7 @@ def remote_read(
     return {"text": text, "result": result}
 
 
+@pinned_endpoint
 def remote_ls(
     endpoint: Endpoint,
     *,

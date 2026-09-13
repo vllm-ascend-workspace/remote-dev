@@ -30,12 +30,14 @@ class ArtifactTransferError(RemoteExecutionError):
 
 class ArtifactStream:
     def __init__(self, endpoint, operation, count, timeout_ms):
-        from .ssh_transport import ssh_base_cmd
+        from .container_endpoint import pin_container_endpoint
+        from .ssh_transport import ssh_command
+        endpoint = pin_container_endpoint(endpoint, timeout_ms=timeout_ms)
         source = (Path(__file__).parents[1] / "processes" / "artifact_worker.py").read_text(encoding="utf-8")
         helper = (Path(__file__).parents[1] / "processes" / "mutation.py").read_text(encoding="utf-8")
         source = source.replace("# REMOTE_DEV_MUTATION_LOCK", helper)
         self.proc = subprocess.Popen(
-            [*ssh_base_cmd(replace(endpoint, ssh_mux=False, keepalive=True)), "python3 -u -c " + shlex.quote(source)],
+            ssh_command(replace(endpoint, ssh_mux=False, keepalive=True), "python3 -u -c " + shlex.quote(source)),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.done = threading.Event()

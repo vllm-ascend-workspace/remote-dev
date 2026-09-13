@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from .endpoint import Endpoint, substrate_root
+from .container_endpoint import pinned_endpoint
 from .atomic import replace_file
 from .errors import PathPolicyError
 from .path_policy import path_fingerprint
@@ -35,10 +36,12 @@ def state_root() -> Path:
     return substrate_root() / "state"
 
 
+@pinned_endpoint
 def endpoint_state_dir(endpoint: Endpoint) -> Path:
     return state_root() / "endpoints" / endpoint.endpoint_id
 
 
+@pinned_endpoint
 def ensure_endpoint_state(endpoint: Endpoint) -> Path:
     base = endpoint_state_dir(endpoint)
     for name in ("context", "reads", "logs", "jobs", "artifacts", "patches"):
@@ -57,6 +60,8 @@ def ensure_endpoint_state(endpoint: Endpoint) -> Path:
                 "cwd": endpoint.effective_cwd,
                 "kind": endpoint.kind,
                 "alias": endpoint.alias,
+                **({"container": endpoint.container} if endpoint.container else {}),
+                **({"container_selector": endpoint.container_selector} if endpoint.container_selector else {}),
                 "created_at": utc_now_iso(),
             },
         )
@@ -99,6 +104,7 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+@pinned_endpoint
 def new_log_dir(endpoint: Endpoint, tool_kind: str, invocation_id: str | None = None) -> Path:
     base = ensure_endpoint_state(endpoint)
     token = invocation_id or new_invocation_id()
@@ -190,11 +196,13 @@ def _legacy_ledger_scopes(raw: str) -> tuple[str, ...]:
     return tuple(seen)
 
 
+@pinned_endpoint
 def read_ledger_path(endpoint: Endpoint, file_path: str, client_context_id: str | None = None) -> Path:
     scope = resolve_ledger_scope(client_context_id)
     return ensure_endpoint_state(endpoint) / "reads" / scope / f"{path_fingerprint(file_path)}.json"
 
 
+@pinned_endpoint
 def write_read_ledger(endpoint: Endpoint, file_info: dict[str, Any], client_context_id: str | None = None) -> Path:
     scope = resolve_ledger_scope(client_context_id)
     path = read_ledger_path(endpoint, str(file_info["path"]), client_context_id)
@@ -216,6 +224,7 @@ def write_read_ledger(endpoint: Endpoint, file_info: dict[str, Any], client_cont
     return path
 
 
+@pinned_endpoint
 def load_read_ledger(endpoint: Endpoint, file_path: str, client_context_id: str | None = None) -> dict[str, Any] | None:
     path = read_ledger_path(endpoint, file_path, client_context_id)
     if not path.exists():
@@ -242,6 +251,7 @@ def _ledger_record_is_current(data: dict[str, Any]) -> bool:
     return data.get("schema_version") == LEDGER_SCHEMA_VERSION and data.get("ledger_scope_encoding") == LEDGER_SCOPE_ENCODING
 
 
+@pinned_endpoint
 def load_write_ledger_guard(
     endpoint: Endpoint,
     file_path: str,
@@ -272,6 +282,7 @@ def load_write_ledger_guard(
     return WriteLedgerGuard(ledger=None, read_required=False, scope=scope)
 
 
+@pinned_endpoint
 def job_record_path(endpoint: Endpoint, job_id: str) -> Path:
     return ensure_endpoint_state(endpoint) / "jobs" / f"{job_id}.json"
 

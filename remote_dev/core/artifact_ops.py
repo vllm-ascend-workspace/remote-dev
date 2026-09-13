@@ -8,6 +8,7 @@ from typing import Any
 from .locking import serialize_mutation
 
 from .endpoint import Endpoint
+from .container_endpoint import pinned_endpoint
 from .errors import PathPolicyError
 from .path_policy import join_under_root
 from remote_dev.result import make_result, utc_now_iso
@@ -152,6 +153,7 @@ def _safe_local_artifact_path(base: Path, relpath: str) -> Path:
     return candidate
 
 
+@pinned_endpoint
 def remote_artifact_manifest(endpoint: Endpoint, *, remote_path: str, timeout_ms: int = 120000) -> dict[str, Any]:
     started = utc_now_iso()
     start = time.monotonic()

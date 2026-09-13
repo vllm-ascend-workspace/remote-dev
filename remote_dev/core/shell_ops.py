@@ -4,6 +4,7 @@ import shlex
 from typing import Any
 
 from .endpoint import Endpoint
+from .container_endpoint import pinned_endpoint
 from .errors import PathPolicyError
 from .job_ops import start_remote_job
 from .path_policy import assert_under_root
@@ -27,6 +28,7 @@ def _cwd_outside_root_next(cwd: str) -> dict[str, Any]:
     }
 
 
+@pinned_endpoint
 def remote_bash(
     endpoint: Endpoint,
     *,

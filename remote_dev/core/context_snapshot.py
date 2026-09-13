@@ -5,6 +5,7 @@ from typing import Any
 
 from importlib.metadata import version as package_version
 from .endpoint import Endpoint
+from .container_endpoint import pinned_endpoint
 from remote_dev.result import make_result, utc_now_iso
 from .ssh_transport import run_remote_python
 from .state_store import atomic_write_json, ensure_endpoint_state
@@ -49,6 +50,7 @@ print(json.dumps({"status": "ok", "summary": summary}, sort_keys=True))
 '''
 
 
+@pinned_endpoint
 def write_context_snapshot(endpoint: Endpoint, summary: dict[str, Any], full_probe: dict[str, Any] | None = None) -> dict[str, Any]:
     base = ensure_endpoint_state(endpoint) / "context"
     payload = {
@@ -86,6 +88,7 @@ def _duration_ms(start: float) -> int:
     return int(round((time.monotonic() - start) * 1000))
 
 
+@pinned_endpoint
 def remote_probe(endpoint: Endpoint, *, timeout_ms: int = 120000, diagnose_connection: bool = False, modules: list[str] | None = None) -> dict[str, Any]:
     if diagnose_connection:
         from remote_dev.diagnostics import diagnose_ssh
@@ -128,6 +131,7 @@ def remote_probe(endpoint: Endpoint, *, timeout_ms: int = 120000, diagnose_conne
     return {"text": text, "result": result}
 
 
+@pinned_endpoint
 def remote_context_snapshot(endpoint: Endpoint, *, timeout_ms: int = 120000, live_probe: bool = True) -> dict[str, Any]:
     if live_probe:
         payload = remote_probe(endpoint, timeout_ms=timeout_ms)

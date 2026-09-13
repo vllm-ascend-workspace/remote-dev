@@ -1,6 +1,37 @@
 # Remote-Dev Validation Record
 
-Last updated: 2026-09-12 (connection lifecycle, control capacity and runtime shell).
+Last updated: 2026-09-13 (existing-container endpoints).
+
+## Version 0.8 validation (2026-09-13)
+
+- Container endpoint tests enumerate public operation/record boundaries and
+  host-only helpers. They cover fresh names, full-ID lookup bypass, replacement
+  isolation for optional read guards and pooled connections, retained old job
+  IDs, unknown launch outcomes without replay, CLI/alias/resolver fields,
+  diagnostics, script and binary argv, and explicit bootstrap/forward rejection.
+- Real local Linux protocol adapters validate Docker argv before running the
+  shipped RPC worker and binary artifact workers. These exercise owned command
+  exit/output and binary roundtrips. Bash pipe, redirection, variable and stdin
+  script tests preserve caller shell semantics. The WSL run uses uid 1000 and
+  verifies inherited command identity with no Docker user override.
+- Native Windows Python 3.13 full suite: 439 passed, 97 skipped, 152 subtests
+  passed. Linux/WSL Python 3.12 full suite: 522 passed, 2 skipped, 189 subtests
+  passed; the final container suite adds an explicit uid-1000 assertion and
+  passes all 74 cases. Package sources also parse with Python 3.9
+  grammar; this is a syntax check, not a Python 3.9 runtime test.
+- After merging canonical main `4da7bbd`, operation roots share one RPC
+  transport within a container or the host while different container IDs
+  remain isolated. The combined regression checks this partition and retains
+  upstream tests for per-root job ownership, cancellation and reconnects.
+  Windows full suite: 439 passed, 101 skipped, 152 subtests passed. Linux/WSL
+  full suite: 526 passed, 2 skipped, 189 subtests passed. The new ownership
+  test waits for verified quiet because result publication can precede the
+  supervisor's own exit; no launch or start gate is replayed.
+- These local adapters do not establish real container namespace isolation or
+  NPU/model correctness. Live existing-container acceptance is a separate
+  consumer test. The package does not install missing container prerequisites
+  or grant managed device leases; jobs retain the existing writable-root
+  requirement for scratch/log files.
 
 ## Version 0.7 validation (2026-09-12)
 

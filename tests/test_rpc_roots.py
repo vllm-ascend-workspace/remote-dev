@@ -61,8 +61,11 @@ def test_identical_job_ids_have_distinct_receipts_logs_gates_and_cached_modules(
     assert control(b, "shared-job", "status")["state"] == "prepared"
     control(b, "shared-job", "go", authorization={"owner": "b"})
     for endpoint, text in ((a, "alpha"), (b, "beta")):
-        done = control(endpoint, "shared-job", "exchange", yield_time_ms=3000, wait_for_exit=True)
-        assert done["quiet"] and done["stdout"] == text
+        # A result can be published just before the supervisor itself exits.
+        # Wait for verified quiet without replaying either launch or start gate.
+        done = until(lambda: control(endpoint, "shared-job", "exchange", yield_time_ms=3000, wait_for_exit=True),
+                     lambda row: row["quiet"])
+        assert done["stdout"] == text, done
         assert done["result"]["exit_code"] == 0
     # Evict source/module entries with real worker revisions, alternating roots.
     # Re-loading the original module must rediscover each root's own receipts.
