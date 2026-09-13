@@ -19,6 +19,14 @@ Last updated: 2026-09-13 (existing-container endpoints).
   passed; the final container suite adds an explicit uid-1000 assertion and
   passes all 74 cases. Package sources also parse with Python 3.9
   grammar; this is a syntax check, not a Python 3.9 runtime test.
+- After merging canonical main `4da7bbd`, operation roots share one RPC
+  transport within a container or the host while different container IDs
+  remain isolated. The combined regression checks this partition and retains
+  upstream tests for per-root job ownership, cancellation and reconnects.
+  Windows full suite: 439 passed, 101 skipped, 152 subtests passed. Linux/WSL
+  full suite: 526 passed, 2 skipped, 189 subtests passed. The new ownership
+  test waits for verified quiet because result publication can precede the
+  supervisor's own exit; no launch or start gate is replayed.
 - These local adapters do not establish real container namespace isolation or
   NPU/model correctness. Live existing-container acceptance is a separate
   consumer test. The package does not install missing container prerequisites

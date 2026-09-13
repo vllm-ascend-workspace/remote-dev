@@ -272,11 +272,15 @@ def _acquire(endpoint, key, deadline):
 
 
 def request(endpoint, kind, source, payload, *, timeout_ms=45000):
-    # Include all connection and isolation inputs. In particular, two roots or
-    # two identities on the same host do not silently borrow a connection.
+    # The transport has no working-tree state: each operation carries its own
+    # root/cwd, and the worker resolves job paths within that request's root.
+    # Share the authenticated SSH channel across roots within one fixed
+    # container (or the host), keeping authentication and connection-timeout
+    # choices separate. Code caches are source-digest keyed; job receipts,
+    # locks and cancellation remain per request/job.
     endpoint = pin_container_endpoint(endpoint, timeout_ms=timeout_ms)
     key = (endpoint.host, endpoint.port, endpoint.user, endpoint.identity_file,
-           endpoint.root, endpoint.connect_timeout_ms, endpoint.container)
+           endpoint.connect_timeout_ms, endpoint.container)
     started = time.monotonic()
     entry = _acquire(endpoint, key, started + (timeout_ms or 45000) / 1000)
     acquired = time.monotonic()

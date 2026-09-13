@@ -273,16 +273,16 @@ def test_lost_launch_reply_retains_id_without_replaying_or_resolving_new_name(tm
         assert control.call_args.args[0].container == A
 
 
-def test_same_host_and_root_containers_have_separate_rpc_connections(monkeypatch):
+def test_roots_share_rpc_only_within_the_same_container():
     from test_rpc_pool import Connection
     rpc.close_connections()
     try:
         with mock.patch.object(rpc, 'RpcConnection', side_effect=Connection) as factory:
-            rpc.request(endpoint(A), 'control', '', {})
-            rpc.request(endpoint(B), 'control', '', {})
-            rpc.request(endpoint(A), 'control', '', {})
-            assert factory.call_count == 2
-            assert {item.connection.endpoint.container for item in rpc._pool.values()} == {A, B}
+            for root in ('/first', '/sibling'):
+                for container in (A, B, None):
+                    rpc.request(replace(endpoint(container), root=root), 'control', '', {})
+            assert factory.call_count == 3
+            assert {item.connection.endpoint.container for item in rpc._pool.values()} == {A, B, None}
     finally:
         rpc.close_connections()
 

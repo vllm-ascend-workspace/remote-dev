@@ -134,13 +134,18 @@ print(json.dumps({'status':'ok'}))
         # Only an explicitly new operation reconnects, with a fresh code cache.
         self.assertEqual(self.request({})["calls"], 1)
 
-    def test_connection_identity_and_root_do_not_cross(self):
+    def test_roots_share_transport_but_connection_identities_do_not_cross(self):
+        from dataclasses import replace
+
         self.request({})
-        for field, value in (("root", "/other"), ("identity_file", "/client/other-key")):
-            from dataclasses import replace
+        sibling = rpc_transport.request(replace(self.endpoint, root="/other"), "control", CONTROL, {})
+        self.assertEqual(sibling["calls"], 2)
+        self.assertTrue(sibling["transport"]["connection_reused"])
+        for field, value in (("host", "other.example"), ("port", 46001), ("user", "other"),
+                             ("identity_file", "/client/other-key"), ("connect_timeout_ms", 2000)):
             row = rpc_transport.request(replace(self.endpoint, **{field: value}), "control", CONTROL, {})
             self.assertEqual(row["calls"], 1)
-        self.assertEqual(len(rpc_transport._pool), 3)
+        self.assertEqual(len(rpc_transport._pool), 6)
 
     def test_cancelled_before_submission_does_not_execute(self):
         self.request({})

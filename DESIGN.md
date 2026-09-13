@@ -59,7 +59,9 @@ separate supervisor, dependency installer or managed resource authority is added
 Host-only prefixes, interactive bootstrap and port forwarding reject container
 endpoints before launching a process. RPC-created PTYs remain inside the container.
 Container IDs partition local state, mutation locks and connection pools; retained
-job records never re-resolve a mutable name. New explicit names are fresh Docker
+job records never re-resolve a mutable name. Within one container or the host,
+operation roots share an authenticated RPC transport; request roots still scope
+job receipts, locks and cancellation. New explicit names are fresh Docker
 selections, so no TTL, background watcher or invalidation protocol is needed.
 
 Layer C is whatever the consumer builds on top: workflow skills, session
